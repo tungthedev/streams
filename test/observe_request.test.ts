@@ -258,4 +258,71 @@ describe("observe request API", () => {
       rmSync(root, { recursive: true, force: true });
     }
   });
+
+  test("paginates trace lookup across more than one _search page", async () => {
+    const root = mkdtempSync(join(tmpdir(), "ds-observe-scale-"));
+    const { app } = createProfileTestApp(root, { searchWalOverlayQuietPeriodMs: 0 });
+    try {
+      await createJsonStream(app, "scale-traces", { kind: "otel-traces" });
+      const rootSpanId = "0000000000000001";
+      const spans = [
+        span({
+          spanId: rootSpanId,
+          service: "api",
+          name: "GET /bulk",
+          kind: "server",
+          start: "1772020800000000000",
+          end: "1772020802000000000",
+          statusCode: "ok",
+          requestId: "req_scale_1",
+        }),
+      ];
+      for (let i = 2; i <= 1200; i++) {
+        const spanId = i.toString(16).padStart(16, "0");
+        spans.push(
+          span({
+            spanId,
+            parentSpanId: rootSpanId,
+            service: i % 2 === 0 ? "api" : "worker",
+            name: `child ${i}`,
+            start: String(1772020800000000000n + BigInt(i) * 1_000_000n),
+            end: String(1772020800000000000n + BigInt(i + 1) * 1_000_000n),
+            statusCode: "ok",
+          })
+        );
+      }
+
+      const appendRes = await app.fetch(
+        new Request("http://local/v1/stream/scale-traces", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(spans),
+        })
+      );
+      expect([200, 204]).toContain(appendRes.status);
+
+      const res = await fetchJsonApp(app, "http://local/v1/observe/request", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          streams: { traces: "scale-traces" },
+          lookup: { traceId: TRACE_ID },
+          include: { events: false, trace: true, timeline: false },
+          limits: { spans: 1300 },
+        }),
+      });
+
+      expect(res.status).toBe(200);
+      expect(res.body.trace.spans).toHaveLength(1200);
+      expect(res.body.trace.tree).toHaveLength(1);
+      expect(res.body.trace.tree[0].children).toHaveLength(1199);
+      expect(res.body.trace.partial).toBe(false);
+      expect(res.body.coverage.traces.hits).toBe(1200);
+      expect(res.body.coverage.traces.limit_reached).toBe(false);
+      expect(res.body.coverage.warnings).toEqual([]);
+    } finally {
+      app.close();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
 });
