@@ -212,7 +212,7 @@ describe("bootstrap from R2", () => {
         expectedPublishedLogicalSize =
           sourceRow && sourceRow.logical_size_bytes > unpublishedTailBytes ? sourceRow.logical_size_bytes - unpublishedTailBytes : 0n;
       } finally {
-        app.close();
+        await app.close();
       }
 
       const cfg2 = makeConfig(root2, {
@@ -367,7 +367,7 @@ describe("bootstrap from R2", () => {
         const detailsBody = await detailsRes.json();
         expect(detailsBody.stream.total_size_bytes).toBe(expectedPublishedLogicalSize.toString());
       } finally {
-        app2.close();
+        await app2.close();
         rmSync(root, { recursive: true, force: true });
         rmSync(root2, { recursive: true, force: true });
       }
@@ -407,7 +407,7 @@ describe("bootstrap from R2", () => {
         );
         expect(delRes.status).toBe(204);
       } finally {
-        app.close();
+        await app.close();
       }
 
       const cfg2 = makeConfig(root2, {
@@ -429,7 +429,7 @@ describe("bootstrap from R2", () => {
         const list = (await listRes.json()) as Array<{ name: string }>;
         expect(list.find((x) => x.name === stream)).toBeUndefined();
       } finally {
-        app2.close();
+        await app2.close();
         rmSync(root, { recursive: true, force: true });
         rmSync(root2, { recursive: true, force: true });
       }
@@ -489,7 +489,7 @@ describe("bootstrap from R2", () => {
           sourceRow && sourceRow.logical_size_bytes > unpublishedTailBytes ? sourceRow.logical_size_bytes - unpublishedTailBytes : 0n;
         expect(expectedPublishedLogicalSize).toBeGreaterThan(0n);
       } finally {
-        app.close();
+        await app.close();
       }
 
       const manifestKey = manifestObjectKey(streamHash16Hex(stream));
@@ -532,7 +532,7 @@ describe("bootstrap from R2", () => {
         const detailsBody = await detailsRes.json();
         expect(detailsBody.stream.total_size_bytes).toBe(expectedPublishedLogicalSize.toString());
       } finally {
-        app2.close();
+        await app2.close();
         rmSync(root, { recursive: true, force: true });
         rmSync(root2, { recursive: true, force: true });
       }
