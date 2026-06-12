@@ -15,6 +15,18 @@ The canonical documentation index is [docs/index.md](./docs/index.md). The
 dedicated stream profile reference is
 [docs/stream-profiles.md](./docs/stream-profiles.md).
 
+## Example Implementations
+
+- [prisma/open-chat](https://github.com/prisma/open-chat) is a local-first,
+  multi-model AI chat application that uses Prisma Streams as the durable
+  system of record for chat message events. It demonstrates append-before-render
+  streaming, resumable reads after refresh or reconnect, per-user streams with
+  routing keys per chat, and deployment of a Streams service alongside a real
+  app.
+- [oss.chat/tour](https://oss.chat/tour) is the guided tour for Open Chat. It
+  walks through the system from prompt to durable stream and is the quickest
+  way to see how the implementation fits together before reading the code.
+
 ## Deploy To Prisma Compute
 
 Deploy Compute services from the published `@prisma/streams-server` npm package

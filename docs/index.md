@@ -29,6 +29,8 @@ and tooling.
   `otel-traces` profile and OTLP trace ingestion
 - [profile-state-protocol.md](./profile-state-protocol.md) — reference for the `state-protocol` profile
 - [profile-evlog.md](./profile-evlog.md) — design and reference for the `evlog` profile
+- [evlog-and-tracing-guide.md](./evlog-and-tracing-guide.md) — practical guide for wiring
+  `evlog` request events and OpenTelemetry traces together in an application
 - [request-observability.md](./request-observability.md) — cross-stream request
   lookup that correlates `evlog` events and `otel-traces` spans
 - [schemas.md](./schemas.md) — schema registry and lens behavior
