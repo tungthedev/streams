@@ -84,7 +84,7 @@ export type OtlpTraceExportResult = {
 
 export type OtlpTraceExportError = {
   message: string;
-  status?: 400 | 415;
+  status?: 400 | 413 | 415;
 };
 
 export type UnifiedTimelineItem = {

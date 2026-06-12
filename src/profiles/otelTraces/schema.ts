@@ -376,14 +376,17 @@ export const OTEL_TRACES_DEFAULT_SEARCH_CONFIG: SearchConfig = {
       intervals: ["1m", "5m", "1h"],
       measures: {
         spans: { kind: "count" },
+        errors: { kind: "count", include: "error:true" },
         latency: { kind: "summary", field: "duration", histogram: "log2_v1" },
       },
     },
     http_server: {
+      include: "kind:server",
       dimensions: ["service", "http.method", "http.route", "http.statusCode"],
       intervals: ["1m", "5m", "1h"],
       measures: {
         requests: { kind: "count" },
+        errors: { kind: "count", include: "error:true" },
         latency: { kind: "summary", field: "duration", histogram: "log2_v1" },
       },
     },

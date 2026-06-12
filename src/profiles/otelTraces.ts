@@ -18,12 +18,12 @@ import {
 import { buildOtelTracesDefaultRegistry } from "./otelTraces/schema";
 import {
   DEFAULT_ATTRIBUTE_LIMITS,
-  DEFAULT_OTEL_TRACE_REDACT_KEYS,
-  DEFAULT_REQUEST_ID_ATTRIBUTES,
+  DEFAULT_OTLP_LIMITS,
   DEFAULT_STORE_CONFIG,
   normalizeOtelTraceRecordResult,
   type DbStatementMode,
   type OtelTraceAttributeLimits,
+  type OtelTraceOtlpLimits,
   type OtelTraceStoreConfig,
   type OtelTracesStreamProfile,
 } from "./otelTraces/normalize";
@@ -92,6 +92,25 @@ function parseAttributeLimitsResult(raw: unknown, path: string): Result<Partial<
   return Result.ok(Object.keys(out).length > 0 ? out : undefined);
 }
 
+function parseOtlpLimitsResult(raw: unknown, path: string): Result<Partial<OtelTraceOtlpLimits> | undefined, { message: string }> {
+  if (raw === undefined) return Result.ok(undefined);
+  const objRes = expectPlainObjectResult(raw, path);
+  if (Result.isError(objRes)) return objRes;
+  const keyCheck = rejectUnknownKeysResult(
+    objRes.value,
+    ["maxCompressedBytes", "maxDecodedBytes", "maxResourceSpansPerRequest", "maxScopeSpansPerRequest", "maxSpansPerRequest"],
+    path
+  );
+  if (Result.isError(keyCheck)) return keyCheck;
+  const out: Partial<OtelTraceOtlpLimits> = {};
+  for (const key of Object.keys(DEFAULT_OTLP_LIMITS) as Array<keyof OtelTraceOtlpLimits>) {
+    const valueRes = parsePositiveIntResult(objRes.value[key], `${path}.${key}`, DEFAULT_OTLP_LIMITS[key]);
+    if (Result.isError(valueRes)) return valueRes;
+    if (objRes.value[key] !== undefined) out[key] = valueRes.value;
+  }
+  return Result.ok(Object.keys(out).length > 0 ? out : undefined);
+}
+
 function parseStoreResult(raw: unknown, path: string): Result<Partial<OtelTraceStoreConfig> | undefined, { message: string }> {
   if (raw === undefined) return Result.ok(undefined);
   const objRes = expectPlainObjectResult(raw, path);
@@ -151,7 +170,7 @@ function validateOtelTracesProfileResult(raw: unknown, path: string): Result<Ote
   if (objRes.value.kind !== "otel-traces") return Result.err({ message: `${path}.kind must be otel-traces` });
   const keyCheck = rejectUnknownKeysResult(
     objRes.value,
-    ["kind", "redactKeys", "requestIdAttributes", "attributeLimits", "store", "dbStatementMode", "observability"],
+    ["kind", "redactKeys", "requestIdAttributes", "attributeLimits", "store", "dbStatementMode", "otlpLimits", "observability"],
     path
   );
   if (Result.isError(keyCheck)) return keyCheck;
@@ -165,6 +184,8 @@ function validateOtelTracesProfileResult(raw: unknown, path: string): Result<Ote
   if (Result.isError(storeRes)) return storeRes;
   const dbStatementModeRes = parseDbStatementModeResult(objRes.value.dbStatementMode, `${path}.dbStatementMode`);
   if (Result.isError(dbStatementModeRes)) return dbStatementModeRes;
+  const otlpLimitsRes = parseOtlpLimitsResult(objRes.value.otlpLimits, `${path}.otlpLimits`);
+  if (Result.isError(otlpLimitsRes)) return otlpLimitsRes;
   const observabilityRes = parseOtelTracesObservabilityResult(objRes.value.observability, `${path}.observability`);
   if (Result.isError(observabilityRes)) return observabilityRes;
   const profile: OtelTracesStreamProfile = { kind: "otel-traces" };
@@ -173,6 +194,7 @@ function validateOtelTracesProfileResult(raw: unknown, path: string): Result<Ote
   if (limitsRes.value) profile.attributeLimits = limitsRes.value;
   if (storeRes.value) profile.store = storeRes.value;
   if (dbStatementModeRes.value) profile.dbStatementMode = dbStatementModeRes.value;
+  if (otlpLimitsRes.value) profile.otlpLimits = otlpLimitsRes.value;
   if (observabilityRes.value) profile.observability = observabilityRes.value;
   return Result.ok(profile);
 }
@@ -191,6 +213,13 @@ function severityForSpan(record: Record<string, unknown>): "debug" | "info" | "w
   const status = isPlainObject(record.status) ? getString(record.status, "code") : null;
   const error = isPlainObject(record.error) && record.error.isError === true;
   return status === "error" || error ? "error" : "info";
+}
+
+function spanEventIsException(event: Record<string, unknown>): boolean {
+  const eventName = getString(event, "name")?.toLowerCase() ?? "";
+  if (eventName === "exception") return true;
+  const attributes = isPlainObject(event.attributes) ? event.attributes : {};
+  return getString(attributes, "exception.type") != null || getString(attributes, "exception.message") != null;
 }
 
 function buildOtelTimelineItems(args: { stream: string; offset?: string; record: unknown }): UnifiedTimelineItem[] {
@@ -228,12 +257,13 @@ function buildOtelTimelineItems(args: { stream: string; offset?: string; record:
       const eventTime = getString(event, "timestamp");
       const eventName = getString(event, "name") ?? "span event";
       if (!eventTime) continue;
+      const isException = spanEventIsException(event);
       out.push({
-        kind: eventName === "exception" ? "otel.exception" : "otel.span.event",
+        kind: isException ? "otel.exception" : "otel.span.event",
         time: eventTime,
         service,
         title: eventName,
-        severity: eventName === "exception" ? "error" : severity,
+        severity: isException ? "error" : severity,
         ids,
         source,
         data: event,

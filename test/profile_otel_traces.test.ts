@@ -165,6 +165,7 @@ function makeOtlpProtoRequest(): Uint8Array {
 
   const scope: number[] = [];
   writeString(scope, 1, "proto-test");
+  writeMessage(scope, 3, kvString("telemetry.sdk.language", "javascript"));
 
   const scopeSpans: number[] = [];
   writeMessage(scopeSpans, 1, scope);
@@ -194,6 +195,11 @@ describe("otel-traces profile", () => {
         attributeLimits: { maxAttributesPerSpan: 32 },
         store: { rawLinks: false },
         dbStatementMode: "raw",
+        otlpLimits: {
+          maxCompressedBytes: 1024,
+          maxDecodedBytes: 2048,
+          maxSpansPerRequest: 100,
+        },
         observability: {
           request: {
             eventsStream: "app-events",
@@ -208,6 +214,11 @@ describe("otel-traces profile", () => {
         attributeLimits: { maxAttributesPerSpan: 32 },
         store: { rawLinks: false },
         dbStatementMode: "raw",
+        otlpLimits: {
+          maxCompressedBytes: 1024,
+          maxDecodedBytes: 2048,
+          maxSpansPerRequest: 100,
+        },
         observability: {
           request: {
             eventsStream: "app-events",
@@ -224,6 +235,9 @@ describe("otel-traces profile", () => {
       expect(schemaRes.body?.search?.fields?.duration?.kind).toBe("float");
       expect(schemaRes.body?.search?.fields?.["events.name"]?.bindings?.[0]?.jsonPointer).toBe("/eventNames");
       expect(schemaRes.body?.search?.rollups?.spans?.measures?.latency?.field).toBe("duration");
+      expect(schemaRes.body?.search?.rollups?.spans?.measures?.errors).toEqual({ kind: "count", include: "error:true" });
+      expect(schemaRes.body?.search?.rollups?.http_server?.include).toBe("kind:server");
+      expect(schemaRes.body?.search?.rollups?.http_server?.measures?.errors).toEqual({ kind: "count", include: "error:true" });
 
       const listRes = await fetchJsonApp(app, "http://local/v1/streams", { method: "GET" });
       expect(listRes.status).toBe(200);
@@ -338,6 +352,11 @@ describe("otel-traces profile", () => {
               "http.route": "/checkout",
               "http.response.status_code": 500,
               authorization: "Bearer secret",
+              "http.request.header.authorization": "Bearer header secret",
+              "http.request.header.cookie": "session=secret",
+              "http.response.header.set-cookie": "session=secret",
+              "http.request.header.x-api-key": "api-key-secret",
+              "rpc.request.metadata.authorization": "Basic secret",
               "db.system": "postgresql",
               "db.statement": "SELECT 1",
             },
@@ -376,8 +395,23 @@ describe("otel-traces profile", () => {
         eventNames: ["exception"],
       });
       expect(span.attributes.authorization).toBe("[REDACTED]");
+      expect(span.attributes["http.request.header.authorization"]).toBe("[REDACTED]");
+      expect(span.attributes["http.request.header.cookie"]).toBe("[REDACTED]");
+      expect(span.attributes["http.response.header.set-cookie"]).toBe("[REDACTED]");
+      expect(span.attributes["http.request.header.x-api-key"]).toBe("[REDACTED]");
+      expect(span.attributes["rpc.request.metadata.authorization"]).toBe("[REDACTED]");
       expect(span.events[0].attributes.token).toBe("[REDACTED]");
-      expect(span.redaction.keys).toEqual(expect.arrayContaining(["attributes.authorization", "events.0.attributes.token"]));
+      expect(span.redaction.keys).toEqual(
+        expect.arrayContaining([
+          "attributes.authorization",
+          "attributes.http.request.header.authorization",
+          "attributes.http.request.header.cookie",
+          "attributes.http.response.header.set-cookie",
+          "attributes.http.request.header.x-api-key",
+          "attributes.rpc.request.metadata.authorization",
+          "events.0.attributes.token",
+        ])
+      );
 
       const searchRes = await fetchJsonApp(app, "http://local/v1/stream/otel-json/_search", {
         method: "POST",
@@ -394,6 +428,112 @@ describe("otel-traces profile", () => {
         requestId: "req_json_1",
         service: "checkout",
         "http.statusCode": 500,
+      });
+
+      const eventNameSearchRes = await fetchJsonApp(app, "http://local/v1/stream/otel-json/_search", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ q: "events.name:exception" }),
+      });
+      expect(eventNameSearchRes.status).toBe(200);
+      expect(eventNameSearchRes.body?.hits).toHaveLength(1);
+
+      const bareExceptionSearchRes = await fetchJsonApp(app, "http://local/v1/stream/otel-json/_search", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ q: "exception" }),
+      });
+      expect(bareExceptionSearchRes.status).toBe(200);
+      expect(bareExceptionSearchRes.body?.hits).toHaveLength(1);
+    } finally {
+      await app.close();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("preserves canonical derived fields when raw attributes were dropped", async () => {
+    const root = mkdtempSync(join(tmpdir(), "ds-profile-otel-canonical-preserve-"));
+    const { app } = createProfileTestApp(root, { searchWalOverlayQuietPeriodMs: 0 });
+    try {
+      await createOtelTraceStream(app, "otel-canonical-preserve", {
+        store: {
+          rawResourceAttributes: false,
+          rawSpanAttributes: false,
+          rawEvents: false,
+          rawLinks: false,
+        },
+      });
+      const appendRes = await app.fetch(
+        new Request("http://local/v1/stream/otel-canonical-preserve", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            traceId: TRACE_ID,
+            spanId: SPAN_ID,
+            name: "GET /checkout",
+            kind: "server",
+            startUnixNano: "1772020800000000000",
+            endUnixNano: "1772020800123000000",
+            status: { code: "error", message: "failed" },
+            resource: {
+              attributes: {
+                "service.name": "checkout",
+                "deployment.environment.name": "prod",
+              },
+            },
+            attributes: {
+              "request.id": "req_preserve_1",
+              "http.request.method": "GET",
+              "http.route": "/checkout",
+              "http.response.status_code": 500,
+            },
+            events: [
+              {
+                timeUnixNano: "1772020800100000000",
+                name: "exception",
+                attributes: {
+                  "exception.message": "checkout failed",
+                },
+              },
+            ],
+          }),
+        })
+      );
+      expect([200, 204]).toContain(appendRes.status);
+
+      const firstReadRes = await fetchJsonApp(app, "http://local/v1/stream/otel-canonical-preserve?format=json", { method: "GET" });
+      expect(firstReadRes.status).toBe(200);
+      const canonical = firstReadRes.body[0];
+      expect(canonical.attributes).toEqual({});
+      expect(canonical.resource.attributes).toEqual({});
+      expect(canonical.events).toEqual([]);
+      expect(canonical).toMatchObject({
+        service: "checkout",
+        environment: "prod",
+        requestId: "req_preserve_1",
+        http: { method: "GET", route: "/checkout", statusCode: 500 },
+        error: { isError: true, message: "failed" },
+        eventNames: ["exception"],
+      });
+
+      const reappendRes = await app.fetch(
+        new Request("http://local/v1/stream/otel-canonical-preserve", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(canonical),
+        })
+      );
+      expect([200, 204]).toContain(reappendRes.status);
+
+      const secondReadRes = await fetchJsonApp(app, "http://local/v1/stream/otel-canonical-preserve?format=json", { method: "GET" });
+      expect(secondReadRes.status).toBe(200);
+      expect(secondReadRes.body[1]).toMatchObject({
+        service: "checkout",
+        environment: "prod",
+        requestId: "req_preserve_1",
+        http: { method: "GET", route: "/checkout", statusCode: 500 },
+        error: { isError: true, message: "failed" },
+        eventNames: ["exception"],
       });
     } finally {
       await app.close();
@@ -464,6 +604,10 @@ describe("otel-traces profile", () => {
         parentSpanId: SPAN_ID,
         requestId: "req_proto_1",
         service: "checkout",
+        instrumentationScope: {
+          name: "proto-test",
+          attributes: { "telemetry.sdk.language": "javascript" },
+        },
         db: { system: "postgresql", operation: "SELECT" },
         status: { code: "ok", message: "ok" },
       });
@@ -498,6 +642,152 @@ describe("otel-traces profile", () => {
       const readRes = await fetchJsonApp(app, "http://local/v1/stream/partial-traces?format=json", { method: "GET" });
       expect(readRes.body).toHaveLength(1);
       expect(readRes.body[0]?.traceId).toBe(TRACE_ID);
+    } finally {
+      await app.close();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects OTLP requests that exceed compressed, decoded, or span-count limits", async () => {
+    const root = mkdtempSync(join(tmpdir(), "ds-profile-otel-limits-"));
+    const { app } = createProfileTestApp(root);
+    try {
+      await createOtelTraceStream(app, "limited-traces", {
+        otlpLimits: {
+          maxCompressedBytes: 48,
+          maxDecodedBytes: 4096,
+          maxSpansPerRequest: 1,
+        },
+      });
+
+      const compressedTooLargeRes = await fetchJsonApp(app, "http://local/v1/stream/limited-traces/_otlp/v1/traces", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "content-encoding": "gzip",
+        },
+        body: gzipSync(JSON.stringify(otlpJsonRequest())),
+      });
+      expect(compressedTooLargeRes.status).toBe(413);
+      expect(compressedTooLargeRes.body?.error?.message).toContain("compressed OTLP body too large");
+
+      await createOtelTraceStream(app, "decoded-limited-traces", {
+        otlpLimits: {
+          maxCompressedBytes: 4096,
+          maxDecodedBytes: 64,
+        },
+      });
+      const decodedTooLargeRes = await fetchJsonApp(app, "http://local/v1/stream/decoded-limited-traces/_otlp/v1/traces", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "content-encoding": "gzip",
+        },
+        body: gzipSync(JSON.stringify(otlpJsonRequest())),
+      });
+      expect(decodedTooLargeRes.status).toBe(413);
+      expect(decodedTooLargeRes.body?.error?.message).toContain("decoded OTLP body too large");
+
+      const tooManySpansRes = await fetchJsonApp(app, "http://local/v1/stream/limited-traces/_otlp/v1/traces", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(otlpJsonRequest([otlpJsonSpan(), otlpJsonSpan({ spanId: CHILD_SPAN_ID })])),
+      });
+      expect(tooManySpansRes.status).toBe(400);
+      expect(tooManySpansRes.body?.error?.message).toContain("too many spans");
+    } finally {
+      await app.close();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("otel-traces rollups filter http_server to server spans and count errors", async () => {
+    const root = mkdtempSync(join(tmpdir(), "ds-profile-otel-rollups-"));
+    const { app } = createProfileTestApp(root, { searchWalOverlayQuietPeriodMs: 0 });
+    try {
+      await createOtelTraceStream(app, "rollup-traces");
+      const appendRes = await app.fetch(
+        new Request("http://local/v1/stream/rollup-traces", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify([
+            {
+              traceId: TRACE_ID,
+              spanId: SPAN_ID,
+              name: "GET /checkout",
+              kind: "server",
+              startUnixNano: "1772020800000000000",
+              endUnixNano: "1772020800123000000",
+              status: { code: "error", message: "failed" },
+              resource: { attributes: { "service.name": "checkout" } },
+              attributes: {
+                "http.request.method": "GET",
+                "http.route": "/checkout",
+                "http.response.status_code": 500,
+              },
+            },
+            {
+              traceId: TRACE_ID,
+              spanId: CHILD_SPAN_ID,
+              parentSpanId: SPAN_ID,
+              name: "SELECT cart",
+              kind: "internal",
+              startUnixNano: "1772020800010000000",
+              endUnixNano: "1772020800018000000",
+              status: { code: "error", message: "db failed" },
+              resource: { attributes: { "service.name": "checkout" } },
+              attributes: {
+                "db.system": "postgresql",
+                "db.operation": "SELECT",
+              },
+            },
+          ]),
+        })
+      );
+      expect([200, 204]).toContain(appendRes.status);
+
+      const httpAggregateRes = await fetchJsonApp(app, "http://local/v1/stream/rollup-traces/_aggregate", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          rollup: "http_server",
+          from: "2026-02-25T12:00:00.000Z",
+          to: "2026-02-25T12:01:00.000Z",
+          interval: "1m",
+          group_by: ["service", "http.method", "http.route", "http.statusCode"],
+        }),
+      });
+      expect(httpAggregateRes.status).toBe(200);
+      expect(httpAggregateRes.body?.buckets?.[0]?.groups).toEqual([
+        {
+          key: {
+            service: "checkout",
+            "http.method": "get",
+            "http.route": "/checkout",
+            "http.statusCode": "500",
+          },
+          measures: {
+            errors: { count: 1 },
+            latency: expect.objectContaining({ count: 1, sum: 123 }),
+            requests: { count: 1 },
+          },
+        },
+      ]);
+
+      const spansAggregateRes = await fetchJsonApp(app, "http://local/v1/stream/rollup-traces/_aggregate", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          rollup: "spans",
+          from: "2026-02-25T12:00:00.000Z",
+          to: "2026-02-25T12:01:00.000Z",
+          interval: "1m",
+          group_by: ["service"],
+        }),
+      });
+      expect(spansAggregateRes.status).toBe(200);
+      expect(spansAggregateRes.body?.buckets?.[0]?.groups?.[0]?.measures?.spans).toEqual({ count: 2 });
+      expect(spansAggregateRes.body?.buckets?.[0]?.groups?.[0]?.measures?.errors).toEqual({ count: 2 });
     } finally {
       await app.close();
       rmSync(root, { recursive: true, force: true });

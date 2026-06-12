@@ -2,6 +2,8 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { buildTraceDetails, summarizeSearchCoverage } from "../src/observe/request";
+import type { SearchHit, SearchResultBatch } from "../src/reader";
 import { createProfileTestApp, fetchJsonApp } from "./profile_test_utils";
 
 const TRACE_ID = "5b8efff798038103d269b633813fc60c";
@@ -158,6 +160,106 @@ function observeBody(lookup: Record<string, string>, extra: Record<string, unkno
 }
 
 describe("observe request API", () => {
+  test("selects the best request root without dropping other root spans", () => {
+    const trace = buildTraceDetails([
+      {
+        traceId: TRACE_ID,
+        spanId: "aaaaaaaaaaaaaaaa",
+        parentSpanId: null,
+        name: "background flush",
+        kind: "internal",
+        timestamp: "2026-02-25T12:00:00.000Z",
+        endTimestamp: "2026-02-25T12:00:10.000Z",
+        duration: 10_000,
+        status: { code: "unset", message: null },
+      },
+      {
+        traceId: TRACE_ID,
+        spanId: ROOT_SPAN_ID,
+        parentSpanId: null,
+        name: "GET /checkout",
+        kind: "server",
+        timestamp: "2026-02-25T12:00:01.000Z",
+        endTimestamp: "2026-02-25T12:00:01.260Z",
+        duration: 260,
+        requestId: "req_obs_1",
+        http: { method: "GET", route: "/checkout", statusCode: 200 },
+        status: { code: "ok", message: null },
+      },
+    ]);
+
+    expect(trace.rootSpanId).toBe(ROOT_SPAN_ID);
+    expect(trace.tree.map((node) => node.spanId).sort()).toEqual(["aaaaaaaaaaaaaaaa", ROOT_SPAN_ID].sort());
+  });
+
+  test("deduplicates overlapping request-observe coverage totals by stream and offset", () => {
+    const baseCoverage: SearchResultBatch["coverage"] = {
+      mode: "complete",
+      complete: true,
+      streamHeadOffset: "1",
+      visibleThroughOffset: "1",
+      visibleThroughPrimaryTimestampMax: null,
+      oldestOmittedAppendAt: null,
+      possibleMissingEventsUpperBound: 0,
+      possibleMissingUploadedSegments: 0,
+      possibleMissingSealedRows: 0,
+      possibleMissingWalRows: 0,
+      indexedSegments: 0,
+      indexedSegmentTimeMs: 0,
+      ftsSectionGetMs: 0,
+      ftsDecodeMs: 0,
+      ftsClauseEstimateMs: 0,
+      scannedSegments: 0,
+      scannedSegmentTimeMs: 0,
+      scannedTailDocs: 0,
+      scannedTailTimeMs: 0,
+      exactCandidateTimeMs: 0,
+      candidateDocIds: 0,
+      decodedRecords: 0,
+      jsonParseTimeMs: 0,
+      segmentPayloadBytesFetched: 0,
+      sortTimeMs: 0,
+      peakHitsHeld: 0,
+      indexFamiliesUsed: ["exact"],
+    };
+    const batches: SearchResultBatch[] = [
+      {
+        stream: "app-traces",
+        snapshotEndOffset: "1",
+        tookMs: 1,
+        timedOut: false,
+        timeoutMs: null,
+        coverage: baseCoverage,
+        total: { value: 2, relation: "eq" },
+        hits: [],
+        nextSearchAfter: null,
+      },
+      {
+        stream: "app-traces",
+        snapshotEndOffset: "1",
+        tookMs: 1,
+        timedOut: false,
+        timeoutMs: null,
+        coverage: baseCoverage,
+        total: { value: 2, relation: "eq" },
+        hits: [],
+        nextSearchAfter: null,
+      },
+    ];
+    const hits: Array<SearchHit & { stream: string }> = [
+      { stream: "app-traces", offset: "0", score: 1, sort: [], fields: {}, source: {} },
+      { stream: "app-traces", offset: "1", score: 1, sort: [], fields: {}, source: {} },
+      { stream: "app-traces", offset: "1", score: 1, sort: [], fields: {}, source: {} },
+    ];
+
+    expect(summarizeSearchCoverage(batches, hits, false)).toMatchObject({
+      hits: 2,
+      unique_hits: 2,
+      query_count: 2,
+      total: { value: 2, relation: "eq" },
+    });
+  });
+
   test("looks up by requestId and returns evlog context with trace tree", async () => {
     const root = mkdtempSync(join(tmpdir(), "ds-observe-request-id-"));
     const { app } = createProfileTestApp(root, { searchWalOverlayQuietPeriodMs: 0 });

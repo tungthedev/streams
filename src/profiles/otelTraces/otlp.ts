@@ -2,10 +2,12 @@ import { gunzipSync } from "node:zlib";
 import { Result } from "better-result";
 import type { OtlpTraceExportError, OtlpTraceExportResult } from "../profile";
 import {
+  DEFAULT_OTLP_LIMITS,
   normalizeOtelDecodedSpanResult,
   type DecodedOtelEvent,
   type DecodedOtelLink,
   type DecodedOtelSpan,
+  type OtelTraceOtlpLimits,
   type OtelTracesStreamProfile,
 } from "./normalize";
 
@@ -146,7 +148,24 @@ function spanFromJson(raw: unknown): Omit<DecodedOtelSpan, "resourceAttributes" 
   };
 }
 
-function decodeJsonExportResult(body: Uint8Array): Result<DecodedOtelSpan[], { message: string }> {
+type OtlpDecodeCounters = {
+  resourceSpans: number;
+  scopeSpans: number;
+  spans: number;
+};
+
+function incrementLimitCounter(
+  counters: OtlpDecodeCounters,
+  key: keyof OtlpDecodeCounters,
+  max: number,
+  label: string
+): Result<void, { message: string }> {
+  counters[key] += 1;
+  if (counters[key] > max) return Result.err({ message: `too many ${label} in OTLP request (max ${max})` });
+  return Result.ok(undefined);
+}
+
+function decodeJsonExportResult(body: Uint8Array, limits: OtelTraceOtlpLimits): Result<DecodedOtelSpan[], { message: string }> {
   let parsed: unknown;
   try {
     parsed = JSON.parse(JSON_TEXT_DECODER.decode(body));
@@ -155,8 +174,11 @@ function decodeJsonExportResult(body: Uint8Array): Result<DecodedOtelSpan[], { m
   }
   if (!isPlainObject(parsed)) return Result.err({ message: "OTLP JSON request must be an object" });
   const out: DecodedOtelSpan[] = [];
+  const counters: OtlpDecodeCounters = { resourceSpans: 0, scopeSpans: 0, spans: 0 };
   const resourceSpans = Array.isArray(parsed.resourceSpans) ? parsed.resourceSpans : [];
   for (const resourceSpanRaw of resourceSpans) {
+    const resourceLimitRes = incrementLimitCounter(counters, "resourceSpans", limits.maxResourceSpansPerRequest, "resourceSpans");
+    if (Result.isError(resourceLimitRes)) return resourceLimitRes;
     if (!isPlainObject(resourceSpanRaw)) continue;
     const resource = isPlainObject(resourceSpanRaw.resource) ? resourceSpanRaw.resource : {};
     const resourceAttributes = keyValuesFromJson(resource.attributes);
@@ -166,6 +188,8 @@ function decodeJsonExportResult(body: Uint8Array): Result<DecodedOtelSpan[], { m
       ...(Array.isArray(resourceSpanRaw.instrumentationLibrarySpans) ? resourceSpanRaw.instrumentationLibrarySpans : []),
     ];
     for (const scopeSpanRaw of scopeSpans) {
+      const scopeLimitRes = incrementLimitCounter(counters, "scopeSpans", limits.maxScopeSpansPerRequest, "scopeSpans");
+      if (Result.isError(scopeLimitRes)) return scopeLimitRes;
       if (!isPlainObject(scopeSpanRaw)) continue;
       const scopeRaw = isPlainObject(scopeSpanRaw.scope) ? scopeSpanRaw.scope : isPlainObject(scopeSpanRaw.instrumentationLibrary) ? scopeSpanRaw.instrumentationLibrary : {};
       const scope = {
@@ -176,6 +200,8 @@ function decodeJsonExportResult(body: Uint8Array): Result<DecodedOtelSpan[], { m
       };
       const spans = Array.isArray(scopeSpanRaw.spans) ? scopeSpanRaw.spans : [];
       for (const spanRaw of spans) {
+        const spanLimitRes = incrementLimitCounter(counters, "spans", limits.maxSpansPerRequest, "spans");
+        if (Result.isError(spanLimitRes)) return spanLimitRes;
         const span = spanFromJson(spanRaw);
         if (!span) continue;
         out.push({
@@ -419,9 +445,9 @@ function decodeScope(bytes: Uint8Array): Result<ScopeSpansDecoded["scope"], { me
     } else if (field === 3 && wire === 2) {
       const bytesRes = reader.readBytes();
       if (Result.isError(bytesRes)) return bytesRes;
-      const attrsRes = decodeKeyValueList(bytesRes.value);
-      if (Result.isError(attrsRes)) return attrsRes;
-      scope.attributes = { ...scope.attributes, ...attrsRes.value };
+      const kvRes = decodeKeyValue(bytesRes.value);
+      if (Result.isError(kvRes)) return kvRes;
+      if (kvRes.value) scope.attributes[kvRes.value.key] = kvRes.value.value;
     } else {
       const skipRes = reader.skip(wire);
       if (Result.isError(skipRes)) return skipRes;
@@ -630,7 +656,7 @@ function decodeSpan(bytes: Uint8Array): Result<Omit<DecodedOtelSpan, "resourceAt
   return Result.ok(span);
 }
 
-function decodeScopeSpans(bytes: Uint8Array): Result<ScopeSpansDecoded, { message: string }> {
+function decodeScopeSpans(bytes: Uint8Array, limits: OtelTraceOtlpLimits, counters: OtlpDecodeCounters): Result<ScopeSpansDecoded, { message: string }> {
   const reader = new ProtoReader(bytes);
   const out: ScopeSpansDecoded = {
     scope: { name: null, version: null, schemaUrl: null, attributes: {} },
@@ -647,6 +673,8 @@ function decodeScopeSpans(bytes: Uint8Array): Result<ScopeSpansDecoded, { messag
       if (Result.isError(scopeRes)) return scopeRes;
       out.scope = { ...out.scope, ...scopeRes.value };
     } else if (field === 2 && wire === 2) {
+      const spanLimitRes = incrementLimitCounter(counters, "spans", limits.maxSpansPerRequest, "spans");
+      if (Result.isError(spanLimitRes)) return spanLimitRes;
       const bytesRes = reader.readBytes();
       if (Result.isError(bytesRes)) return bytesRes;
       const spanRes = decodeSpan(bytesRes.value);
@@ -664,7 +692,7 @@ function decodeScopeSpans(bytes: Uint8Array): Result<ScopeSpansDecoded, { messag
   return Result.ok(out);
 }
 
-function decodeResourceSpans(bytes: Uint8Array): Result<ResourceSpansDecoded, { message: string }> {
+function decodeResourceSpans(bytes: Uint8Array, limits: OtelTraceOtlpLimits, counters: OtlpDecodeCounters): Result<ResourceSpansDecoded, { message: string }> {
   const reader = new ProtoReader(bytes);
   const out: ResourceSpansDecoded = { resourceAttributes: {}, resourceSchemaUrl: null, scopeSpans: [] };
   while (!reader.eof()) {
@@ -678,9 +706,11 @@ function decodeResourceSpans(bytes: Uint8Array): Result<ResourceSpansDecoded, { 
       if (Result.isError(resourceRes)) return resourceRes;
       out.resourceAttributes = resourceRes.value;
     } else if ((field === 2 || field === 1000) && wire === 2) {
+      const scopeLimitRes = incrementLimitCounter(counters, "scopeSpans", limits.maxScopeSpansPerRequest, "scopeSpans");
+      if (Result.isError(scopeLimitRes)) return scopeLimitRes;
       const bytesRes = reader.readBytes();
       if (Result.isError(bytesRes)) return bytesRes;
-      const scopeRes = decodeScopeSpans(bytesRes.value);
+      const scopeRes = decodeScopeSpans(bytesRes.value, limits, counters);
       if (Result.isError(scopeRes)) return scopeRes;
       out.scopeSpans.push(scopeRes.value);
     } else if (field === 3 && wire === 2) {
@@ -695,16 +725,19 @@ function decodeResourceSpans(bytes: Uint8Array): Result<ResourceSpansDecoded, { 
   return Result.ok(out);
 }
 
-function decodeProtobufExportResult(body: Uint8Array): Result<DecodedOtelSpan[], { message: string }> {
+function decodeProtobufExportResult(body: Uint8Array, limits: OtelTraceOtlpLimits): Result<DecodedOtelSpan[], { message: string }> {
   const reader = new ProtoReader(body);
   const out: DecodedOtelSpan[] = [];
+  const counters: OtlpDecodeCounters = { resourceSpans: 0, scopeSpans: 0, spans: 0 };
   while (!reader.eof()) {
     const tagRes = reader.readTag();
     if (Result.isError(tagRes)) return tagRes;
     if (tagRes.value.field === 1 && tagRes.value.wire === 2) {
+      const resourceLimitRes = incrementLimitCounter(counters, "resourceSpans", limits.maxResourceSpansPerRequest, "resourceSpans");
+      if (Result.isError(resourceLimitRes)) return resourceLimitRes;
       const bytesRes = reader.readBytes();
       if (Result.isError(bytesRes)) return bytesRes;
-      const resourceSpansRes = decodeResourceSpans(bytesRes.value);
+      const resourceSpansRes = decodeResourceSpans(bytesRes.value, limits, counters);
       if (Result.isError(resourceSpansRes)) return resourceSpansRes;
       for (const scopeSpans of resourceSpansRes.value.scopeSpans) {
         for (const span of scopeSpans.spans) {
@@ -729,31 +762,40 @@ function decodeBody(args: {
   contentEncoding: string | null;
   body: Uint8Array;
   maxDecodedBytes: number;
+  limits: OtelTraceOtlpLimits;
 }): Result<{ spans: DecodedOtelSpan[]; responseEncoding: "protobuf" | "json" }, OtlpTraceExportError> {
   let body = args.body;
+  const maxDecodedBytes = Math.min(args.maxDecodedBytes, args.limits.maxDecodedBytes);
   const encoding = args.contentEncoding?.trim().toLowerCase() ?? "";
   if (encoding !== "" && encoding !== "identity" && encoding !== "gzip") {
     return Result.err({ status: 415, message: "unsupported content-encoding" });
   }
   if (encoding === "gzip") {
+    if (body.byteLength > args.limits.maxCompressedBytes) {
+      return Result.err({ status: 413, message: `compressed OTLP body too large (max ${args.limits.maxCompressedBytes})` });
+    }
     try {
-      body = new Uint8Array(gunzipSync(body));
-    } catch {
+      body = new Uint8Array(gunzipSync(body, { maxOutputLength: maxDecodedBytes }));
+    } catch (error) {
+      const code = typeof error === "object" && error && "code" in error ? String((error as { code?: unknown }).code) : "";
+      if (code === "ERR_BUFFER_TOO_LARGE") {
+        return Result.err({ status: 413, message: `decoded OTLP body too large (max ${maxDecodedBytes})` });
+      }
       return Result.err({ status: 400, message: "invalid gzip body" });
     }
   }
-  if (body.byteLength > args.maxDecodedBytes) {
-    return Result.err({ status: 400, message: `decoded OTLP body too large (max ${args.maxDecodedBytes})` });
+  if (body.byteLength > maxDecodedBytes) {
+    return Result.err({ status: 413, message: `decoded OTLP body too large (max ${maxDecodedBytes})` });
   }
 
   const contentType = baseContentType(args.contentType);
   if (contentType === JSON_CONTENT_TYPE) {
-    const spansRes = decodeJsonExportResult(body);
+    const spansRes = decodeJsonExportResult(body, args.limits);
     if (Result.isError(spansRes)) return Result.err({ status: 400, message: spansRes.error.message });
     return Result.ok({ spans: spansRes.value, responseEncoding: "json" });
   }
   if (contentType === PROTOBUF_CONTENT_TYPE) {
-    const spansRes = decodeProtobufExportResult(body);
+    const spansRes = decodeProtobufExportResult(body, args.limits);
     if (Result.isError(spansRes)) return Result.err({ status: 400, message: spansRes.error.message });
     return Result.ok({ spans: spansRes.value, responseEncoding: "protobuf" });
   }
@@ -768,7 +810,8 @@ export function decodeOtlpTraceExportRequestResult(args: {
   body: Uint8Array;
   maxDecodedBytes: number;
 }): Result<OtlpTraceExportResult, OtlpTraceExportError> {
-  const decodedRes = decodeBody(args);
+  const limits = { ...DEFAULT_OTLP_LIMITS, ...(args.profile.otlpLimits ?? {}) };
+  const decodedRes = decodeBody({ ...args, limits });
   if (Result.isError(decodedRes)) return decodedRes;
   const records: OtlpTraceExportResult["records"] = [];
   const warnings: string[] = [];

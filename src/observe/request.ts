@@ -35,6 +35,9 @@ export type ObserveSearchCoverage = {
   timed_out: boolean;
   limit_reached: boolean;
   hits: number;
+  unique_hits: number;
+  query_count: number;
+  batch_count: number;
   total: { value: number; relation: "eq" | "gte" };
   index_families_used: string[];
   scanned_tail_docs: number;
@@ -292,15 +295,103 @@ function cloneNodeAtDepth(node: TraceTreeNode, depth: number): TraceTreeNode {
   };
 }
 
-function buildCriticalPath(rootNodes: TraceTreeNode[]): string[] {
+function parseTimeMs(value: string | null): number | null {
+  if (!value) return null;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function intervalDurationMs(node: TraceTreeNode): number | null {
+  const start = parseTimeMs(node.startTime);
+  const end = parseTimeMs(node.endTime);
+  if (start == null || end == null || end < start) return node.duration;
+  return end - start;
+}
+
+function exclusiveDurationMs(node: TraceTreeNode): number {
+  const total = intervalDurationMs(node) ?? node.duration ?? 0;
+  const start = parseTimeMs(node.startTime);
+  const end = parseTimeMs(node.endTime);
+  if (start == null || end == null || end <= start || node.children.length === 0) return Math.max(0, total);
+  const intervals = node.children
+    .map((child) => {
+      const childStart = parseTimeMs(child.startTime);
+      const childEnd = parseTimeMs(child.endTime);
+      if (childStart == null || childEnd == null || childEnd <= childStart) return null;
+      return [Math.max(start, childStart), Math.min(end, childEnd)] as const;
+    })
+    .filter((interval): interval is readonly [number, number] => !!interval && interval[1] > interval[0])
+    .sort((left, right) => left[0] - right[0]);
+  let covered = 0;
+  let currentStart: number | null = null;
+  let currentEnd: number | null = null;
+  for (const [left, right] of intervals) {
+    if (currentStart == null || currentEnd == null) {
+      currentStart = left;
+      currentEnd = right;
+      continue;
+    }
+    if (left <= currentEnd) {
+      currentEnd = Math.max(currentEnd, right);
+      continue;
+    }
+    covered += currentEnd - currentStart;
+    currentStart = left;
+    currentEnd = right;
+  }
+  if (currentStart != null && currentEnd != null) covered += currentEnd - currentStart;
+  return Math.max(0, total - covered);
+}
+
+function criticalPathScore(node: TraceTreeNode, memo: Map<string, number>): number {
+  const cached = memo.get(node.spanId);
+  if (cached != null) return cached;
+  const score =
+    node.children.length === 0
+      ? exclusiveDurationMs(node)
+      : exclusiveDurationMs(node) + Math.max(...node.children.map((child) => criticalPathScore(child, memo)));
+  memo.set(node.spanId, score);
+  return score;
+}
+
+function rootSelectionScore(node: TraceTreeNode, record: Record<string, unknown> | undefined): number {
+  const http = record ? nestedObject(record, "http") : {};
+  const hasHttp =
+    stringField(http, "method") != null ||
+    stringField(http, "route") != null ||
+    stringField(http, "path") != null ||
+    numberField(http, "statusCode") != null;
+  return (
+    (node.parentSpanId == null ? 10_000 : 0) +
+    (node.kind === "server" ? 2_000 : 0) +
+    (hasHttp ? 1_000 : 0) +
+    (record && stringField(record, "requestId") ? 500 : 0) +
+    Math.min(node.duration ?? 0, 60_000) / 10
+  );
+}
+
+function selectRootSpanId(rootNodes: TraceTreeNode[], bySpanId: Map<string, Record<string, unknown>>): string | null {
+  if (rootNodes.length === 0) return null;
+  return [...rootNodes]
+    .sort((left, right) => {
+      const scoreDiff = rootSelectionScore(right, bySpanId.get(right.spanId)) - rootSelectionScore(left, bySpanId.get(left.spanId));
+      if (scoreDiff !== 0) return scoreDiff;
+      if (left.startTime !== right.startTime) return left.startTime < right.startTime ? -1 : 1;
+      return left.spanId.localeCompare(right.spanId);
+    })[0]?.spanId ?? null;
+}
+
+function buildCriticalPath(rootNodes: TraceTreeNode[], rootSpanId: string | null): string[] {
   if (rootNodes.length === 0) return [];
-  const score = (node: TraceTreeNode): number => (node.duration ?? 0) + (node.statusCode === "error" ? 1_000_000 : 0);
-  let current = [...rootNodes].sort((a, b) => score(b) - score(a))[0]!;
+  const memo = new Map<string, number>();
+  let current =
+    rootNodes.find((node) => node.spanId === rootSpanId) ??
+    [...rootNodes].sort((a, b) => criticalPathScore(b, memo) - criticalPathScore(a, memo))[0]!;
   const out: string[] = [];
   while (current) {
     out.push(current.spanId);
     if (current.children.length === 0) break;
-    current = [...current.children].sort((a, b) => score(b) - score(a))[0]!;
+    current = [...current.children].sort((a, b) => criticalPathScore(b, memo) - criticalPathScore(a, memo))[0]!;
   }
   return out;
 }
@@ -412,14 +503,15 @@ export function buildTraceDetails(spansRaw: unknown[], args?: { spanLimitReached
   };
   const tree = roots.map((root) => setDepth(root, 0)).map((root) => cloneNodeAtDepth(root, 0));
   sortTree(tree);
+  const rootSpanId = selectRootSpanId(tree, bySpanId);
 
   return {
     traceId: spans.length > 0 ? stringField(spans[0]!, "traceId") : null,
-    rootSpanId: tree[0]?.spanId ?? null,
+    rootSpanId,
     spans,
     tree,
     serviceMap: buildServiceMap(spans, bySpanId),
-    criticalPath: buildCriticalPath(tree),
+    criticalPath: buildCriticalPath(tree, rootSpanId),
     errors: buildTraceErrors(spans),
     partial: (args?.spanLimitReached ?? false) || args?.coverageComplete === false || missingParents.size > 0,
     missingParents: Array.from(missingParents).sort(),
@@ -429,31 +521,40 @@ export function buildTraceDetails(spansRaw: unknown[], args?: { spanLimitReached
 
 export function summarizeSearchCoverage(batches: SearchResultBatch[], hits: SearchHit[], limitReached: boolean): ObserveSearchCoverage {
   const families = new Set<string>();
+  const uniqueHitKeys = new Set<string>();
   let complete = batches.length > 0;
   let timedOut = false;
   let scannedTailDocs = 0;
   let scannedSegments = 0;
   let possibleMissing = 0;
-  let totalValue = 0;
   let totalRelation: "eq" | "gte" = "eq";
+  const batchStreams = new Set(batches.map((batch) => batch.stream));
+  const fallbackStream = batchStreams.size === 1 ? Array.from(batchStreams)[0]! : "";
+  for (const hit of hits) {
+    const stream = typeof (hit as SearchHit & { stream?: unknown }).stream === "string" ? (hit as SearchHit & { stream: string }).stream : fallbackStream;
+    uniqueHitKeys.add(`${stream}\0${hit.offset}`);
+  }
   for (const batch of batches) {
     complete = complete && batch.coverage.complete;
     timedOut = timedOut || batch.timedOut;
     scannedTailDocs += batch.coverage.scannedTailDocs;
     scannedSegments += batch.coverage.scannedSegments;
     possibleMissing += batch.coverage.possibleMissingEventsUpperBound;
-    totalValue += batch.total.value;
     if (batch.total.relation === "gte") totalRelation = "gte";
     for (const family of batch.coverage.indexFamiliesUsed) families.add(family);
   }
   if (batches.length === 0) complete = true;
+  const exactUniqueTotal = !limitReached && !timedOut && complete && totalRelation === "eq";
   return {
     searched: batches.length > 0,
     complete: complete && !timedOut && !limitReached,
     timed_out: timedOut,
     limit_reached: limitReached,
-    hits: hits.length,
-    total: { value: totalValue, relation: limitReached ? "gte" : totalRelation },
+    hits: uniqueHitKeys.size,
+    unique_hits: uniqueHitKeys.size,
+    query_count: batches.length,
+    batch_count: batches.length,
+    total: { value: uniqueHitKeys.size, relation: exactUniqueTotal ? "eq" : "gte" },
     index_families_used: Array.from(families).sort(),
     scanned_tail_docs: scannedTailDocs,
     scanned_segments: scannedSegments,

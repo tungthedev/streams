@@ -45,7 +45,7 @@ export type SearchFieldConfig = {
 };
 
 export type SearchRollupMeasureConfig =
-  | { kind: "count" }
+  | { kind: "count"; include?: string }
   | { kind: "summary"; field: string; histogram?: "log2_v1" }
   | {
       kind: "summary_parts";
@@ -58,6 +58,7 @@ export type SearchRollupMeasureConfig =
 
 export type SearchRollupConfig = {
   timestampField?: string;
+  include?: string;
   dimensions?: string[];
   intervals: string[];
   measures: Record<string, SearchRollupMeasureConfig>;
@@ -299,9 +300,12 @@ function parseSearchRollupMeasureResult(
 ): Result<SearchRollupMeasureConfig, { message: string }> {
   if (!isPlainObject(raw)) return Result.err({ message: `${path} must be an object` });
   if (raw.kind === "count") {
-    const keyCheck = rejectUnknownKeysResult(raw, ["kind"], path);
+    const keyCheck = rejectUnknownKeysResult(raw, ["kind", "include"], path);
     if (Result.isError(keyCheck)) return keyCheck;
-    return Result.ok({ kind: "count" });
+    if (raw.include !== undefined && (typeof raw.include !== "string" || raw.include.trim() === "")) {
+      return Result.err({ message: `${path}.include must be a non-empty string` });
+    }
+    return Result.ok({ kind: "count", include: typeof raw.include === "string" ? raw.include.trim() : undefined });
   }
   if (raw.kind === "summary") {
     const keyCheck = rejectUnknownKeysResult(raw, ["kind", "field", "histogram"], path);
@@ -360,7 +364,7 @@ function parseSearchRollupConfigResult(
   primaryTimestampField: string
 ): Result<SearchRollupConfig, { message: string }> {
   if (!isPlainObject(raw)) return Result.err({ message: `${path} must be an object` });
-  const keyCheck = rejectUnknownKeysResult(raw, ["timestampField", "dimensions", "intervals", "measures"], path);
+  const keyCheck = rejectUnknownKeysResult(raw, ["timestampField", "include", "dimensions", "intervals", "measures"], path);
   if (Result.isError(keyCheck)) return keyCheck;
 
   const timestampFieldRaw = raw.timestampField === undefined ? primaryTimestampField : raw.timestampField;
@@ -370,6 +374,14 @@ function parseSearchRollupConfigResult(
   const timestampField = fields[timestampFieldRes.value];
   if (!timestampField) return Result.err({ message: `${path}.timestampField must reference a declared field` });
   if (timestampField.kind !== "date") return Result.err({ message: `${path}.timestampField must reference a date field` });
+
+  let include: string | undefined;
+  if (raw.include !== undefined) {
+    if (typeof raw.include !== "string" || raw.include.trim() === "") {
+      return Result.err({ message: `${path}.include must be a non-empty string` });
+    }
+    include = raw.include.trim();
+  }
 
   let dimensions: string[] | undefined;
   if (raw.dimensions !== undefined) {
@@ -421,6 +433,7 @@ function parseSearchRollupConfigResult(
 
   return Result.ok({
     timestampField: timestampFieldRes.value,
+    include,
     dimensions,
     intervals,
     measures,

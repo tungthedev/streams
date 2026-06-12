@@ -15,6 +15,14 @@ export type OtelTraceAttributeLimits = {
   maxStatementBytes: number;
 };
 
+export type OtelTraceOtlpLimits = {
+  maxCompressedBytes: number;
+  maxDecodedBytes: number;
+  maxResourceSpansPerRequest: number;
+  maxScopeSpansPerRequest: number;
+  maxSpansPerRequest: number;
+};
+
 export type OtelTraceStoreConfig = {
   rawResourceAttributes: boolean;
   rawSpanAttributes: boolean;
@@ -29,6 +37,7 @@ export type OtelTracesStreamProfile = {
   attributeLimits?: Partial<OtelTraceAttributeLimits>;
   store?: Partial<OtelTraceStoreConfig>;
   dbStatementMode?: DbStatementMode;
+  otlpLimits?: Partial<OtelTraceOtlpLimits>;
   observability?: {
     request?: {
       eventsStream: string;
@@ -217,6 +226,14 @@ export const DEFAULT_ATTRIBUTE_LIMITS: OtelTraceAttributeLimits = {
   maxStatementBytes: 4096,
 };
 
+export const DEFAULT_OTLP_LIMITS: OtelTraceOtlpLimits = {
+  maxCompressedBytes: 4 * 1024 * 1024,
+  maxDecodedBytes: 16 * 1024 * 1024,
+  maxResourceSpansPerRequest: 1024,
+  maxScopeSpansPerRequest: 4096,
+  maxSpansPerRequest: 50_000,
+};
+
 export const DEFAULT_STORE_CONFIG: OtelTraceStoreConfig = {
   rawResourceAttributes: true,
   rawSpanAttributes: true,
@@ -326,6 +343,36 @@ function truncateUtf8(value: string, maxBytes: number): string {
   return TEXT_DECODER.decode(bytes.slice(0, Math.max(0, maxBytes)));
 }
 
+function redactionKeyCandidates(key: string): Set<string> {
+  const lowered = key.trim().toLowerCase();
+  const out = new Set<string>();
+  if (lowered === "") return out;
+  out.add(lowered);
+
+  const dotted = lowered.split(".").filter((part) => part !== "");
+  for (let i = 0; i < dotted.length; i++) out.add(dotted.slice(i).join("."));
+  const terminal = dotted.at(-1) ?? lowered;
+  out.add(terminal);
+  out.add(terminal.replace(/[-_]/g, ""));
+
+  const tokens = lowered.split(/[._-]+/).filter((part) => part !== "");
+  for (let length = 1; length <= Math.min(4, tokens.length); length++) {
+    const suffix = tokens.slice(tokens.length - length);
+    out.add(suffix.join("."));
+    out.add(suffix.join("-"));
+    out.add(suffix.join("_"));
+    out.add(suffix.join(""));
+  }
+  return out;
+}
+
+function shouldRedactAttributeKey(key: string, redactKeys: Set<string>): boolean {
+  for (const candidate of redactionKeyCandidates(key)) {
+    if (redactKeys.has(candidate)) return true;
+  }
+  return false;
+}
+
 function sanitizeAttributeValue(value: unknown, redactKeys: Set<string>, path: string, maxBytes: number): { value: unknown; redacted: string[] } {
   if (typeof value === "string") return { value: truncateUtf8(value, maxBytes), redacted: [] };
   if (typeof value === "number") return { value: Number.isFinite(value) ? value : null, redacted: [] };
@@ -347,7 +394,7 @@ function sanitizeAttributeValue(value: unknown, redactKeys: Set<string>, path: s
   const redacted: string[] = [];
   for (const [key, childValue] of Object.entries(value)) {
     const childPath = path === "" ? key : `${path}.${key}`;
-    if (redactKeys.has(key.toLowerCase())) {
+    if (shouldRedactAttributeKey(key, redactKeys)) {
       out[key] = REDACTED_VALUE;
       redacted.push(childPath);
       continue;
@@ -380,7 +427,7 @@ function limitAttributes(
     }
     count += 1;
     const keyPath = args.path === "" ? key : `${args.path}.${key}`;
-    if (args.redactKeys.has(key.toLowerCase())) {
+    if (shouldRedactAttributeKey(key, args.redactKeys)) {
       out[key] = REDACTED_VALUE;
       redacted.push(keyPath);
       continue;
@@ -419,11 +466,14 @@ function getRequestId(attrs: Record<string, unknown>, direct: string | null, req
 
 function extractExceptionFromEvents(events: DecodedOtelEvent[]): { type: string | null; message: string | null; stacktrace: string | null } {
   for (const event of events) {
-    if (event.name !== "exception") continue;
+    const type = getString(event.attributes, "exception.type");
+    const message = getString(event.attributes, "exception.message");
+    const stacktrace = getString(event.attributes, "exception.stacktrace");
+    if ((normalizeString(event.name)?.toLowerCase() ?? "") !== "exception" && !type && !message) continue;
     return {
-      type: getString(event.attributes, "exception.type"),
-      message: getString(event.attributes, "exception.message"),
-      stacktrace: getString(event.attributes, "exception.stacktrace"),
+      type,
+      message,
+      stacktrace,
     };
   }
   return { type: null, message: null, stacktrace: null };
@@ -675,6 +725,118 @@ function linkFromCanonical(value: unknown): DecodedOtelLink | null {
   };
 }
 
+function canonicalString(value: unknown, fallback: string | null): string | null {
+  const normalized = normalizeString(value);
+  return normalized ?? fallback;
+}
+
+function canonicalNumber(value: unknown, fallback: number | null): number | null {
+  const normalized = normalizeNumber(value);
+  return normalized ?? fallback;
+}
+
+function canonicalInteger(value: unknown, fallback: number | null): number | null {
+  const normalized = normalizeInteger(value);
+  return normalized ?? fallback;
+}
+
+function canonicalBoolean(value: unknown, fallback: boolean): boolean {
+  return typeof value === "boolean" ? value : fallback;
+}
+
+function preserveCanonicalEventNames(value: unknown, fallback: string[]): string[] {
+  const out = new Set(fallback);
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const normalized = normalizeString(item);
+      if (normalized) out.add(normalized);
+    }
+  }
+  return Array.from(out);
+}
+
+function preserveRedactionKeys(value: unknown, fallback: string[]): string[] {
+  const out = new Set(fallback);
+  if (isPlainObject(value) && Array.isArray(value.keys)) {
+    for (const item of value.keys) {
+      const normalized = normalizeString(item);
+      if (normalized) out.add(normalized);
+    }
+  }
+  return Array.from(out).sort();
+}
+
+function preserveCanonicalDerivedFields(canonical: CanonicalOtelSpan, raw: Record<string, unknown>): CanonicalOtelSpan {
+  if (raw.schemaVersion !== 1 || raw.signal !== "trace.span") return canonical;
+  const out: CanonicalOtelSpan = structuredClone(canonical);
+
+  out.duration = canonicalNumber(raw.duration, out.duration);
+  out.service = canonicalString(raw.service, out.service);
+  out.serviceNamespace = canonicalString(raw.serviceNamespace, out.serviceNamespace);
+  out.serviceInstanceId = canonicalString(raw.serviceInstanceId, out.serviceInstanceId);
+  out.environment = canonicalString(raw.environment, out.environment);
+  out.version = canonicalString(raw.version, out.version);
+  out.region = canonicalString(raw.region, out.region);
+  out.requestId = canonicalString(raw.requestId, out.requestId);
+
+  const http = isPlainObject(raw.http) ? raw.http : {};
+  out.http = {
+    method: canonicalString(http.method, out.http.method),
+    route: canonicalString(http.route, out.http.route),
+    path: canonicalString(http.path, out.http.path),
+    target: canonicalString(http.target, out.http.target),
+    url: canonicalString(http.url, out.http.url),
+    statusCode: canonicalInteger(http.statusCode, out.http.statusCode),
+    userAgent: canonicalString(http.userAgent, out.http.userAgent),
+  };
+
+  const db = isPlainObject(raw.db) ? raw.db : {};
+  out.db = {
+    system: canonicalString(db.system, out.db.system),
+    name: canonicalString(db.name, out.db.name),
+    operation: canonicalString(db.operation, out.db.operation),
+    statement: canonicalString(db.statement, out.db.statement),
+  };
+
+  const rpc = isPlainObject(raw.rpc) ? raw.rpc : {};
+  out.rpc = {
+    system: canonicalString(rpc.system, out.rpc.system),
+    service: canonicalString(rpc.service, out.rpc.service),
+    method: canonicalString(rpc.method, out.rpc.method),
+  };
+
+  const messaging = isPlainObject(raw.messaging) ? raw.messaging : {};
+  out.messaging = {
+    system: canonicalString(messaging.system, out.messaging.system),
+    destination: canonicalString(messaging.destination, out.messaging.destination),
+    operation: canonicalString(messaging.operation, out.messaging.operation),
+  };
+
+  const error = isPlainObject(raw.error) ? raw.error : {};
+  out.error = {
+    isError: canonicalBoolean(error.isError, out.error.isError),
+    type: canonicalString(error.type, out.error.type),
+    message: canonicalString(error.message, out.error.message),
+    stacktrace: canonicalString(error.stacktrace, out.error.stacktrace),
+  };
+
+  out.eventNames = preserveCanonicalEventNames(raw.eventNames, out.eventNames);
+  out.redaction.keys = preserveRedactionKeys(raw.redaction, out.redaction.keys);
+
+  const dropped = isPlainObject(raw.dropped) ? raw.dropped : {};
+  out.dropped = {
+    attributes: canonicalInteger(dropped.attributes, out.dropped.attributes) ?? 0,
+    events: canonicalInteger(dropped.events, out.dropped.events) ?? 0,
+    links: canonicalInteger(dropped.links, out.dropped.links) ?? 0,
+  };
+
+  out.identity = {
+    spanKey: `${out.traceId}:${out.spanId}`,
+    dedupeKey: sha256Hex(`${out.traceId}\0${out.spanId}\0${out.startUnixNano ?? ""}\0${out.service ?? ""}\0${out.name}`),
+  };
+  return out;
+}
+
 function decodedSpanFromCanonicalLikeResult(value: unknown): Result<DecodedOtelSpan, { message: string }> {
   const objRes = expectPlainObjectResult(value, "otel-traces record");
   if (Result.isError(objRes)) return objRes;
@@ -728,8 +890,9 @@ export function normalizeOtelTraceRecordResult(
   if (Result.isError(decodedRes)) return decodedRes;
   const normalizedRes = normalizeOtelDecodedSpanResult(profile, decodedRes.value);
   if (Result.isError(normalizedRes)) return normalizedRes;
+  const normalized = preserveCanonicalDerivedFields(normalizedRes.value, isPlainObject(value) ? value : {});
   return Result.ok({
-    value: normalizedRes.value,
-    routingKey: normalizedRes.value.traceId,
+    value: normalized,
+    routingKey: normalized.traceId,
   });
 }

@@ -1731,6 +1731,7 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
             });
             if (Result.isError(decodedRes)) {
               if (decodedRes.error.status === 415) return unsupportedMediaType(decodedRes.error.message);
+              if (decodedRes.error.status === 413) return tooLarge(decodedRes.error.message);
               return badRequest(decodedRes.error.message);
             }
 
@@ -1891,21 +1892,24 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
           target: "events" | "traces",
           result: { hits: SearchHit[]; batches: SearchResultBatch[]; limitReached: boolean }
         ) => {
+          const stream = result.batches[0]?.stream ?? "";
           if (target === "events") {
-            const seen = new Set(eventHits.map((hit) => hit.offset));
+            const seen = new Set(eventHits.map((hit) => `${(hit as SearchHit & { stream?: string }).stream ?? ""}\0${hit.offset}`));
             for (const hit of result.hits) {
-              if (seen.has(hit.offset)) continue;
-              seen.add(hit.offset);
-              eventHits.push(hit);
+              const key = `${stream}\0${hit.offset}`;
+              if (seen.has(key)) continue;
+              seen.add(key);
+              eventHits.push({ ...hit, stream } as SearchHit);
             }
             eventBatches.push(...result.batches);
             eventLimitReached = eventLimitReached || result.limitReached || eventHits.length >= observeReq.limits.events && !!result.batches.at(-1)?.nextSearchAfter;
           } else {
-            const seen = new Set(traceHits.map((hit) => hit.offset));
+            const seen = new Set(traceHits.map((hit) => `${(hit as SearchHit & { stream?: string }).stream ?? ""}\0${hit.offset}`));
             for (const hit of result.hits) {
-              if (seen.has(hit.offset)) continue;
-              seen.add(hit.offset);
-              traceHits.push(hit);
+              const key = `${stream}\0${hit.offset}`;
+              if (seen.has(key)) continue;
+              seen.add(key);
+              traceHits.push({ ...hit, stream } as SearchHit);
             }
             traceBatches.push(...result.batches);
             traceLimitReached = traceLimitReached || result.limitReached || traceHits.length >= observeReq.limits.spans && !!result.batches.at(-1)?.nextSearchAfter;
