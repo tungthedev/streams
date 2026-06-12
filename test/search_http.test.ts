@@ -900,7 +900,7 @@ describe("_search http", () => {
   );
 
   test(
-    "reports incomplete WAL coverage while returning visible uploaded matches",
+    "reports incomplete coverage while uploaded companions are missing",
     async () => {
       const root = mkdtempSync(join(tmpdir(), "ds-search-omit-suffix-"));
       const cfg = makeConfig(root, {
@@ -997,15 +997,15 @@ describe("_search http", () => {
         );
         expect(res.status).toBe(200);
         const body = await res.json();
-        expect(body.hits.length).toBeGreaterThan(0);
+        expect(body.hits).toHaveLength(0);
         expect(body.coverage.complete).toBe(false);
         expect(body.coverage.mode).toBe("published");
-        expect(body.coverage.indexed_segments + body.coverage.scanned_segments).toBeGreaterThan(0);
+        expect(body.coverage.indexed_segments + body.coverage.scanned_segments).toBe(0);
         expect(body.coverage.scanned_tail_docs).toBe(0);
+        expect(body.coverage.possible_missing_uploaded_segments).toBeGreaterThan(0);
         expect(body.coverage.possible_missing_wal_rows).toBeGreaterThan(0);
         expect(body.coverage.possible_missing_events_upper_bound).toBeGreaterThan(0);
-        expect(body.total.value).toBeGreaterThan(0);
-        expect(["eq", "gte"]).toContain(body.total.relation);
+        expect(body.total).toEqual({ value: 0, relation: "gte" });
       } finally {
         await app.close();
         rmSync(root, { recursive: true, force: true });

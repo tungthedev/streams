@@ -2,6 +2,13 @@
 
 ## Upcoming
 
+- Add an `otel-traces` profile with OTLP JSON/protobuf/gzip ingest, canonical
+  trace-span normalization, search aliases, privacy controls, and trace rollups.
+- Add request observability pairing descriptors and `POST /v1/observe/request`
+  so clients can correlate `evlog` request events with `otel-traces` spans by
+  request ID, trace ID, or span ID.
+- Add bounded request-observability coverage diagnostics, raw-payload controls,
+  and scale-oriented tests for Studio request detail views.
 - Require an explicit full-server auth mode, with `--auth-strategy api-key`
   enforcing bearer-token authentication on every production Streams and Compute
   demo request.
