@@ -558,6 +558,7 @@ export function normalizeOtelDecodedSpanResult(
   const endTimestamp = isoFromUnixNano(endUnixNano);
 
   const normalizedEvents: CanonicalOtelSpan["events"] = [];
+  const eventDerivationInput: DecodedOtelEvent[] = [];
   let droppedEvents = Math.max(0, Math.trunc(input.droppedEventsCount ?? 0));
   const eventNames: string[] = [];
   for (const event of input.events) {
@@ -574,6 +575,12 @@ export function normalizeOtelDecodedSpanResult(
     });
     const eventName = normalizeString(event.name) ?? "";
     eventNames.push(eventName);
+    eventDerivationInput.push({
+      timeUnixNano: normalizeNanoString(event.timeUnixNano),
+      name: eventName,
+      attributes: eventAttrs.attributes,
+      droppedAttributesCount: eventAttrs.dropped,
+    });
     normalizedEvents.push({
       timestamp: isoFromUnixNano(normalizeNanoString(event.timeUnixNano)),
       timeUnixNano: normalizeNanoString(event.timeUnixNano),
@@ -622,7 +629,7 @@ export function normalizeOtelDecodedSpanResult(
   const spanAttrs = attrsRes.attributes;
   const service = getString(resourceAttrs, "service.name");
   const statusCode = normalizeStatusCode(input.status?.code);
-  const exception = extractExceptionFromEvents(normalizedEvents);
+  const exception = extractExceptionFromEvents(eventDerivationInput);
   const attrErrorType = getString(spanAttrs, "exception.type", "error.type");
   const attrErrorMessage = getString(spanAttrs, "exception.message", "error.message");
   const attrErrorStack = getString(spanAttrs, "exception.stacktrace", "error.stacktrace");

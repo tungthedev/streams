@@ -204,6 +204,11 @@ It means:
   default rollups
 - the canonical routing key is `traceId`
 
+See [docs/profile-otel-traces.md](./docs/profile-otel-traces.md) for the
+profile and OTLP receiver contract, and
+[docs/request-observability.md](./docs/request-observability.md) for
+cross-stream lookup over `evlog` events and `otel-traces` spans.
+
 ## Profile Versus Schema
 
 What belongs in a profile:

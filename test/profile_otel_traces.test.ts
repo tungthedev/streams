@@ -371,7 +371,7 @@ describe("otel-traces profile", () => {
             kind: "server",
             startUnixNano: "1772020800000000000",
             endUnixNano: "1772020800123000000",
-            status: { code: "error", message: "failed" },
+            status: { code: "error" },
             resource: {
               attributes: {
                 "service.name": "checkout",
@@ -528,6 +528,7 @@ describe("otel-traces profile", () => {
                 timeUnixNano: "1772020800100000000",
                 name: "exception",
                 attributes: {
+                  "exception.type": "Error",
                   "exception.message": "checkout failed",
                 },
               },
@@ -548,7 +549,7 @@ describe("otel-traces profile", () => {
         environment: "prod",
         requestId: "req_preserve_1",
         http: { method: "GET", route: "/checkout", statusCode: 500 },
-        error: { isError: true, message: "failed" },
+        error: { isError: true, type: "Error", message: "checkout failed" },
         eventNames: ["exception"],
       });
 
@@ -568,7 +569,7 @@ describe("otel-traces profile", () => {
         environment: "prod",
         requestId: "req_preserve_1",
         http: { method: "GET", route: "/checkout", statusCode: 500 },
-        error: { isError: true, message: "failed" },
+        error: { isError: true, type: "Error", message: "checkout failed" },
         eventNames: ["exception"],
       });
     } finally {
