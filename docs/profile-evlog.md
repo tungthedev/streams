@@ -19,6 +19,9 @@ The v1 profile:
 - support request-centric lookup through the existing routing-key path
 
 The v1 profile does not introduce a separate observability storage engine.
+It also does not store OpenTelemetry span graphs; spans belong in
+[`otel-traces`](./profile-otel-traces.md) streams and are correlated at query
+time.
 
 ## Stream Contract
 
@@ -31,7 +34,57 @@ The v1 profile does not introduce a separate observability storage engine.
   default `search` and `search.rollups` config
 - the profile provides a default routing key from `requestId`, with `traceId`
   fallback
+- optional correlation settings can define request/trace field aliases and
+  `traceparent` parsing for better joins with `otel-traces`
 - reads continue to use the normal durable stream APIs
+
+Supported profile shape:
+
+```json
+{
+  "kind": "evlog",
+  "redactKeys": ["sessiontoken"],
+  "correlation": {
+    "requestIdFields": ["requestId", "context.requestId"],
+    "traceContextFields": [
+      "traceId",
+      "spanId",
+      "traceContext.traceId",
+      "traceContext.spanId"
+    ],
+    "parseTraceparent": true
+  },
+  "observability": {
+    "request": {
+      "tracesStream": "app-traces"
+    }
+  }
+}
+```
+
+`correlation` only affects how the evlog canonical envelope derives
+`requestId`, `traceId`, and `spanId`; it does not make evlog accept spans.
+When `parseTraceparent` is not false, the profile reads W3C `traceparent` from
+`traceparent`, `traceContext.traceparent`, `context.traceparent`, or
+`headers.traceparent` if explicit trace fields are absent.
+
+`observability.request.tracesStream` declares the explicit `otel-traces`
+counterpart for request-observability clients. When it is present,
+`GET /v1/streams` and `GET /v1/stream/{name}/_details` expose:
+
+```json
+{
+  "observability": {
+    "request": {
+      "events_stream": "app-events",
+      "traces_stream": "app-traces"
+    }
+  }
+}
+```
+
+Clients must use this descriptor instead of guessing the trace stream from
+other stream names or profiles.
 
 ## Canonical Envelope
 
@@ -196,6 +249,7 @@ Current evlog query surfaces:
 - `POST /v1/stream/{name}/_search`
 - `GET /v1/stream/{name}/_search?q=...`
 - `POST /v1/stream/{name}/_aggregate`
+- `POST /v1/observe/request` when paired with an `otel-traces` stream
 
 ## UI Integration
 
@@ -206,7 +260,9 @@ record/detail surface.
 Recommended integration flow:
 
 1. Create the stream with `application/json`.
-2. Install the `evlog` profile with `POST /v1/stream/{name}/_profile`.
+2. Install the `evlog` profile with `POST /v1/stream/{name}/_profile`. Include
+   `observability.request.tracesStream` when this stream has a known
+   `otel-traces` counterpart.
 3. Read `GET /v1/stream/{name}/_details` when the UI needs the combined
    stream/profile/schema/index descriptor.
 4. Read `GET /v1/stream/{name}/_index_status` for dedicated indexing progress

@@ -13,6 +13,7 @@ import {
 } from "./schema";
 import {
   collectPositiveSearchExactClauses,
+  evaluateSearchQueryResult,
   parseSearchQueryResult,
   type CompiledSearchQuery,
 } from "./query";
@@ -289,6 +290,20 @@ export function rollupRequiredFieldNames(registry: SchemaRegistry, rollup: Searc
   return Array.from(fields);
 }
 
+function matchesRollupIncludeResult(
+  registry: SchemaRegistry,
+  offset: bigint,
+  value: unknown,
+  include: string | undefined
+): Result<boolean, { message: string }> {
+  if (!include) return Result.ok(true);
+  const queryRes = parseSearchQueryResult(registry, include);
+  if (Result.isError(queryRes)) return queryRes;
+  const evalRes = evaluateSearchQueryResult(registry, offset, queryRes.value, value);
+  if (Result.isError(evalRes)) return evalRes;
+  return Result.ok(evalRes.value.matched);
+}
+
 export function extractRollupContributionResult(
   registry: SchemaRegistry,
   rollup: SearchRollupConfig,
@@ -297,6 +312,9 @@ export function extractRollupContributionResult(
   precomputedRawValues?: Map<string, unknown[]>
 ): Result<{ timestampMs: number; dimensions: Record<string, string | null>; measures: Record<string, AggMeasureState> } | null, { message: string }> {
   if (!isPlainObject(value)) return Result.ok(null);
+  const rollupIncludeRes = matchesRollupIncludeResult(registry, offset, value, rollup.include);
+  if (Result.isError(rollupIncludeRes)) return rollupIncludeRes;
+  if (!rollupIncludeRes.value) return Result.ok(null);
   const rawValuesRes = precomputedRawValues
     ? Result.ok(precomputedRawValues)
     : extractRawSearchValuesForFieldsResult(registry, offset, value, rollupRequiredFieldNames(registry, rollup));
@@ -331,7 +349,9 @@ export function extractRollupContributionResult(
   const measures: Record<string, AggMeasureState> = {};
   for (const [measureName, measure] of Object.entries(rollup.measures)) {
     if (measure.kind === "count") {
-      measures[measureName] = { kind: "count", value: 1 };
+      const includeRes = matchesRollupIncludeResult(registry, offset, value, measure.include);
+      if (Result.isError(includeRes)) return includeRes;
+      measures[measureName] = { kind: "count", value: includeRes.value ? 1 : 0 };
       continue;
     }
     if (measure.kind === "summary") {

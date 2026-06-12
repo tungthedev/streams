@@ -68,6 +68,11 @@ Notes:
   and `sortable`.
 - `search.rollups` is optional. When configured, the server builds schema-owned
   `.agg` rollup companions and enables `POST /v1/stream/{name}/_aggregate`.
+- A rollup may set `include` to a normal search query string. Records that do
+  not match that query do not contribute to that rollup.
+- A `count` rollup measure may also set `include`. Matching records contribute
+  `1`; non-matching records contribute `0` to that measure while still
+  contributing to the rest of the rollup row.
 
 ## HTTP API
 
@@ -77,11 +82,15 @@ Notes:
   fields for schema updates, routing-key updates, and search updates.
 - Profile-owned live/touch configuration belongs in `/_profile`, not `/_schema`.
 
-One profile-owned exception exists in the current shipped system:
+Profile-owned exceptions exist for built-in canonical profiles:
 
 - installing the `evlog` profile auto-installs its canonical schema version `1`
   and default `search` registry, so the default evlog path does not require a
   separate manual `/_schema` call
+- installing the `metrics` profile auto-installs its canonical metrics schema
+  version `1` and default `search`/`search.rollups` registry
+- installing the `otel-traces` profile auto-installs its canonical span schema
+  version `1` and default `search`/`search.rollups` registry
 
 Accepted POST shapes:
 
@@ -106,7 +115,7 @@ Accepted POST shapes:
 4) Search update with rollups:
 
 ```json
-{"search": {"primaryTimestampField": "eventTime", "fields": {"eventTime": {"kind": "date", "bindings": [{"version": 1, "jsonPointer": "/eventTime"}], "exact": true, "column": true, "exists": true, "sortable": true}, "service": {"kind": "keyword", "bindings": [{"version": 1, "jsonPointer": "/service"}], "exact": true, "prefix": true, "exists": true}, "duration": {"kind": "float", "bindings": [{"version": 1, "jsonPointer": "/duration"}], "exact": true, "column": true, "exists": true, "sortable": true, "aggregatable": true}}, "rollups": {"requests": {"dimensions": ["service"], "intervals": ["1m"], "measures": {"requests": {"kind": "count"}, "latency": {"kind": "summary", "field": "duration", "histogram": "log2_v1"}}}}}}
+{"search": {"primaryTimestampField": "eventTime", "fields": {"eventTime": {"kind": "date", "bindings": [{"version": 1, "jsonPointer": "/eventTime"}], "exact": true, "column": true, "exists": true, "sortable": true}, "service": {"kind": "keyword", "bindings": [{"version": 1, "jsonPointer": "/service"}], "exact": true, "prefix": true, "exists": true}, "kind": {"kind": "keyword", "bindings": [{"version": 1, "jsonPointer": "/kind"}], "exact": true, "exists": true}, "error": {"kind": "bool", "bindings": [{"version": 1, "jsonPointer": "/error"}], "exact": true, "column": true, "exists": true}, "duration": {"kind": "float", "bindings": [{"version": 1, "jsonPointer": "/duration"}], "exact": true, "column": true, "exists": true, "sortable": true, "aggregatable": true}}, "rollups": {"requests": {"include": "kind:server", "dimensions": ["service"], "intervals": ["1m"], "measures": {"requests": {"kind": "count"}, "errors": {"kind": "count", "include": "error:true"}, "latency": {"kind": "summary", "field": "duration", "histogram": "log2_v1"}}}}}}
 ```
 
 Important rule:
@@ -168,8 +177,10 @@ If `routingKey` is configured:
 
 Schemas do not define:
 
-- whether a stream is `generic`, `evlog`, `metrics`, or `state-protocol`
+- whether a stream is `generic`, `evlog`, `metrics`, `otel-traces`, or
+  `state-protocol`
 - profile-owned endpoints or runtime hooks
+- OTLP trace ingestion or cross-stream request correlation
 
 Schemas do define payload-owned field extraction, including routing keys and
 schema-owned search field declarations and rollups.
