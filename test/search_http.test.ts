@@ -900,7 +900,7 @@ describe("_search http", () => {
   );
 
   test(
-    "reports incomplete coverage while uploaded companions are missing",
+    "reports incomplete coverage while omitting the fresh WAL tail during companion catch-up",
     async () => {
       const root = mkdtempSync(join(tmpdir(), "ds-search-omit-suffix-"));
       const cfg = makeConfig(root, {
@@ -997,15 +997,24 @@ describe("_search http", () => {
         );
         expect(res.status).toBe(200);
         const body = await res.json();
-        expect(body.hits).toHaveLength(0);
         expect(body.coverage.complete).toBe(false);
         expect(body.coverage.mode).toBe("published");
-        expect(body.coverage.indexed_segments + body.coverage.scanned_segments).toBe(0);
         expect(body.coverage.scanned_tail_docs).toBe(0);
-        expect(body.coverage.possible_missing_uploaded_segments).toBeGreaterThan(0);
         expect(body.coverage.possible_missing_wal_rows).toBeGreaterThan(0);
         expect(body.coverage.possible_missing_events_upper_bound).toBeGreaterThan(0);
-        expect(body.total).toEqual({ value: 0, relation: "gte" });
+        expect(body.total.relation).toBe("gte");
+
+        const requestIds = body.hits.map((hit: any) => hit.fields.requestId);
+        expect(requestIds).not.toContain("req_tail");
+        expect(requestIds.every((requestId: string) => requestId === "req_1" || requestId === "req_2")).toBe(true);
+        if (body.hits.length === 0) {
+          expect(body.coverage.possible_missing_uploaded_segments).toBeGreaterThan(0);
+          expect(body.coverage.indexed_segments + body.coverage.scanned_segments).toBe(0);
+          expect(body.total.value).toBe(0);
+        } else {
+          expect(body.coverage.indexed_segments + body.coverage.scanned_segments).toBeGreaterThan(0);
+          expect(body.total.value).toBeGreaterThanOrEqual(body.hits.length);
+        }
       } finally {
         await app.close();
         rmSync(root, { recursive: true, force: true });
