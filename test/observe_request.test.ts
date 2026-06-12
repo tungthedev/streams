@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { buildTraceDetails, summarizeSearchCoverage } from "../src/observe/request";
+import { buildTraceDetails, summarizeSearchCoverage, summarizeSearchQueryCoverage } from "../src/observe/request";
 import type { SearchHit, SearchResultBatch } from "../src/reader";
 import { createProfileTestApp, fetchJsonApp } from "./profile_test_utils";
 
@@ -252,11 +252,21 @@ describe("observe request API", () => {
       { stream: "app-traces", offset: "1", score: 1, sort: [], fields: {}, source: {} },
     ];
 
-    expect(summarizeSearchCoverage(batches, hits, false)).toMatchObject({
+    const query = summarizeSearchQueryCoverage("trace:abc", batches, hits.slice(0, 2), false);
+    expect(query).toMatchObject({
+      q: "trace:abc",
+      hits: 2,
+      total: { value: 2, relation: "eq" },
+      pages: 2,
+      complete: true,
+    });
+
+    expect(summarizeSearchCoverage(batches, hits, false, [query])).toMatchObject({
       hits: 2,
       unique_hits: 2,
       query_count: 2,
       total: { value: 2, relation: "eq" },
+      queries: [query],
     });
   });
 
@@ -310,6 +320,18 @@ describe("observe request API", () => {
       expect(res.body.timeline.length).toBeGreaterThanOrEqual(7);
       expect(res.body.coverage.events.searched).toBe(true);
       expect(res.body.coverage.traces.searched).toBe(true);
+      expect(res.body.coverage.events.queries[0]).toMatchObject({
+        hits: 1,
+        pages: 1,
+        complete: true,
+      });
+      expect(res.body.coverage.events.queries[0].q).toContain("req:");
+      expect(res.body.coverage.traces.queries[0]).toMatchObject({
+        hits: 3,
+        pages: 1,
+        complete: true,
+      });
+      expect(res.body.coverage.traces.queries[0].q).toContain("trace:");
       expect(res.body.coverage.warnings).toEqual([]);
     } finally {
       await app.close();
@@ -421,6 +443,12 @@ describe("observe request API", () => {
       expect(res.body.trace.partial).toBe(false);
       expect(res.body.coverage.traces.hits).toBe(1200);
       expect(res.body.coverage.traces.limit_reached).toBe(false);
+      expect(res.body.coverage.traces.queries[0]).toMatchObject({
+        hits: 1200,
+        pages: 3,
+        complete: true,
+      });
+      expect(res.body.coverage.traces.queries[0].q).toBe(`trace:"${TRACE_ID}"`);
       expect(res.body.coverage.warnings).toEqual([]);
     } finally {
       await app.close();

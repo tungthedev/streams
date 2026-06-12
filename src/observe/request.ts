@@ -43,6 +43,17 @@ export type ObserveSearchCoverage = {
   scanned_tail_docs: number;
   scanned_segments: number;
   possible_missing_events_upper_bound: number;
+  queries: ObserveSearchQueryCoverage[];
+};
+
+export type ObserveSearchQueryCoverage = {
+  q: string;
+  hits: number;
+  total: { value: number; relation: "eq" | "gte" };
+  pages: number;
+  complete: boolean;
+  timed_out: boolean;
+  limit_reached: boolean;
 };
 
 export type TraceTreeNode = {
@@ -519,7 +530,40 @@ export function buildTraceDetails(spansRaw: unknown[], args?: { spanLimitReached
   };
 }
 
-export function summarizeSearchCoverage(batches: SearchResultBatch[], hits: SearchHit[], limitReached: boolean): ObserveSearchCoverage {
+export function summarizeSearchQueryCoverage(
+  q: string,
+  batches: SearchResultBatch[],
+  hits: SearchHit[],
+  limitReached: boolean
+): ObserveSearchQueryCoverage {
+  let complete = batches.length > 0;
+  let timedOut = false;
+  let totalValue = 0;
+  let totalRelation: "eq" | "gte" = "eq";
+  for (const batch of batches) {
+    complete = complete && batch.coverage.complete;
+    timedOut = timedOut || batch.timedOut;
+    totalValue = Math.max(totalValue, batch.total.value);
+    if (batch.total.relation === "gte") totalRelation = "gte";
+  }
+  if (batches.length === 0) complete = true;
+  return {
+    q,
+    hits: hits.length,
+    total: { value: totalValue, relation: totalRelation },
+    pages: batches.length,
+    complete: complete && !timedOut && !limitReached,
+    timed_out: timedOut,
+    limit_reached: limitReached,
+  };
+}
+
+export function summarizeSearchCoverage(
+  batches: SearchResultBatch[],
+  hits: SearchHit[],
+  limitReached: boolean,
+  queries: ObserveSearchQueryCoverage[] = []
+): ObserveSearchCoverage {
   const families = new Set<string>();
   const uniqueHitKeys = new Set<string>();
   let complete = batches.length > 0;
@@ -559,6 +603,7 @@ export function summarizeSearchCoverage(batches: SearchResultBatch[], hits: Sear
     scanned_tail_docs: scannedTailDocs,
     scanned_segments: scannedSegments,
     possible_missing_events_upper_bound: possibleMissing,
+    queries,
   };
 }
 

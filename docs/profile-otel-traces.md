@@ -53,12 +53,16 @@ Content-Type: application/json
       "rawLinks": true
     },
     "dbStatementMode": "drop",
+    "urlMode": "drop_query",
     "otlpLimits": {
       "maxCompressedBytes": 4194304,
       "maxDecodedBytes": 16777216,
       "maxResourceSpansPerRequest": 1024,
       "maxScopeSpansPerRequest": 4096,
-      "maxSpansPerRequest": 50000
+      "maxSpansPerRequest": 50000,
+      "maxAnyValueDepth": 16,
+      "maxArrayValuesPerAnyValue": 256,
+      "maxKvListValuesPerAnyValue": 256
     },
     "observability": {
       "request": {
@@ -72,9 +76,14 @@ Content-Type: application/json
 Supported `dbStatementMode` values:
 
 - `drop` stores `db.statement` as `null`
-- `raw` stores the statement after normal attribute value truncation
+- `raw` stores the statement after `maxStatementBytes` truncation
 
 There is no `redact_literals` mode in the shipped implementation.
+
+Supported `urlMode` values:
+
+- `drop_query` stores `http.url` / `url.full` without query or fragment
+- `raw` stores the URL after normal attribute value truncation
 
 Redaction matches configured keys case-insensitively and also checks dotted
 header/metadata suffixes. For example, the built-in `authorization`, `cookie`,
@@ -110,7 +119,10 @@ UI rendering.
 When an already-canonical span record is appended again, top-level canonical
 fields such as service, environment, request ID, HTTP fields, error fields,
 duration, and `eventNames` are preserved even if the raw attributes or raw
-events were not retained in the stored record.
+events were not retained in the stored record. Preservation still applies the
+current profile policy: `dbStatementMode` can drop `db.statement`, `urlMode`
+can remove URL query/fragment data, and preserved strings are truncated by the
+active attribute limits.
 
 ## OTLP Ingestion
 
@@ -151,12 +163,17 @@ Both endpoints support:
 - `application/json`
 - `Content-Encoding: gzip`
 
-Malformed payloads and requests that exceed resource-span, scope-span, or span
-count limits return `400`. Payloads that exceed compressed or decoded byte
-limits return `413`. Unsupported media types or encodings return `415`. A
-successful full acceptance returns OTLP success. Partial acceptance returns
-HTTP `200` with OTLP `partialSuccess` / `partial_success` information; clients
-should not retry rejected spans from that response.
+Malformed payloads and requests that exceed resource-span or scope-span limits
+return `400`. Payloads that exceed compressed or decoded byte limits return
+`413`. Unsupported media types or encodings return `415`. If a decodable batch
+exceeds `maxSpansPerRequest`, the first spans up to the limit are accepted and
+the response is HTTP `200` with OTLP `partialSuccess` / `partial_success`
+information for the rejected overflow. Clients should not retry rejected spans
+from that response.
+
+OTLP `AnyValue` decoding is bounded by `maxAnyValueDepth`,
+`maxArrayValuesPerAnyValue`, and `maxKvListValuesPerAnyValue` for both JSON
+and protobuf requests.
 
 ## JSON Appends
 

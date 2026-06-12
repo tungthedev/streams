@@ -70,6 +70,8 @@ import {
   quoteSearchValue,
   sortTimeline,
   summarizeSearchCoverage,
+  summarizeSearchQueryCoverage,
+  type ObserveSearchQueryCoverage,
 } from "./observe/request";
 import { buildRequestObservabilityPairingDescriptor } from "./observe/pairing";
 import { dsError } from "./util/ds_error.ts";
@@ -1828,7 +1830,7 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
           q: string,
           limit: number,
           sort: string[]
-        ): Promise<{ hits: SearchHit[]; batches: SearchResultBatch[]; limitReached: boolean } | Response> => {
+        ): Promise<{ hits: SearchHit[]; batches: SearchResultBatch[]; limitReached: boolean; query: ObserveSearchQueryCoverage } | Response> => {
           const regRes = registry.getRegistryResult(stream);
           if (Result.isError(regRes)) return internalError(regRes.error.message);
           const hits: SearchHit[] = [];
@@ -1867,7 +1869,7 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
               break;
             }
           }
-          return { hits, batches, limitReached };
+          return { hits, batches, limitReached, query: summarizeSearchQueryCoverage(q, batches, hits, limitReached) };
         };
 
         const timeClauses = buildTimeSearchClauses(observeReq.time);
@@ -1876,9 +1878,11 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
         const traceSort = ["timestamp:asc", "spanId:asc"];
         let eventHits: SearchHit[] = [];
         let eventBatches: SearchResultBatch[] = [];
+        const eventQueries: ObserveSearchQueryCoverage[] = [];
         let eventLimitReached = false;
         let traceHits: SearchHit[] = [];
         let traceBatches: SearchResultBatch[] = [];
+        const traceQueries: ObserveSearchQueryCoverage[] = [];
         let traceLimitReached = false;
         const candidateTraceIds = new Set<string>();
         const addTraceIdsFromHits = (hits: SearchHit[]) => {
@@ -1890,7 +1894,7 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
         };
         const appendSearch = (
           target: "events" | "traces",
-          result: { hits: SearchHit[]; batches: SearchResultBatch[]; limitReached: boolean }
+          result: { hits: SearchHit[]; batches: SearchResultBatch[]; limitReached: boolean; query: ObserveSearchQueryCoverage }
         ) => {
           const stream = result.batches[0]?.stream ?? "";
           if (target === "events") {
@@ -1902,6 +1906,7 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
               eventHits.push({ ...hit, stream } as SearchHit);
             }
             eventBatches.push(...result.batches);
+            eventQueries.push(result.query);
             eventLimitReached = eventLimitReached || result.limitReached || eventHits.length >= observeReq.limits.events && !!result.batches.at(-1)?.nextSearchAfter;
           } else {
             const seen = new Set(traceHits.map((hit) => `${(hit as SearchHit & { stream?: string }).stream ?? ""}\0${hit.offset}`));
@@ -1912,6 +1917,7 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
               traceHits.push({ ...hit, stream } as SearchHit);
             }
             traceBatches.push(...result.batches);
+            traceQueries.push(result.query);
             traceLimitReached = traceLimitReached || result.limitReached || traceHits.length >= observeReq.limits.spans && !!result.batches.at(-1)?.nextSearchAfter;
           }
         };
@@ -1972,8 +1978,8 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
           }
         }
 
-        const eventCoverage = summarizeSearchCoverage(eventBatches, eventHits, eventLimitReached);
-        const traceCoverage = summarizeSearchCoverage(traceBatches, traceHits, traceLimitReached);
+        const eventCoverage = summarizeSearchCoverage(eventBatches, eventHits, eventLimitReached, eventQueries);
+        const traceCoverage = summarizeSearchCoverage(traceBatches, traceHits, traceLimitReached, traceQueries);
         const trace = buildTraceDetails(
           traceHits.map((hit) => hit.source),
           { spanLimitReached: traceCoverage.limit_reached, coverageComplete: traceCoverage.complete }

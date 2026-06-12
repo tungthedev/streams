@@ -26,6 +26,7 @@ import {
   type OtelTraceOtlpLimits,
   type OtelTraceStoreConfig,
   type OtelTracesStreamProfile,
+  type UrlMode,
 } from "./otelTraces/normalize";
 import { decodeOtlpTraceExportRequestResult } from "./otelTraces/otlp";
 
@@ -98,7 +99,16 @@ function parseOtlpLimitsResult(raw: unknown, path: string): Result<Partial<OtelT
   if (Result.isError(objRes)) return objRes;
   const keyCheck = rejectUnknownKeysResult(
     objRes.value,
-    ["maxCompressedBytes", "maxDecodedBytes", "maxResourceSpansPerRequest", "maxScopeSpansPerRequest", "maxSpansPerRequest"],
+    [
+      "maxCompressedBytes",
+      "maxDecodedBytes",
+      "maxResourceSpansPerRequest",
+      "maxScopeSpansPerRequest",
+      "maxSpansPerRequest",
+      "maxAnyValueDepth",
+      "maxArrayValuesPerAnyValue",
+      "maxKvListValuesPerAnyValue",
+    ],
     path
   );
   if (Result.isError(keyCheck)) return keyCheck;
@@ -131,6 +141,12 @@ function parseDbStatementModeResult(raw: unknown, path: string): Result<DbStatem
   if (raw === undefined) return Result.ok(undefined);
   if (raw === "drop" || raw === "raw") return Result.ok(raw);
   return Result.err({ message: `${path} must be drop or raw` });
+}
+
+function parseUrlModeResult(raw: unknown, path: string): Result<UrlMode | undefined, { message: string }> {
+  if (raw === undefined) return Result.ok(undefined);
+  if (raw === "drop_query" || raw === "raw") return Result.ok(raw);
+  return Result.err({ message: `${path} must be drop_query or raw` });
 }
 
 function parseStreamNameResult(raw: unknown, path: string): Result<string | undefined, { message: string }> {
@@ -170,7 +186,7 @@ function validateOtelTracesProfileResult(raw: unknown, path: string): Result<Ote
   if (objRes.value.kind !== "otel-traces") return Result.err({ message: `${path}.kind must be otel-traces` });
   const keyCheck = rejectUnknownKeysResult(
     objRes.value,
-    ["kind", "redactKeys", "requestIdAttributes", "attributeLimits", "store", "dbStatementMode", "otlpLimits", "observability"],
+    ["kind", "redactKeys", "requestIdAttributes", "attributeLimits", "store", "dbStatementMode", "urlMode", "otlpLimits", "observability"],
     path
   );
   if (Result.isError(keyCheck)) return keyCheck;
@@ -184,6 +200,8 @@ function validateOtelTracesProfileResult(raw: unknown, path: string): Result<Ote
   if (Result.isError(storeRes)) return storeRes;
   const dbStatementModeRes = parseDbStatementModeResult(objRes.value.dbStatementMode, `${path}.dbStatementMode`);
   if (Result.isError(dbStatementModeRes)) return dbStatementModeRes;
+  const urlModeRes = parseUrlModeResult(objRes.value.urlMode, `${path}.urlMode`);
+  if (Result.isError(urlModeRes)) return urlModeRes;
   const otlpLimitsRes = parseOtlpLimitsResult(objRes.value.otlpLimits, `${path}.otlpLimits`);
   if (Result.isError(otlpLimitsRes)) return otlpLimitsRes;
   const observabilityRes = parseOtelTracesObservabilityResult(objRes.value.observability, `${path}.observability`);
@@ -194,6 +212,7 @@ function validateOtelTracesProfileResult(raw: unknown, path: string): Result<Ote
   if (limitsRes.value) profile.attributeLimits = limitsRes.value;
   if (storeRes.value) profile.store = storeRes.value;
   if (dbStatementModeRes.value) profile.dbStatementMode = dbStatementModeRes.value;
+  if (urlModeRes.value) profile.urlMode = urlModeRes.value;
   if (otlpLimitsRes.value) profile.otlpLimits = otlpLimitsRes.value;
   if (observabilityRes.value) profile.observability = observabilityRes.value;
   return Result.ok(profile);

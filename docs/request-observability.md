@@ -189,10 +189,11 @@ request roots first: no parent, server kind, HTTP fields, request ID, and then
 duration. Other root spans remain in `trace.tree`; the selected root only
 drives summary fields and the highlighted path.
 
-`criticalPath` is an interval-aware highlighted span path that starts at the
+`criticalPath` is a best-effort interval-aware latency path that starts at the
 selected root when one exists. Child selection uses each subtree's exclusive
 time plus its longest descendant contribution, so overlapping sibling spans do
-not simply add together.
+not simply add together. It is intended for UI highlighting and debugging, not
+as a mathematically exact causal critical path.
 
 ## Trace Tree
 
@@ -254,12 +255,23 @@ the request:
 - `scanned_tail_docs`
 - `scanned_segments`
 - `possible_missing_events_upper_bound`
+- `queries`
 
 `hits`, `unique_hits`, and `total.value` are de-duplicated by stream and offset
 across overlapping lookup searches. `query_count` / `batch_count` show how many
 underlying `_search` batches were used. `total.relation` is `gte` whenever a
 limit, timeout, incomplete coverage, or any underlying lower-bound total means
 the exact unique total is not known.
+
+`queries` preserves per-query diagnostics for UI debug panels:
+
+- `q`
+- `hits`
+- `total`
+- `pages`
+- `complete`
+- `timed_out`
+- `limit_reached`
 
 Warnings are emitted for missing evlog events, missing trace spans, hit limits,
 incomplete search coverage, and missing parent spans. A UI should surface these

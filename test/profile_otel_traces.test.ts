@@ -140,6 +140,21 @@ function kvString(key: string, value: string): number[] {
   return out;
 }
 
+function anyArray(values: number[][]): number[] {
+  const arrayValue: number[] = [];
+  for (const value of values) writeMessage(arrayValue, 1, value);
+  const out: number[] = [];
+  writeMessage(out, 5, arrayValue);
+  return out;
+}
+
+function kvAny(key: string, value: number[]): number[] {
+  const out: number[] = [];
+  writeString(out, 1, key);
+  writeMessage(out, 2, value);
+  return out;
+}
+
 function statusMessage(code: number, message: string): number[] {
   const out: number[] = [];
   writeString(out, 2, message);
@@ -148,7 +163,7 @@ function statusMessage(code: number, message: string): number[] {
   return out;
 }
 
-function makeOtlpProtoRequest(): Uint8Array {
+function makeOtlpProtoRequest(extraSpanAttributes: number[][] = []): Uint8Array {
   const span: number[] = [];
   writeBytes(span, 1, hexBytes(TRACE_ID));
   writeBytes(span, 2, hexBytes(CHILD_SPAN_ID));
@@ -161,6 +176,7 @@ function makeOtlpProtoRequest(): Uint8Array {
   writeMessage(span, 9, kvString("request.id", "req_proto_1"));
   writeMessage(span, 9, kvString("db.system", "postgresql"));
   writeMessage(span, 9, kvString("db.operation", "SELECT"));
+  for (const attr of extraSpanAttributes) writeMessage(span, 9, attr);
   writeMessage(span, 15, statusMessage(1, "ok"));
 
   const scope: number[] = [];
@@ -195,10 +211,14 @@ describe("otel-traces profile", () => {
         attributeLimits: { maxAttributesPerSpan: 32 },
         store: { rawLinks: false },
         dbStatementMode: "raw",
+        urlMode: "raw",
         otlpLimits: {
           maxCompressedBytes: 1024,
           maxDecodedBytes: 2048,
           maxSpansPerRequest: 100,
+          maxAnyValueDepth: 8,
+          maxArrayValuesPerAnyValue: 16,
+          maxKvListValuesPerAnyValue: 16,
         },
         observability: {
           request: {
@@ -214,10 +234,14 @@ describe("otel-traces profile", () => {
         attributeLimits: { maxAttributesPerSpan: 32 },
         store: { rawLinks: false },
         dbStatementMode: "raw",
+        urlMode: "raw",
         otlpLimits: {
           maxCompressedBytes: 1024,
           maxDecodedBytes: 2048,
           maxSpansPerRequest: 100,
+          maxAnyValueDepth: 8,
+          maxArrayValuesPerAnyValue: 16,
+          maxKvListValuesPerAnyValue: 16,
         },
         observability: {
           request: {
@@ -283,6 +307,14 @@ describe("otel-traces profile", () => {
       });
       expect(invalidRes.status).toBe(400);
       expect(invalidRes.body?.error?.message).toContain("dbStatementMode");
+
+      const invalidUrlModeRes = await fetchJsonApp(app, "http://local/v1/stream/otel-invalid/_profile", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ profile: { kind: "otel-traces", urlMode: "redact_query" } }),
+      });
+      expect(invalidUrlModeRes.status).toBe(400);
+      expect(invalidUrlModeRes.body?.error?.message).toContain("urlMode");
 
       const invalidPairingRes = await fetchJsonApp(app, "http://local/v1/stream/otel-invalid/_profile", {
         method: "POST",
@@ -350,6 +382,8 @@ describe("otel-traces profile", () => {
               "request.id": "req_json_1",
               "http.request.method": "GET",
               "http.route": "/checkout",
+              "url.full": "https://checkout.test/checkout?token=secret#fragment",
+              "user_agent.original": "test-agent",
               "http.response.status_code": 500,
               authorization: "Bearer secret",
               "http.request.header.authorization": "Bearer header secret",
@@ -394,6 +428,8 @@ describe("otel-traces profile", () => {
         error: { isError: true, type: "Error", message: "checkout failed" },
         eventNames: ["exception"],
       });
+      expect(span.http.url).toBe("https://checkout.test/checkout");
+      expect(span.http.userAgent).toBe("test-agent");
       expect(span.attributes.authorization).toBe("[REDACTED]");
       expect(span.attributes["http.request.header.authorization"]).toBe("[REDACTED]");
       expect(span.attributes["http.request.header.cookie"]).toBe("[REDACTED]");
@@ -541,6 +577,85 @@ describe("otel-traces profile", () => {
     }
   });
 
+  test("canonical re-append preserves derived fields through active privacy policy", async () => {
+    const root = mkdtempSync(join(tmpdir(), "ds-profile-otel-canonical-policy-"));
+    const { app } = createProfileTestApp(root, { searchWalOverlayQuietPeriodMs: 0 });
+    try {
+      const canonical = {
+        schemaVersion: 1,
+        signal: "trace.span",
+        traceId: TRACE_ID,
+        spanId: SPAN_ID,
+        name: "GET /checkout",
+        kind: "server",
+        startUnixNano: "1772020800000000000",
+        endUnixNano: "1772020800123000000",
+        status: { code: "error", message: "status-message-that-is-long" },
+        service: "checkout-service-name-that-is-long",
+        http: {
+          method: "GET",
+          route: "/checkout",
+          url: "https://x.io/cb?token=secret#fragment",
+          userAgent: "u".repeat(64),
+          statusCode: 500,
+        },
+        db: {
+          system: "postgresql",
+          statement: "SELECT * FROM users WHERE email = 'secret@example.com'",
+        },
+        error: {
+          isError: true,
+          message: "m".repeat(64),
+          stacktrace: "s".repeat(64),
+        },
+      };
+
+      await createOtelTraceStream(app, "otel-policy-drop", {
+        attributeLimits: { maxAttributeValueBytes: 16, maxStatementBytes: 8 },
+      });
+      const dropAppendRes = await app.fetch(
+        new Request("http://local/v1/stream/otel-policy-drop", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(canonical),
+        })
+      );
+      expect([200, 204]).toContain(dropAppendRes.status);
+      const dropReadRes = await fetchJsonApp(app, "http://local/v1/stream/otel-policy-drop?format=json", { method: "GET" });
+      expect(dropReadRes.status).toBe(200);
+      const dropped = dropReadRes.body[0];
+      expect(dropped.db.statement).toBe(null);
+      expect(dropped.http.url).toBe("https://x.io/cb");
+      expect(dropped.http.userAgent.length).toBeLessThanOrEqual(16);
+      expect(dropped.status.message.length).toBeLessThanOrEqual(16);
+      expect(dropped.error.message.length).toBeLessThanOrEqual(16);
+      expect(dropped.error.stacktrace.length).toBeLessThanOrEqual(16);
+
+      await createOtelTraceStream(app, "otel-policy-raw", {
+        dbStatementMode: "raw",
+        urlMode: "raw",
+        attributeLimits: { maxAttributeValueBytes: 128, maxStatementBytes: 8 },
+      });
+      const rawAppendRes = await app.fetch(
+        new Request("http://local/v1/stream/otel-policy-raw", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ ...canonical, spanId: CHILD_SPAN_ID }),
+        })
+      );
+      expect([200, 204]).toContain(rawAppendRes.status);
+      const rawReadRes = await fetchJsonApp(app, "http://local/v1/stream/otel-policy-raw?format=json", { method: "GET" });
+      expect(rawReadRes.status).toBe(200);
+      const raw = rawReadRes.body[0];
+      expect(raw.db.statement).toBe("SELECT *");
+      expect(raw.db.statement.length).toBeLessThanOrEqual(8);
+      expect(raw.http.url).toBe("https://x.io/cb?token=secret#fragment");
+    } finally {
+      await app.close();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("ingests OTLP JSON over the default endpoint with gzip and auto-create", async () => {
     const root = mkdtempSync(join(tmpdir(), "ds-profile-otel-otlp-json-"));
     const { app } = createProfileTestApp(root, {
@@ -648,7 +763,7 @@ describe("otel-traces profile", () => {
     }
   });
 
-  test("rejects OTLP requests that exceed compressed, decoded, or span-count limits", async () => {
+  test("handles OTLP requests that exceed compressed, decoded, or span-count limits", async () => {
     const root = mkdtempSync(join(tmpdir(), "ds-profile-otel-limits-"));
     const { app } = createProfileTestApp(root);
     try {
@@ -693,8 +808,79 @@ describe("otel-traces profile", () => {
         headers: { "content-type": "application/json" },
         body: JSON.stringify(otlpJsonRequest([otlpJsonSpan(), otlpJsonSpan({ spanId: CHILD_SPAN_ID })])),
       });
-      expect(tooManySpansRes.status).toBe(400);
-      expect(tooManySpansRes.body?.error?.message).toContain("too many spans");
+      expect(tooManySpansRes.status).toBe(200);
+      expect(tooManySpansRes.body?.partialSuccess?.rejectedSpans).toBe(1);
+      expect(tooManySpansRes.body?.partialSuccess?.errorMessage).toContain("too many spans");
+
+      const limitedReadRes = await fetchJsonApp(app, "http://local/v1/stream/limited-traces?format=json", { method: "GET" });
+      expect(limitedReadRes.status).toBe(200);
+      expect(limitedReadRes.body).toHaveLength(1);
+      expect(limitedReadRes.body[0]?.spanId).toBe(SPAN_ID);
+    } finally {
+      await app.close();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects OTLP JSON nested AnyValue beyond configured depth", async () => {
+    const root = mkdtempSync(join(tmpdir(), "ds-profile-otel-anyvalue-json-"));
+    const { app } = createProfileTestApp(root);
+    try {
+      await createOtelTraceStream(app, "anyvalue-json-limited", {
+        otlpLimits: { maxAnyValueDepth: 2 },
+      });
+      const nestedSpan = otlpJsonSpan({
+        attributes: [
+          {
+            key: "nested",
+            value: {
+              arrayValue: {
+                values: [
+                  {
+                    arrayValue: {
+                      values: [
+                        {
+                          arrayValue: {
+                            values: [{ stringValue: "x" }],
+                          },
+                        },
+                      ],
+                    },
+                  },
+                ],
+              },
+            },
+          },
+        ],
+      });
+      const res = await fetchJsonApp(app, "http://local/v1/stream/anyvalue-json-limited/_otlp/v1/traces", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(otlpJsonRequest([nestedSpan])),
+      });
+      expect(res.status).toBe(400);
+      expect(res.body?.error?.message).toContain("AnyValue nesting too deep");
+    } finally {
+      await app.close();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects OTLP protobuf nested AnyValue beyond configured depth", async () => {
+    const root = mkdtempSync(join(tmpdir(), "ds-profile-otel-anyvalue-proto-"));
+    const { app } = createProfileTestApp(root);
+    try {
+      await createOtelTraceStream(app, "anyvalue-proto-limited", {
+        otlpLimits: { maxAnyValueDepth: 2 },
+      });
+      const nested = kvAny("nested", anyArray([anyArray([anyArray([anyString("x")])])]));
+      const res = await fetchJsonApp(app, "http://local/v1/stream/anyvalue-proto-limited/_otlp/v1/traces", {
+        method: "POST",
+        headers: { "content-type": "application/x-protobuf" },
+        body: makeOtlpProtoRequest([nested]),
+      });
+      expect(res.status).toBe(400);
+      expect(res.body?.error?.message).toContain("AnyValue nesting too deep");
     } finally {
       await app.close();
       rmSync(root, { recursive: true, force: true });

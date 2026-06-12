@@ -6,6 +6,7 @@ import { expectPlainObjectResult, isPlainObject } from "../profile";
 export type OTelSpanKind = "unspecified" | "internal" | "server" | "client" | "producer" | "consumer";
 export type OTelStatusCode = "unset" | "ok" | "error";
 export type DbStatementMode = "drop" | "raw";
+export type UrlMode = "drop_query" | "raw";
 
 export type OtelTraceAttributeLimits = {
   maxAttributeValueBytes: number;
@@ -21,6 +22,9 @@ export type OtelTraceOtlpLimits = {
   maxResourceSpansPerRequest: number;
   maxScopeSpansPerRequest: number;
   maxSpansPerRequest: number;
+  maxAnyValueDepth: number;
+  maxArrayValuesPerAnyValue: number;
+  maxKvListValuesPerAnyValue: number;
 };
 
 export type OtelTraceStoreConfig = {
@@ -37,6 +41,7 @@ export type OtelTracesStreamProfile = {
   attributeLimits?: Partial<OtelTraceAttributeLimits>;
   store?: Partial<OtelTraceStoreConfig>;
   dbStatementMode?: DbStatementMode;
+  urlMode?: UrlMode;
   otlpLimits?: Partial<OtelTraceOtlpLimits>;
   observability?: {
     request?: {
@@ -232,6 +237,9 @@ export const DEFAULT_OTLP_LIMITS: OtelTraceOtlpLimits = {
   maxResourceSpansPerRequest: 1024,
   maxScopeSpansPerRequest: 4096,
   maxSpansPerRequest: 50_000,
+  maxAnyValueDepth: 16,
+  maxArrayValuesPerAnyValue: 256,
+  maxKvListValuesPerAnyValue: 256,
 };
 
 export const DEFAULT_STORE_CONFIG: OtelTraceStoreConfig = {
@@ -240,6 +248,8 @@ export const DEFAULT_STORE_CONFIG: OtelTraceStoreConfig = {
   rawEvents: true,
   rawLinks: true,
 };
+
+export const DEFAULT_URL_MODE: UrlMode = "drop_query";
 
 function normalizeString(value: unknown): string | null {
   if (typeof value !== "string") return null;
@@ -341,6 +351,24 @@ function truncateUtf8(value: string, maxBytes: number): string {
   const bytes = TEXT_ENCODER.encode(value);
   if (bytes.byteLength <= maxBytes) return value;
   return TEXT_DECODER.decode(bytes.slice(0, Math.max(0, maxBytes)));
+}
+
+function truncateNullableString(value: string | null, maxBytes: number): string | null {
+  return value == null ? null : truncateUtf8(value, maxBytes);
+}
+
+function stripUrlQueryAndFragment(value: string): string {
+  const fragmentStart = value.indexOf("#");
+  const withoutFragment = fragmentStart >= 0 ? value.slice(0, fragmentStart) : value;
+  const queryStart = withoutFragment.indexOf("?");
+  return queryStart >= 0 ? withoutFragment.slice(0, queryStart) : withoutFragment;
+}
+
+function sanitizeUrl(value: string | null, urlMode: UrlMode, maxBytes: number): string | null {
+  if (!value) return null;
+  const sanitized = urlMode === "raw" ? value : stripUrlQueryAndFragment(value);
+  const normalized = normalizeString(sanitized);
+  return normalized ? truncateUtf8(normalized, maxBytes) : null;
 }
 
 function redactionKeyCandidates(key: string): Set<string> {
@@ -496,6 +524,7 @@ export function normalizeOtelDecodedSpanResult(
 
   const limits = { ...DEFAULT_ATTRIBUTE_LIMITS, ...(profile.attributeLimits ?? {}) };
   const store = { ...DEFAULT_STORE_CONFIG, ...(profile.store ?? {}) };
+  const urlMode = profile.urlMode ?? DEFAULT_URL_MODE;
   const redactKeys = new Set([...DEFAULT_OTEL_TRACE_REDACT_KEYS, ...(profile.redactKeys ?? [])].map((key) => key.toLowerCase()));
   const requestIdAttributes = profile.requestIdAttributes ?? [...DEFAULT_REQUEST_ID_ATTRIBUTES];
 
@@ -598,7 +627,8 @@ export function normalizeOtelDecodedSpanResult(
   const attrErrorMessage = getString(spanAttrs, "exception.message", "error.message");
   const attrErrorStack = getString(spanAttrs, "exception.stacktrace", "error.stacktrace");
   const httpStatusCode = getInteger(spanAttrs, "http.response.status_code", "http.status_code");
-  const errorMessage = attrErrorMessage ?? exception.message ?? normalizeString(input.status?.message);
+  const statusMessage = truncateNullableString(normalizeString(input.status?.message), limits.maxAttributeValueBytes);
+  const errorMessage = attrErrorMessage ?? exception.message ?? statusMessage;
   const traceFlagsRaw = normalizeInteger(input.traceFlags);
   const dbStatementRaw = getString(spanAttrs, "db.statement", "db.query.text");
   const dbStatement =
@@ -626,7 +656,7 @@ export function normalizeOtelDecodedSpanResult(
     kind: normalizeSpanKind(input.kind),
     status: {
       code: statusCode,
-      message: normalizeString(input.status?.message),
+      message: statusMessage,
     },
     service,
     serviceNamespace: getString(resourceAttrs, "service.namespace"),
@@ -640,7 +670,7 @@ export function normalizeOtelDecodedSpanResult(
       route: getString(spanAttrs, "http.route"),
       path: getString(spanAttrs, "url.path", "http.target"),
       target: getString(spanAttrs, "http.target"),
-      url: getString(spanAttrs, "url.full", "http.url"),
+      url: sanitizeUrl(getString(spanAttrs, "url.full", "http.url"), urlMode, limits.maxAttributeValueBytes),
       statusCode: httpStatusCode,
       userAgent: getString(spanAttrs, "user_agent.original", "http.user_agent"),
     },
@@ -664,7 +694,7 @@ export function normalizeOtelDecodedSpanResult(
       isError: statusCode === "error" || (httpStatusCode != null && httpStatusCode >= 500) || !!attrErrorType || !!exception.type,
       type: attrErrorType ?? exception.type,
       message: errorMessage,
-      stacktrace: attrErrorStack ?? exception.stacktrace,
+      stacktrace: truncateNullableString(attrErrorStack ?? exception.stacktrace, limits.maxAttributeValueBytes),
     },
     instrumentationScope: {
       name: normalizeString(input.instrumentationScope?.name),
@@ -730,6 +760,10 @@ function canonicalString(value: unknown, fallback: string | null): string | null
   return normalized ?? fallback;
 }
 
+function canonicalLimitedString(value: unknown, fallback: string | null, maxBytes: number): string | null {
+  return truncateNullableString(canonicalString(value, fallback), maxBytes);
+}
+
 function canonicalNumber(value: unknown, fallback: number | null): number | null {
   const normalized = normalizeNumber(value);
   return normalized ?? fallback;
@@ -766,58 +800,73 @@ function preserveRedactionKeys(value: unknown, fallback: string[]): string[] {
   return Array.from(out).sort();
 }
 
-function preserveCanonicalDerivedFields(canonical: CanonicalOtelSpan, raw: Record<string, unknown>): CanonicalOtelSpan {
+function preserveCanonicalDerivedFields(
+  canonical: CanonicalOtelSpan,
+  raw: Record<string, unknown>,
+  profile: OtelTracesStreamProfile,
+  limits: OtelTraceAttributeLimits
+): CanonicalOtelSpan {
   if (raw.schemaVersion !== 1 || raw.signal !== "trace.span") return canonical;
   const out: CanonicalOtelSpan = structuredClone(canonical);
+  const urlMode = profile.urlMode ?? DEFAULT_URL_MODE;
 
   out.duration = canonicalNumber(raw.duration, out.duration);
-  out.service = canonicalString(raw.service, out.service);
-  out.serviceNamespace = canonicalString(raw.serviceNamespace, out.serviceNamespace);
-  out.serviceInstanceId = canonicalString(raw.serviceInstanceId, out.serviceInstanceId);
-  out.environment = canonicalString(raw.environment, out.environment);
-  out.version = canonicalString(raw.version, out.version);
-  out.region = canonicalString(raw.region, out.region);
-  out.requestId = canonicalString(raw.requestId, out.requestId);
+  out.service = canonicalLimitedString(raw.service, out.service, limits.maxAttributeValueBytes);
+  out.serviceNamespace = canonicalLimitedString(raw.serviceNamespace, out.serviceNamespace, limits.maxAttributeValueBytes);
+  out.serviceInstanceId = canonicalLimitedString(raw.serviceInstanceId, out.serviceInstanceId, limits.maxAttributeValueBytes);
+  out.environment = canonicalLimitedString(raw.environment, out.environment, limits.maxAttributeValueBytes);
+  out.version = canonicalLimitedString(raw.version, out.version, limits.maxAttributeValueBytes);
+  out.region = canonicalLimitedString(raw.region, out.region, limits.maxAttributeValueBytes);
+  out.requestId = canonicalLimitedString(raw.requestId, out.requestId, limits.maxAttributeValueBytes);
+
+  const status = isPlainObject(raw.status) ? raw.status : {};
+  out.status = {
+    code: out.status.code,
+    message: canonicalLimitedString(status.message, out.status.message, limits.maxAttributeValueBytes),
+  };
 
   const http = isPlainObject(raw.http) ? raw.http : {};
   out.http = {
-    method: canonicalString(http.method, out.http.method),
-    route: canonicalString(http.route, out.http.route),
-    path: canonicalString(http.path, out.http.path),
-    target: canonicalString(http.target, out.http.target),
-    url: canonicalString(http.url, out.http.url),
+    method: canonicalLimitedString(http.method, out.http.method, limits.maxAttributeValueBytes),
+    route: canonicalLimitedString(http.route, out.http.route, limits.maxAttributeValueBytes),
+    path: canonicalLimitedString(http.path, out.http.path, limits.maxAttributeValueBytes),
+    target: canonicalLimitedString(http.target, out.http.target, limits.maxAttributeValueBytes),
+    url: sanitizeUrl(canonicalString(http.url, out.http.url), urlMode, limits.maxAttributeValueBytes),
     statusCode: canonicalInteger(http.statusCode, out.http.statusCode),
-    userAgent: canonicalString(http.userAgent, out.http.userAgent),
+    userAgent: canonicalLimitedString(http.userAgent, out.http.userAgent, limits.maxAttributeValueBytes),
   };
 
   const db = isPlainObject(raw.db) ? raw.db : {};
   out.db = {
-    system: canonicalString(db.system, out.db.system),
-    name: canonicalString(db.name, out.db.name),
-    operation: canonicalString(db.operation, out.db.operation),
-    statement: canonicalString(db.statement, out.db.statement),
+    system: canonicalLimitedString(db.system, out.db.system, limits.maxAttributeValueBytes),
+    name: canonicalLimitedString(db.name, out.db.name, limits.maxAttributeValueBytes),
+    operation: canonicalLimitedString(db.operation, out.db.operation, limits.maxAttributeValueBytes),
+    statement:
+      profile.dbStatementMode === "raw"
+        ? canonicalLimitedString(db.statement, out.db.statement, limits.maxStatementBytes)
+        : null,
   };
 
   const rpc = isPlainObject(raw.rpc) ? raw.rpc : {};
   out.rpc = {
-    system: canonicalString(rpc.system, out.rpc.system),
-    service: canonicalString(rpc.service, out.rpc.service),
-    method: canonicalString(rpc.method, out.rpc.method),
+    system: canonicalLimitedString(rpc.system, out.rpc.system, limits.maxAttributeValueBytes),
+    service: canonicalLimitedString(rpc.service, out.rpc.service, limits.maxAttributeValueBytes),
+    method: canonicalLimitedString(rpc.method, out.rpc.method, limits.maxAttributeValueBytes),
   };
 
   const messaging = isPlainObject(raw.messaging) ? raw.messaging : {};
   out.messaging = {
-    system: canonicalString(messaging.system, out.messaging.system),
-    destination: canonicalString(messaging.destination, out.messaging.destination),
-    operation: canonicalString(messaging.operation, out.messaging.operation),
+    system: canonicalLimitedString(messaging.system, out.messaging.system, limits.maxAttributeValueBytes),
+    destination: canonicalLimitedString(messaging.destination, out.messaging.destination, limits.maxAttributeValueBytes),
+    operation: canonicalLimitedString(messaging.operation, out.messaging.operation, limits.maxAttributeValueBytes),
   };
 
   const error = isPlainObject(raw.error) ? raw.error : {};
   out.error = {
     isError: canonicalBoolean(error.isError, out.error.isError),
-    type: canonicalString(error.type, out.error.type),
-    message: canonicalString(error.message, out.error.message),
-    stacktrace: canonicalString(error.stacktrace, out.error.stacktrace),
+    type: canonicalLimitedString(error.type, out.error.type, limits.maxAttributeValueBytes),
+    message: canonicalLimitedString(error.message, out.error.message, limits.maxAttributeValueBytes),
+    stacktrace: canonicalLimitedString(error.stacktrace, out.error.stacktrace, limits.maxAttributeValueBytes),
   };
 
   out.eventNames = preserveCanonicalEventNames(raw.eventNames, out.eventNames);
@@ -890,7 +939,8 @@ export function normalizeOtelTraceRecordResult(
   if (Result.isError(decodedRes)) return decodedRes;
   const normalizedRes = normalizeOtelDecodedSpanResult(profile, decodedRes.value);
   if (Result.isError(normalizedRes)) return normalizedRes;
-  const normalized = preserveCanonicalDerivedFields(normalizedRes.value, isPlainObject(value) ? value : {});
+  const limits = { ...DEFAULT_ATTRIBUTE_LIMITS, ...(profile.attributeLimits ?? {}) };
+  const normalized = preserveCanonicalDerivedFields(normalizedRes.value, isPlainObject(value) ? value : {}, profile, limits);
   return Result.ok({
     value: normalized,
     routingKey: normalized.traceId,
