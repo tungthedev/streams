@@ -59,6 +59,9 @@ Request:
 
 `streams.events` is required when `include.events` is true. `streams.traces` is
 required when `include.trace` is true.
+The supported pairing is an `evlog` stream for `streams.events` and an
+`otel-traces` stream for `streams.traces`; swapped or unsupported profile roles
+return `400`.
 
 Limits:
 
@@ -67,6 +70,14 @@ Limits:
 
 The implementation pages internally through `_search` because `_search` pages
 are capped at 500 hits.
+
+`include.raw` defaults to false. With `raw=false`, the response keeps compact
+normalized event/span records for request detail rendering but omits raw source
+payload fields such as evlog `context`, span `attributes`, `resource`,
+`instrumentationScope`, raw span `events`, `links`, raw statements, URLs, stack
+traces, redaction metadata, identity internals, and timeline `data`. With
+`raw=true`, `evlog.primary`, `evlog.matches[].source`, `trace.spans[]`, and
+timeline items include the full profile-normalized source payloads.
 
 ## Pairing Descriptor
 
@@ -165,7 +176,8 @@ environment, duration, start/end time, level, and error fields.
 - `matches`
 
 The primary event prefers a match with the selected trace ID, otherwise the
-first event result.
+first event result. With `include.raw=false`, `primary` and `matches[].source`
+are compact evlog records rather than full source records.
 
 `trace` is null when `include.trace=false`. Otherwise it contains:
 
@@ -182,7 +194,9 @@ first event result.
 - `duplicateSpans`
 
 Spans are deduplicated by `traceId:spanId` for the trace view. The underlying
-stream remains append-only and keeps duplicate deliveries.
+stream remains append-only and keeps duplicate deliveries. With
+`include.raw=false`, `spans` contains compact span records; the tree, service
+map, errors, and critical path are still computed from the full returned spans.
 
 `rootSpanId` is selected from the returned root candidates by scoring likely
 request roots first: no parent, server kind, HTTP fields, request ID, and then
@@ -232,7 +246,8 @@ The timeline merges profile-owned timeline items:
 - `otel.exception`
 
 Each item includes time, title, service, severity, IDs, source stream/profile,
-and source data.
+and source stream/profile. Timeline source `data` is included only when
+`include.raw=true`.
 
 This response is intended for custom UI rendering, but no custom UI is shipped
 with this feature.

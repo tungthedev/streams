@@ -101,6 +101,11 @@ async function seedObservabilityStreams(app: ReturnType<typeof createProfileTest
         message: "Checkout failed",
         why: "Payment provider returned 502",
         fix: "Retry after provider recovery",
+        context: {
+          provider: "stripe",
+          retryable: true,
+          token: "provider-secret",
+        },
       }),
     })
   );
@@ -333,6 +338,72 @@ describe("observe request API", () => {
       });
       expect(res.body.coverage.traces.queries[0].q).toContain("trace:");
       expect(res.body.coverage.warnings).toEqual([]);
+    } finally {
+      await app.close();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects swapped event and trace stream profile roles", async () => {
+    const root = mkdtempSync(join(tmpdir(), "ds-observe-swapped-"));
+    const { app } = createProfileTestApp(root, { searchWalOverlayQuietPeriodMs: 0 });
+    try {
+      await seedObservabilityStreams(app);
+      const res = await fetchJsonApp(app, "http://local/v1/observe/request", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          streams: { events: "app-traces", traces: "app-events" },
+          lookup: { requestId: "req_obs_1" },
+          include: { events: true, trace: true, timeline: true },
+        }),
+      });
+
+      expect(res.status).toBe(400);
+      expect(res.body.error.message).toContain("streams.events must reference an evlog stream");
+    } finally {
+      await app.close();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("honors include.raw by compacting source payloads unless explicitly requested", async () => {
+    const root = mkdtempSync(join(tmpdir(), "ds-observe-raw-"));
+    const { app } = createProfileTestApp(root, { searchWalOverlayQuietPeriodMs: 0 });
+    try {
+      await seedObservabilityStreams(app);
+      const compactRes = await fetchJsonApp(app, "http://local/v1/observe/request", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(observeBody({ requestId: "req_obs_1" }, { include: { events: true, trace: true, timeline: true, raw: false } })),
+      });
+
+      expect(compactRes.status).toBe(200);
+      expect(compactRes.body.evlog.primary.requestId).toBe("req_obs_1");
+      expect(compactRes.body.evlog.matches[0].source.requestId).toBe("req_obs_1");
+      expect(compactRes.body.evlog.matches[0].source.context).toBeUndefined();
+      const compactRootSpan = compactRes.body.trace.spans.find((item: any) => item.spanId === ROOT_SPAN_ID);
+      expect(compactRootSpan.http).toMatchObject({ method: "GET", route: "/checkout", statusCode: 502 });
+      expect(compactRootSpan.status).toMatchObject({ code: "error", message: "provider unavailable" });
+      expect(compactRootSpan.attributes).toBeUndefined();
+      expect(compactRootSpan.resource).toBeUndefined();
+      expect(compactRootSpan.events).toBeUndefined();
+      expect(compactRes.body.timeline.length).toBeGreaterThan(0);
+      expect(compactRes.body.timeline.some((item: any) => Object.prototype.hasOwnProperty.call(item, "data"))).toBe(false);
+
+      const rawRes = await fetchJsonApp(app, "http://local/v1/observe/request", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(observeBody({ requestId: "req_obs_1" }, { include: { events: true, trace: true, timeline: true, raw: true } })),
+      });
+
+      expect(rawRes.status).toBe(200);
+      expect(rawRes.body.evlog.matches[0].source.context.provider).toBe("stripe");
+      const rawRootSpan = rawRes.body.trace.spans.find((item: any) => item.spanId === ROOT_SPAN_ID);
+      expect(rawRootSpan.attributes["request.id"]).toBe("req_obs_1");
+      expect(rawRootSpan.resource.attributes["service.name"]).toBe("checkout");
+      expect(rawRootSpan.events.length).toBeGreaterThan(0);
+      expect(rawRes.body.timeline.some((item: any) => Object.prototype.hasOwnProperty.call(item, "data"))).toBe(true);
     } finally {
       await app.close();
       rmSync(root, { recursive: true, force: true });

@@ -65,6 +65,9 @@ import {
   buildTimeSearchClauses,
   buildTraceDetails,
   choosePrimaryEvent,
+  compactEvlogRecord,
+  compactTimelineItem,
+  compactTraceSpanRecord,
   combineSearchClauses,
   parseObserveRequestResult,
   quoteSearchValue,
@@ -1804,12 +1807,21 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
         if (Result.isError(requestRes)) return badRequest(requestRes.error.message);
         const observeReq = requestRes.value;
 
-        const loadCorrelationCapability = (stream: string): ReturnType<typeof resolveCorrelationCapability> | Response => {
+        const loadCorrelationCapability = (
+          stream: string,
+          role: "events" | "traces"
+        ): ReturnType<typeof resolveCorrelationCapability> | Response => {
           const srow = db.getStream(stream);
           if (!srow || db.isDeleted(srow)) return notFound();
           if (srow.expires_at_ms != null && db.nowMs() > srow.expires_at_ms) return notFound("stream expired");
           const profileRes = profiles.getProfileResult(stream, srow);
           if (Result.isError(profileRes)) return internalError("invalid stream profile");
+          if (role === "events" && profileRes.value.kind !== "evlog") {
+            return badRequest(`streams.events must reference an evlog stream; ${stream} has profile ${profileRes.value.kind}`);
+          }
+          if (role === "traces" && profileRes.value.kind !== "otel-traces") {
+            return badRequest(`streams.traces must reference an otel-traces stream; ${stream} has profile ${profileRes.value.kind}`);
+          }
           const capability = resolveCorrelationCapability(profileRes.value);
           if (!capability) return badRequest(`stream ${stream} profile does not support observability correlation`);
           const regRes = registry.getRegistryResult(stream);
@@ -1819,10 +1831,10 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
         };
 
         const eventCorrelation =
-          observeReq.include.events && observeReq.streams.events ? loadCorrelationCapability(observeReq.streams.events) : null;
+          observeReq.include.events && observeReq.streams.events ? loadCorrelationCapability(observeReq.streams.events, "events") : null;
         if (eventCorrelation instanceof Response) return eventCorrelation;
         const traceCorrelation =
-          observeReq.include.trace && observeReq.streams.traces ? loadCorrelationCapability(observeReq.streams.traces) : null;
+          observeReq.include.trace && observeReq.streams.traces ? loadCorrelationCapability(observeReq.streams.traces, "traces") : null;
         if (traceCorrelation instanceof Response) return traceCorrelation;
 
         const runPagedSearch = async (
@@ -2001,6 +2013,13 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
           }
           timeline.push(...sortTimeline(items));
         }
+        const responsePrimaryEvent = observeReq.include.raw ? primaryEvent : compactEvlogRecord(primaryEvent);
+        const responseEventMatches = eventHits.map((hit) => ({
+          offset: hit.offset,
+          source: observeReq.include.raw ? hit.source : compactEvlogRecord(hit.source),
+        }));
+        const responseTraceSpans = observeReq.include.raw ? trace.spans : trace.spans.map((span) => compactTraceSpanRecord(span));
+        const responseTimeline = observeReq.include.raw ? timeline : timeline.map((item) => compactTimelineItem(item));
 
         const warnings: string[] = [];
         if (observeReq.include.trace && traceHits.length === 0) warnings.push("no trace spans found");
@@ -2024,11 +2043,8 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
           evlog: observeReq.include.events
             ? {
                 stream: observeReq.streams.events ?? null,
-                primary: primaryEvent,
-                matches: eventHits.map((hit) => ({
-                  offset: hit.offset,
-                  source: hit.source,
-                })),
+                primary: responsePrimaryEvent,
+                matches: responseEventMatches,
               }
             : null,
           trace: observeReq.include.trace
@@ -2036,7 +2052,7 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
                 stream: observeReq.streams.traces ?? null,
                 traceId: trace.traceId,
                 rootSpanId: trace.rootSpanId,
-                spans: trace.spans,
+                spans: responseTraceSpans,
                 tree: trace.tree,
                 serviceMap: trace.serviceMap,
                 criticalPath: trace.criticalPath,
@@ -2046,7 +2062,7 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
                 duplicateSpans: trace.duplicateSpans,
               }
             : null,
-          timeline,
+          timeline: responseTimeline,
           coverage: {
             events: eventCoverage,
             traces: traceCoverage,

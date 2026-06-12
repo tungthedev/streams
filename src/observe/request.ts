@@ -124,6 +124,23 @@ function nestedObject(record: Record<string, unknown>, field: string): Record<st
   return isPlainObject(value) ? value : {};
 }
 
+function pickFields(record: Record<string, unknown>, fields: readonly string[]): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const field of fields) {
+    if (Object.prototype.hasOwnProperty.call(record, field)) out[field] = structuredClone(record[field]);
+  }
+  return out;
+}
+
+function nonEmptyRecord(record: Record<string, unknown>): Record<string, unknown> | null {
+  return Object.keys(record).length === 0 ? null : record;
+}
+
+function compactNested(record: Record<string, unknown>, field: string, fields: readonly string[]): Record<string, unknown> | null {
+  const nested = nestedObject(record, field);
+  return nonEmptyRecord(pickFields(nested, fields));
+}
+
 function parseOptionalString(raw: unknown, path: string): Result<string | null, { message: string }> {
   if (raw === undefined || raw === null) return Result.ok(null);
   if (typeof raw !== "string") return Result.err({ message: `${path} must be a string` });
@@ -678,4 +695,78 @@ export function choosePrimaryEvent(events: SearchHit[], traceId: string | null):
     if (matching) return matching;
   }
   return events[0]!;
+}
+
+export function compactEvlogRecord(record: unknown): unknown {
+  if (!isPlainObject(record)) return record;
+  return pickFields(record, [
+    "timestamp",
+    "level",
+    "service",
+    "environment",
+    "version",
+    "region",
+    "requestId",
+    "traceId",
+    "spanId",
+    "method",
+    "path",
+    "status",
+    "duration",
+    "message",
+    "why",
+    "fix",
+    "link",
+  ]);
+}
+
+export function compactTraceSpanRecord(record: unknown): unknown {
+  if (!isPlainObject(record)) return record;
+  const out = pickFields(record, [
+    "schemaVersion",
+    "signal",
+    "timestamp",
+    "endTimestamp",
+    "startUnixNano",
+    "endUnixNano",
+    "duration",
+    "traceId",
+    "spanId",
+    "parentSpanId",
+    "name",
+    "kind",
+    "service",
+    "serviceNamespace",
+    "serviceInstanceId",
+    "environment",
+    "version",
+    "region",
+    "requestId",
+    "eventNames",
+    "dropped",
+  ]);
+
+  const traceFlags = nestedObject(record, "traceFlags");
+  if (Object.prototype.hasOwnProperty.call(traceFlags, "sampled")) out.traceFlags = { sampled: traceFlags.sampled };
+
+  const status = compactNested(record, "status", ["code", "message"]);
+  if (status) out.status = status;
+  const http = compactNested(record, "http", ["method", "route", "path", "statusCode"]);
+  if (http) out.http = http;
+  const db = compactNested(record, "db", ["system", "name", "operation"]);
+  if (db) out.db = db;
+  const rpc = compactNested(record, "rpc", ["system", "service", "method"]);
+  if (rpc) out.rpc = rpc;
+  const messaging = compactNested(record, "messaging", ["system", "destination", "operation"]);
+  if (messaging) out.messaging = messaging;
+  const error = compactNested(record, "error", ["isError", "type", "message"]);
+  if (error) out.error = error;
+
+  return out;
+}
+
+export function compactTimelineItem(item: unknown): unknown {
+  if (!isPlainObject(item)) return item;
+  const { data: _data, ...rest } = item;
+  return rest;
 }

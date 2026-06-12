@@ -300,9 +300,19 @@ Request body:
 `lookup` must contain exactly one of `requestId`, `traceId`, or `spanId`.
 `streams.events` is required when `include.events=true`; `streams.traces` is
 required when `include.trace=true`.
+The supported request-observability pairing is `streams.events` with profile
+`evlog` and `streams.traces` with profile `otel-traces`.
 
 The endpoint uses the configured `_search` registries for the referenced
 streams. Event and trace streams must expose the profile correlation capability.
+`include.raw` defaults to `false`. With `raw=false`, `evlog.primary`,
+`evlog.matches[].source`, and `trace.spans[]` contain compact normalized records
+that keep IDs, timestamps, service/request fields, status/error fields, and
+safe request/operation summaries while omitting raw context, attributes,
+resources, span events, links, statements, URLs, stack traces, redaction
+metadata, and identity internals. Timeline items omit `data`. With `raw=true`,
+those response fields include the full profile-normalized source records and
+timeline source data.
 The response contains:
 
 - `lookup`
