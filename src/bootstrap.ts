@@ -7,6 +7,7 @@ import { zstdDecompressSync } from "./util/zstd";
 import { localSegmentPath, schemaObjectKey, segmentObjectKey, streamHash16Hex } from "./util/stream_paths";
 import { retry } from "./util/retry";
 import { dsError } from "./util/ds_error.ts";
+import { resolveTouchCapability, type StreamProfileSpec } from "./profiles";
 
 type Manifest = Record<string, any>;
 
@@ -120,8 +121,13 @@ export async function bootstrapFromR2(cfg: Config, store: ObjectStore, opts: { c
       });
       if (profileJson) {
         db.upsertStreamProfile(stream, JSON.stringify(profileJson));
+        const profile = profileJson as StreamProfileSpec;
+        const touchCapability = resolveTouchCapability(profile);
+        if (touchCapability) touchCapability.syncState({ db, stream, profile });
+        else db.deleteStreamTouchState(stream);
       } else {
         db.deleteStreamProfile(stream);
+        db.deleteStreamTouchState(stream);
       }
 
       db.upsertSegmentMeta(stream, segmentCount, segmentOffsetsBytes, segmentBlocksBytes, segmentLastTsBytes);
