@@ -77,6 +77,7 @@ export type Config = {
 const KNOWN_DS_ENVS = new Set<string>([
   "DS_STORAGE",
   "DS_POSTGRES_URL",
+  "DS_TEST_POSTGRES_URL",
   "DS_ROOT",
   "DS_HOST",
   "DS_DB_PATH",
