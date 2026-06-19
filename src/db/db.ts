@@ -1,6 +1,9 @@
 import { initSchema } from "./schema.ts";
 import { openSqliteDatabase, type SqliteDatabase, type SqliteStatement } from "../sqlite/adapter.ts";
 import { Result } from "better-result";
+import type { StoreAppendBatch, StoreAppendTask } from "../store/append";
+import type { WalStore } from "../store/wal_store";
+import { SqliteWalStore } from "./sqlite_wal_store";
 
 export const STREAM_FLAG_DELETED = 1 << 0;
 // Internal companion touch stream. Hidden from listing and not eligible for segmentation.
@@ -156,8 +159,9 @@ export type SearchSegmentCompanionRow = {
   updated_at_ms: bigint;
 };
 
-export class SqliteDurableStore {
+export class SqliteDurableStore implements WalStore {
   public readonly db: SqliteDatabase;
+  private readonly walStore: WalStore;
   private dbstatReady: boolean | null = null;
 
   // Prepared statements.
@@ -280,6 +284,7 @@ export class SqliteDurableStore {
       const kb = Math.max(1, Math.floor(opts.cacheBytes / 1024));
       this.db.exec(`PRAGMA cache_size = -${kb};`);
     }
+    this.walStore = new SqliteWalStore(this.db, () => this.nowMs(), STREAM_FLAG_DELETED);
 
     this.stmts = {
       getStream: this.db.query(
@@ -1446,6 +1451,10 @@ export class SqliteDurableStore {
     });
 
     return tx();
+  }
+
+  async appendBatch(batch: StoreAppendTask[]): Promise<StoreAppendBatch> {
+    return this.walStore.appendBatch(batch);
   }
 
   /**

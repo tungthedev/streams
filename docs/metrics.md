@@ -261,7 +261,7 @@ This implementation emits interval summaries for:
 ### Ingest and backpressure
 
 - `tieredstore.ingest.flush.latency`
-- `tieredstore.ingest.sqlite_busy.wait`
+- `tieredstore.ingest.store_retry.wait`
 - `tieredstore.ingest.queue.bytes`
 - `tieredstore.ingest.queue.requests`
 - `tieredstore.ingest.queue.capacity.bytes`
