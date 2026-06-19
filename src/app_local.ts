@@ -9,6 +9,7 @@ import type { StatsCollector } from "./stats";
 import { readSqliteRuntimeMemoryStats } from "./sqlite/runtime_stats";
 import { Result } from "better-result";
 import { SqliteDurableStore } from "./db/db";
+import type { WalControlPlaneStore } from "./store/capabilities";
 
 const TEXT_DECODER = new TextDecoder();
 
@@ -111,18 +112,36 @@ export type CreateLocalAppOptions = {
   stats?: StatsCollector;
 };
 
+function localControlStore(db: SqliteDurableStore): WalControlPlaneStore {
+  return new Proxy(db, {
+    get(target, prop, receiver) {
+      if (prop === "capabilities") {
+        return {
+          ...target.capabilities,
+          manifests: false,
+          schemaPublication: false,
+          internalMetrics: false,
+        };
+      }
+      const value = Reflect.get(target, prop, receiver);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  }) as WalControlPlaneStore;
+}
+
 export function createLocalApp(cfg: Config, os?: ObjectStore, opts: CreateLocalAppOptions = {}): App {
   const db = new SqliteDurableStore(cfg.dbPath, { cacheBytes: cfg.sqliteCacheBytes });
+  const controlStore = localControlStore(db);
   return createAppCore(cfg, {
     db,
-    store: db,
+    store: controlStore,
     stats: opts.stats,
     createRuntime: ({ config, registry, memorySampler, memory }) => {
       const store = os ?? new NullObjectStore();
       const indexer = new LocalIndexLookup(db);
       const reader = new StreamReader(
         config,
-        db,
+        controlStore,
         registry,
         { segmentReads: db, objectStore: store, index: indexer },
         memorySampler,

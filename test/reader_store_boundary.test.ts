@@ -5,7 +5,6 @@ import { join } from "node:path";
 import { Result } from "better-result";
 import { loadConfig } from "../src/config";
 import { SqliteDurableStore } from "../src/db/db";
-import { MockR2Store } from "../src/objectstore/mock_r2";
 import { encodeOffset } from "../src/offset";
 import { StreamReader } from "../src/reader";
 import { SchemaRegistryStore } from "../src/schema/registry";
@@ -29,7 +28,7 @@ describe("reader store boundary", () => {
         rootDir: root,
         dbPath: `${root}/wal.sqlite`,
       };
-      const reader = new StreamReader(cfg, db, undefined, new MockR2Store(), new SchemaRegistryStore(db));
+      const reader = new StreamReader(cfg, db, new SchemaRegistryStore(db));
 
       const walOnly = await reader.readResult({
         stream: "s",

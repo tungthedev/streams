@@ -51,7 +51,10 @@ export class IngestQueue {
     this.stats = stats;
     this.gate = gate;
     this.metrics = metrics;
+  }
 
+  start(): void {
+    if (this.timer) return;
     this.timer = setInterval(() => {
       void this.flush();
     }, this.cfg.ingestFlushIntervalMs);

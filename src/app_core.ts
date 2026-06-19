@@ -79,7 +79,7 @@ import {
 import { buildRequestObservabilityPairingDescriptor } from "./observe/pairing";
 import { dsError } from "./util/ds_error.ts";
 import type { SchemaPublicationStore } from "./store/schema_publication";
-import { requireWalControlPlaneStore, type StoreLifecycle, type WalControlPlaneStore } from "./store/capabilities";
+import { requireWalControlPlaneStore, type WalControlPlaneStore } from "./store/capabilities";
 import { streamHash16Hex } from "./util/stream_paths";
 
 function withNosniff(headers: HeadersInit = {}): HeadersInit {
@@ -526,11 +526,23 @@ type AppRuntimeDeps = {
 };
 
 export type CreateAppCoreOptions = {
-  store: StoreLifecycle;
+  store: WalControlPlaneStore;
   db?: SqliteDurableStore;
   stats?: StatsCollector;
   createRuntime(args: CreateAppRuntimeArgs): AppRuntimeDeps;
 };
+
+function validateRuntimeCapabilityBundle(controlStore: WalControlPlaneStore, db: SqliteDurableStore | undefined, runtime: AppRuntimeDeps): void {
+  const caps = controlStore.capabilities;
+  if (caps.indexes && !runtime.indexer) throw dsError("index capability requires an index runtime");
+  if (caps.schemaPublication && !runtime.schemaPublication) throw dsError("schema publication capability requires a schema publication runtime");
+  if (caps.manifests && !runtime.fullMode?.manifestPublication) throw dsError("manifest capability requires a full-mode manifest runtime");
+  if (caps.storageStats && !db) throw dsError("storage stats capability requires a sqlite metadata store");
+  if (caps.objectStoreAccounting && !db) throw dsError("object-store accounting capability requires a sqlite metadata store");
+  if (caps.touch && !db) throw dsError("touch capability requires a sqlite metadata store");
+  if (caps.internalMetrics && !caps.builtinProfiles) throw dsError("internal metrics capability requires built-in profile support");
+  if (runtime.fullMode && !db) throw dsError("full-mode runtime requires a sqlite metadata store");
+}
 
 function reduceConcurrencyLimit(limit: number): number {
   return Math.max(1, Math.ceil(Math.max(1, limit) / 2));
@@ -570,7 +582,6 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
           scope: "main",
         })
       : undefined;
-  memorySampler?.start();
   const ingestGate = new ConcurrencyGate(cfg.ingestConcurrency);
   const readGate = new ConcurrencyGate(cfg.readConcurrency);
   const searchGate = new ConcurrencyGate(cfg.searchConcurrency);
@@ -585,7 +596,6 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
     },
     heapSnapshotPath: cfg.heapSnapshotPath ?? undefined,
   });
-  memory.start();
   let httpAppendGcBytesSinceLast = 0;
   let httpAppendGcLastMs = 0;
   const maybeCollectAfterHttpAppend = (bodyBytes: number): void => {
@@ -647,6 +657,7 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
     metrics,
     memorySampler,
   });
+  validateRuntimeCapabilityBundle(controlStore, db, runtime);
   const {
     reader,
     indexer,
@@ -655,6 +666,9 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
     getRuntimeMemorySnapshot,
   } = runtime;
   const getLocalStorageUsage = fullMode?.getLocalStorageUsage;
+  memorySampler?.start();
+  memory.start();
+  ingest.start();
   const runtimeHighWater: RuntimeMemoryHighWaterSnapshot = {
     process: {},
     process_breakdown: {},

@@ -73,6 +73,27 @@ async function readJson(resp: Response): Promise<any> {
 }
 
 describe("app core capability gates", () => {
+  test("startup rejects stores that advertise full-mode capabilities without matching runtime deps", () => {
+    const root = mkdtempSync(join(tmpdir(), "ds-app-core-caps-invalid-"));
+    const cfg = makeConfig(root);
+    const db = new SqliteDurableStore(cfg.dbPath, { cacheBytes: cfg.sqliteCacheBytes });
+    try {
+      expect(() =>
+        createAppCore(cfg, {
+          db,
+          store: db,
+          createRuntime: ({ config, registry, memorySampler, memory }) => ({
+            reader: new StreamReader(config, db, registry, undefined, memorySampler, memory),
+            start(): void {},
+          }),
+        })
+      ).toThrow("index capability requires an index runtime");
+    } finally {
+      db.close();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("WAL-only startup does not create or emit the internal metrics stream", async () => {
     await withLimitedApp(async ({ app, baseUrl, sqlite }) => {
       expect(app.deps.db).toBeUndefined();
