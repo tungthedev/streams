@@ -3,6 +3,8 @@ import { loadConfig } from "../src/config";
 import { deriveMemoryPressureHeadroomBytes, deriveMemoryPressureLimitBytes } from "../src/memory";
 
 const KEYS = [
+  "DS_STORAGE",
+  "DS_POSTGRES_URL",
   "DS_MEMORY_LIMIT_MB",
   "DS_SQLITE_CACHE_MB",
   "DS_SQLITE_CACHE_BYTES",
@@ -22,6 +24,20 @@ afterEach(() => {
 });
 
 describe("config memory tuning", () => {
+  test("defaults to sqlite storage and rejects postgres until public wiring lands", () => {
+    delete process.env.DS_STORAGE;
+    expect(loadConfig().storage).toBe("sqlite");
+
+    process.env.DS_STORAGE = "sqlite";
+    expect(loadConfig().storage).toBe("sqlite");
+
+    process.env.DS_STORAGE = "postgres";
+    expect(() => loadConfig()).toThrow("postgres storage is not enabled yet");
+
+    process.env.DS_STORAGE = "memory";
+    expect(() => loadConfig()).toThrow("invalid DS_STORAGE: memory");
+  });
+
   test("derives a smaller worker sqlite cache than the main process cache", () => {
     process.env.DS_MEMORY_LIMIT_MB = "4096";
     process.env.DS_SQLITE_CACHE_MB = "256";

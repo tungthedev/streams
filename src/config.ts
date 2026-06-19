@@ -3,6 +3,7 @@ export type Config = {
   autoTuneRequestedMemoryMb: number | null;
   autoTunePresetMb: number | null;
   autoTuneEffectiveMemoryLimitMb: number | null;
+  storage: "sqlite";
   host: string;
   rootDir: string;
   dbPath: string;
@@ -74,6 +75,8 @@ export type Config = {
 };
 
 const KNOWN_DS_ENVS = new Set<string>([
+  "DS_STORAGE",
+  "DS_POSTGRES_URL",
   "DS_ROOT",
   "DS_HOST",
   "DS_DB_PATH",
@@ -246,8 +249,16 @@ function clampBytes(value: number, min: number, max: number): number {
   return value;
 }
 
+function parseStorageMode(): "sqlite" {
+  const raw = process.env.DS_STORAGE?.trim().toLowerCase();
+  if (raw == null || raw === "" || raw === "sqlite") return "sqlite";
+  if (raw === "postgres") throw dsError("postgres storage is not enabled yet");
+  throw dsError(`invalid DS_STORAGE: ${process.env.DS_STORAGE}`);
+}
+
 export function loadConfig(): Config {
   warnUnknownEnv();
+  const storage = parseStorageMode();
   const rootDir = process.env.DS_ROOT ?? "./ds-data";
   const host = process.env.DS_HOST?.trim() || "127.0.0.1";
   const autoTuneRequestedMemoryMb = envBytes("DS_AUTO_TUNE_REQUESTED_MB");
@@ -298,6 +309,7 @@ export function loadConfig(): Config {
     autoTuneRequestedMemoryMb,
     autoTunePresetMb,
     autoTuneEffectiveMemoryLimitMb,
+    storage,
     host,
     rootDir,
     dbPath: process.env.DS_DB_PATH ?? `${rootDir}/wal.sqlite`,
