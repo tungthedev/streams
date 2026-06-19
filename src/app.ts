@@ -19,6 +19,7 @@ import { LexiconIndexManager } from "./index/lexicon_indexer";
 import { readSqliteRuntimeMemoryStats } from "./sqlite/runtime_stats";
 import { sumRuntimeMemoryValues } from "./runtime_memory";
 import { SqliteDurableStore } from "./db/db";
+import { PostgresDurableStore } from "./postgres/store";
 
 export type { App } from "./app_core";
 
@@ -373,5 +374,16 @@ export function createApp(cfg: Config, os?: ObjectStore, opts: CreateAppOptions 
         },
       };
     },
+  });
+}
+
+export function createPostgresApp(cfg: Config, store: PostgresDurableStore, opts: CreateAppOptions = {}): App {
+  return createAppCore(cfg, {
+    store,
+    stats: opts.stats,
+    createRuntime: ({ config, registry, memorySampler, memory }) => ({
+      reader: new StreamReader(config, store, registry, undefined, memorySampler, memory),
+      start: (): void => {},
+    }),
   });
 }

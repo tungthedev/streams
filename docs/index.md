@@ -15,6 +15,7 @@ and tooling.
 - [live-query-invalidation.md](./live-query-invalidation.md) — SQL query-family matrix for
   exact vs coarse live invalidation
 - [local-dev.md](./local-dev.md) — local development server behavior and Prisma CLI integration
+- [postgres-store.md](./postgres-store.md) — Postgres WAL/control-plane storage mode
 - [auth.md](./auth.md) — authentication and authorization constraints
 - [security.md](./security.md) — security reporting policy and deployment posture
 

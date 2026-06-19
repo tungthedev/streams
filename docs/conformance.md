@@ -11,6 +11,8 @@ This repository uses two layers of protocol verification:
 bun test test/conformance.test.ts
 bun run test:conformance
 bun run test:conformance:local
+DS_TEST_POSTGRES_URL=postgres://postgres:postgres@127.0.0.1:5432/streams_test \
+  bun test test/postgres_store.test.ts test/postgres_http.test.ts
 ```
 
 Default behavior:
@@ -35,6 +37,11 @@ Last verified on `2026-03-14`:
 - Upstream local-mode suite: `239/239` passing
 
 Prisma Streams currently passes the upstream black-box suite for both server modes.
+
+Postgres mode has focused store and HTTP smoke coverage for its supported
+WAL/control-plane subset. It does not claim full upstream conformance because
+the first Postgres mode intentionally excludes full-mode search, aggregate,
+touch/live, object-store publication, and built-in profile side effects.
 
 ## Notes
 

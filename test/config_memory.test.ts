@@ -24,16 +24,22 @@ afterEach(() => {
 });
 
 describe("config memory tuning", () => {
-  test("defaults to sqlite storage and rejects postgres until public wiring lands", () => {
+  test("defaults to sqlite storage and validates postgres configuration", () => {
     delete process.env.DS_STORAGE;
+    delete process.env.DS_POSTGRES_URL;
     expect(loadConfig().storage).toBe("sqlite");
 
     process.env.DS_STORAGE = "sqlite";
     expect(loadConfig().storage).toBe("sqlite");
 
     process.env.DS_STORAGE = "postgres";
-    expect(() => loadConfig()).toThrow("postgres storage is not enabled yet");
+    expect(() => loadConfig()).toThrow("DS_POSTGRES_URL is required when DS_STORAGE=postgres");
+    process.env.DS_POSTGRES_URL = "postgres://localhost/streams";
+    const postgresConfig = loadConfig();
+    expect(postgresConfig.storage).toBe("postgres");
+    expect(postgresConfig.postgresUrl).toBe("postgres://localhost/streams");
 
+    delete process.env.DS_POSTGRES_URL;
     process.env.DS_STORAGE = "memory";
     expect(() => loadConfig()).toThrow("invalid DS_STORAGE: memory");
   });

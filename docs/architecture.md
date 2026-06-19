@@ -3,6 +3,7 @@
 This document describes the architecture of the Prisma Streams Bun + TypeScript
 implementation using:
 - SQLite (bun:sqlite) as the durable WAL and metadata store
+- Postgres as an optional WAL/control-plane store
 - TieredStore-style segments and manifests
 - An R2-compatible object store (MockR2 for tests)
 
@@ -192,6 +193,13 @@ object storage. Published logical stream size is restored from the manifest,
 and if it is missing a background reconciliation pass can rebuild it from
 published segments plus retained WAL. Profiles and schemas only shape how a
 stream is interpreted.
+
+In Postgres mode, Postgres is the durable source for stream lifecycle metadata,
+schema/profile metadata, producer state, and WAL rows. Postgres mode does not
+publish segment, manifest, schema, or index objects to object storage, so it does
+not run the segmenter, uploader, index managers, touch runtime, or internal
+metrics profile stream. It supports the shared WAL/control-plane HTTP routes and
+rejects full-mode capabilities explicitly.
 
 ## Stream Deletion Enforcement
 

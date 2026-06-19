@@ -32,10 +32,11 @@ streams and instruments an app from scratch. UIs should use the explicit
 `observability.request` descriptor from `GET /v1/streams` or
 `GET /v1/stream/{name}/_details` to pair `evlog` and `otel-traces` streams.
 
-This repository currently contains two server modes:
+This repository currently contains three server modes:
 
 - `full` mode: a self-hosted server with SQLite WAL storage, segmenting, upload, and index maintenance
 - `local` mode: an embedded single-SQLite server intended for trusted local development workflows, especially `npx prisma dev`
+- `postgres` mode: a self-hosted WAL/control-plane server backed by Postgres, without segmenting, object-store upload, search, touch/live, or built-in profile side effects
 
 ## Current Durability Model
 
@@ -95,6 +96,10 @@ bun install
 # Full server (self-hosted pipeline)
 bun run src/server.ts --object-store local --no-auth
 
+# Postgres WAL/control-plane server
+DS_STORAGE=postgres DS_POSTGRES_URL=postgres://user:pass@host:5432/db \
+  bun run src/server.ts --no-auth
+
 # Local development server
 bun run src/local/cli.ts start --name default --port 8080
 
@@ -107,6 +112,9 @@ bun run src/local/cli.ts reset --name default
 Notes:
 
 - Full server startup requires `--object-store local|r2` and exactly one auth mode: `--no-auth` or `--auth-strategy api-key`.
+- Postgres mode requires `DS_STORAGE=postgres` and `DS_POSTGRES_URL`, rejects
+  `--object-store` and `--bootstrap-from-r2`, and supports only WAL/control-plane
+  endpoints. See [postgres-store.md](./postgres-store.md).
 - Prisma Compute deployments from npm should follow the package-based flow in
   the top-level [README.md](../README.md#deploy-to-prisma-compute).
 - Repository Compute bundle deployments can use `src/compute/entry.ts`, which
@@ -197,6 +205,25 @@ Optional OTLP trace receiver configuration:
   receiver target
 - `DS_OTLP_AUTO_CREATE=true` lets `/v1/traces` create and profile that stream
   as `otel-traces` before accepting spans
+
+## Postgres Server
+
+Postgres mode starts the same Bun HTTP server with a Postgres WAL/control-plane
+store:
+
+```bash
+DS_STORAGE=postgres \
+DS_POSTGRES_URL=postgres://user:pass@host:5432/database \
+bun run src/server.ts --no-auth
+```
+
+It supports basic stream lifecycle, append, read, long-poll, schema metadata,
+routing-key derivation, and `generic` profile metadata. It does not support
+object-store upload, R2 bootstrap, search, aggregate queries, routing-key
+lexicon listing, touch/live invalidation, OTLP ingestion, internal metrics
+profile streams, or non-generic built-in profile side effects.
+
+See [postgres-store.md](./postgres-store.md).
 
 ### Object Store Configuration
 
