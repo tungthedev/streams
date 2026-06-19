@@ -1,6 +1,8 @@
 import { Result } from "better-result";
-import type { SqliteDurableStore, StreamRow } from "../db/db";
-import type { SchemaRegistry, SchemaRegistryStore } from "../schema/registry";
+import type { SchemaRegistry } from "../schema/registry";
+import type { StreamReadRow as StreamRow, StreamReadStore } from "../store/segment_read_store";
+import type { ProfileStore } from "../store/schema_profile_store";
+import type { ProfileTouchStatePlan, ProfileTouchStateStore } from "../store/profile_touch_store";
 import { LruCache } from "../util/lru";
 import { dsError } from "../util/ds_error.ts";
 import { GENERIC_STREAM_PROFILE_DEFINITION } from "./generic";
@@ -20,6 +22,7 @@ import {
   type StreamProfileCorrelationCapability,
   type StreamProfileDefinition,
   type StreamProfileMetricsCapability,
+  type StreamProfilePersistResult,
   type StreamProfileReadError,
   type StreamProfileResource,
   type StreamProfileSpec,
@@ -137,34 +140,34 @@ export type StreamProfileUpdateResult = {
 };
 
 export class StreamProfileStore {
-  private readonly db: SqliteDurableStore;
-  private readonly registry: SchemaRegistryStore;
+  private readonly store: ProfileStore & StreamReadStore;
+  private readonly touchStore?: ProfileTouchStateStore;
   private readonly cache: LruCache<string, CachedStreamProfile>;
 
-  constructor(db: SqliteDurableStore, registry: SchemaRegistryStore, opts?: { cacheEntries?: number }) {
-    this.db = db;
-    this.registry = registry;
+  constructor(store: ProfileStore & StreamReadStore, opts?: { cacheEntries?: number; touchStore?: ProfileTouchStateStore }) {
+    this.store = store;
+    this.touchStore = opts?.touchStore;
     this.cache = new LruCache(opts?.cacheEntries ?? 1024);
   }
 
-  private loadRow(stream: string): StoredProfileRow | null {
-    return this.db.getStreamProfile(stream);
+  private async loadRow(stream: string): Promise<StoredProfileRow | null> {
+    return this.store.getStreamProfileForRead(stream);
   }
 
-  getProfile(stream: string, streamRow?: StreamRow | null): StreamProfileSpec {
-    const res = this.getProfileResult(stream, streamRow);
+  async getProfile(stream: string, streamRow?: StreamRow | null): Promise<StreamProfileSpec> {
+    const res = await this.getProfileResult(stream, streamRow);
     if (Result.isError(res)) throw dsError(res.error.message, { code: res.error.code });
     return res.value;
   }
 
-  getProfileResult(stream: string, streamRow?: StreamRow | null): Result<StreamProfileSpec, StreamProfileReadError> {
-    const srow = streamRow ?? this.db.getStream(stream);
+  async getProfileResult(stream: string, streamRow?: StreamRow | null): Promise<Result<StreamProfileSpec, StreamProfileReadError>> {
+    const srow = streamRow ?? await this.store.getStreamForRead(stream);
     if (!srow) return Result.ok(GENERIC_STREAM_PROFILE_DEFINITION.defaultProfile());
 
     const definitionRes = resolveStreamProfileDefinitionResult(srow.profile);
     if (Result.isError(definitionRes)) return definitionRes;
 
-    const row = definitionRes.value.usesStoredProfileRow ? this.loadRow(stream) : null;
+    const row = definitionRes.value.usesStoredProfileRow ? await this.loadRow(stream) : null;
     const cached = cloneCachedProfile(this.cache.get(stream) ?? null);
     const readRes = definitionRes.value.readProfileResult({
       row,
@@ -179,42 +182,59 @@ export class StreamProfileStore {
     return Result.ok(cloneStreamProfileSpec(readRes.value.profile));
   }
 
-  getProfileResource(stream: string, streamRow?: StreamRow | null): StreamProfileResource {
-    const res = this.getProfileResourceResult(stream, streamRow);
+  async getProfileResource(stream: string, streamRow?: StreamRow | null): Promise<StreamProfileResource> {
+    const res = await this.getProfileResourceResult(stream, streamRow);
     if (Result.isError(res)) throw dsError(res.error.message, { code: res.error.code });
     return res.value;
   }
 
-  getProfileResourceResult(stream: string, streamRow?: StreamRow | null): Result<StreamProfileResource, StreamProfileReadError> {
-    const profileRes = this.getProfileResult(stream, streamRow);
+  async getProfileResourceResult(stream: string, streamRow?: StreamRow | null): Promise<Result<StreamProfileResource, StreamProfileReadError>> {
+    const profileRes = await this.getProfileResult(stream, streamRow);
     if (Result.isError(profileRes)) return profileRes;
     return Result.ok(buildStreamProfileResource(profileRes.value));
   }
 
-  updateProfile(stream: string, streamRow: StreamRow, profile: StreamProfileSpec): StreamProfileResource {
-    const res = this.updateProfileResult(stream, streamRow, profile);
+  async updateProfile(stream: string, profile: StreamProfileSpec): Promise<StreamProfileResource> {
+    const res = await this.updateProfileResult(stream, profile);
     if (Result.isError(res)) throw dsError(res.error.message, { code: res.error.code });
     return res.value.resource;
   }
 
-  updateProfileResult(
-    stream: string,
-    streamRow: StreamRow,
-    profile: StreamProfileSpec
-  ): Result<StreamProfileUpdateResult, StreamProfileMutationError> {
+  async updateProfileResult(stream: string, profile: StreamProfileSpec): Promise<Result<StreamProfileUpdateResult, StreamProfileMutationError>> {
     const definition = resolveStreamProfileDefinition(profile.kind);
     if (!definition) {
       return Result.err({ kind: "bad_request", message: `profile.kind must be ${supportedProfileKindsMessage()}` });
     }
 
-    const persistRes = definition.persistProfileResult({ db: this.db, registry: this.registry, stream, streamRow, profile });
-    if (Result.isError(persistRes)) return persistRes;
+    let touchState: ProfileTouchStatePlan = "preserve";
+    const commitRes = await this.store.commitProfileMetadataMutation<StreamProfilePersistResult, StreamProfileMutationError>(stream, ({ streamRow }) => {
+      if (!streamRow) return Result.err({ kind: "bad_request", message: "stream not found" });
+      const persistRes = definition.persistProfileResult({ stream, streamRow, profile });
+      if (Result.isError(persistRes)) return persistRes;
+      if (persistRes.value.touchState !== "preserve" && !this.touchStore) {
+        return Result.err({ kind: "bad_request", message: `${persistRes.value.profile.kind} profile requires touch capability` });
+      }
+      touchState = persistRes.value.touchState;
+      return Result.ok({
+        metadata: {
+          streamProfile: persistRes.value.streamProfile,
+          profileJson: persistRes.value.profileJson,
+          schemaRegistry: persistRes.value.schemaRegistry ?? null,
+        },
+        value: persistRes.value,
+      });
+    });
+    if (Result.isError(commitRes)) return commitRes;
+    if (touchState !== "preserve") await this.touchStore!.updateProfileTouchState(stream, touchState);
 
-    if (persistRes.value.cache) this.cache.set(stream, cloneCachedProfile(persistRes.value.cache)!);
+    const persist = commitRes.value.value;
+    const cache = persist.cache ? { ...persist.cache, updatedAtMs: commitRes.value.profileUpdatedAtMs } : null;
+
+    if (cache) this.cache.set(stream, cloneCachedProfile(cache)!);
     else this.cache.delete(stream);
     return Result.ok({
-      resource: buildStreamProfileResource(cloneStreamProfileSpec(persistRes.value.profile)),
-      schemaRegistry: persistRes.value.schemaRegistry ?? null,
+      resource: buildStreamProfileResource(cloneStreamProfileSpec(persist.profile)),
+      schemaRegistry: commitRes.value.schemaRegistry,
     });
   }
 }

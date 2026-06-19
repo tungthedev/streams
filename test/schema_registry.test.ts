@@ -5,9 +5,16 @@ import { join } from "node:path";
 import { Result } from "better-result";
 import { SqliteDurableStore } from "../src/db/db";
 import { SchemaRegistryStore } from "../src/schema/registry";
+import { StreamProfileStore } from "../src/profiles";
+
+class FixedClockStore extends SqliteDurableStore {
+  override nowMs(): bigint {
+    return 123456789n;
+  }
+}
 
 describe("schema registry", () => {
-  test("install schema then upgrade with lens", () => {
+  test("install schema then upgrade with lens", async () => {
     const root = mkdtempSync(join(tmpdir(), "ds-schema-"));
     try {
       const db = new SqliteDurableStore(`${root}/wal.sqlite`);
@@ -21,11 +28,11 @@ describe("schema registry", () => {
         additionalProperties: false,
       };
 
-      let reg = regStore.updateRegistry("s", db.getStream("s")!, { schema: v1 });
+      let reg = await regStore.updateRegistry("s", { schema: v1 });
       expect(reg.currentVersion).toBe(1);
       expect(reg.boundaries[0].offset).toBe(0);
 
-      reg = regStore.updateSearch("s", {
+      reg = await regStore.updateSearch("s", {
         primaryTimestampField: "eventTime",
         fields: {
           eventTime: {
@@ -97,7 +104,7 @@ describe("schema registry", () => {
         ops: [{ op: "add", path: "/b", schema: { type: "object" } }],
       };
 
-      reg = regStore.updateRegistry("s", db.getStream("s")!, { schema: v2, lens });
+      reg = await regStore.updateRegistry("s", { schema: v2, lens });
       expect(reg.currentVersion).toBe(2);
       expect(reg.search).toEqual({
         primaryTimestampField: "eventTime",
@@ -134,14 +141,14 @@ describe("schema registry", () => {
     }
   });
 
-  test("rejects search-only updates before a schema version exists", () => {
+  test("rejects search-only updates before a schema version exists", async () => {
     const root = mkdtempSync(join(tmpdir(), "ds-schema-search-"));
     try {
       const db = new SqliteDurableStore(`${root}/wal.sqlite`);
       db.ensureStream("s", null);
       const regStore = new SchemaRegistryStore(db);
 
-      const res = regStore.updateSearchResult("s", {
+      const res = await regStore.updateSearchResult("s", {
         primaryTimestampField: "eventTime",
         fields: {
           eventTime: {
@@ -156,6 +163,41 @@ describe("schema registry", () => {
       expect(Result.isError(res)).toBe(true);
       if (Result.isOk(res)) return;
       expect(res.error.message).toContain("installed schema version");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("profile-owned schema replacement invalidates same-timestamp registry cache", async () => {
+    const root = mkdtempSync(join(tmpdir(), "ds-schema-cache-"));
+    try {
+      const db = new FixedClockStore(`${root}/wal.sqlite`);
+      db.ensureStream("s", { contentType: "application/json" });
+      const regStore = new SchemaRegistryStore(db);
+      const profileStore = new StreamProfileStore(db, { touchStore: db });
+
+      const reg = await regStore.updateRegistry("s", {
+        schema: {
+          type: "object",
+          properties: { a: { type: "string" } },
+          required: ["a"],
+          additionalProperties: false,
+        },
+      });
+      expect(reg.currentVersion).toBe(1);
+
+      const cachedBefore = await regStore.getRegistryResult("s");
+      expect(Result.isOk(cachedBefore)).toBe(true);
+      if (Result.isError(cachedBefore)) return;
+      expect(cachedBefore.value.search).toBeUndefined();
+
+      const profileRes = await profileStore.updateProfileResult("s", { kind: "evlog" });
+      expect(Result.isOk(profileRes)).toBe(true);
+
+      const after = await regStore.getRegistryResult("s");
+      expect(Result.isOk(after)).toBe(true);
+      if (Result.isError(after)) return;
+      expect(after.value.search?.profile).toBe("evlog");
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

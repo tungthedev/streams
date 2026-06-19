@@ -171,9 +171,9 @@ function createColocatedStreamsTarget(streamsApp: App): StreamsFetchTarget {
       const streamRow = db.getStream(stream);
       if (!streamRow || db.isDeleted(streamRow)) throw dsError("stream not found");
 
-      const regRes = registry.getRegistryResult(stream);
+      const regRes = await registry.getRegistryResult(stream);
       if (Result.isError(regRes)) throw dsError(regRes.error.message);
-      const profileRes = profiles.getProfileResult(stream, streamRow);
+      const profileRes = await profiles.getProfileResult(stream, streamRow);
       if (Result.isError(profileRes)) throw dsError(profileRes.error.message);
       const jsonIngest = resolveJsonIngestCapability(profileRes.value);
       const reg = regRes.value;

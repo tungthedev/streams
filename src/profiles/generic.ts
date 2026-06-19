@@ -37,11 +37,15 @@ export const GENERIC_STREAM_PROFILE_DEFINITION: StreamProfileDefinition = {
     return Result.ok({ profile: cloneGenericProfile(), cache: null });
   },
 
-  persistProfileResult({ db, stream }): Result<StreamProfilePersistResult, { kind: "bad_request"; message: string; code?: string }> {
-    db.updateStreamProfile(stream, "generic");
-    db.deleteStreamProfile(stream);
-    db.deleteStreamTouchState(stream);
+  persistProfileResult({ streamRow }): Result<StreamProfilePersistResult, { kind: "bad_request"; message: string; code?: string }> {
     const profile: StreamProfileSpec = cloneStreamProfileSpec(cloneGenericProfile());
-    return Result.ok({ profile, cache: null, schemaRegistry: null });
+    return Result.ok({
+      profile,
+      cache: null,
+      schemaRegistry: null,
+      streamProfile: "generic",
+      profileJson: null,
+      touchState: streamRow.profile === "state-protocol" ? "delete" : "preserve",
+    });
   },
 };

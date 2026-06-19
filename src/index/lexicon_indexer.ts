@@ -282,7 +282,7 @@ export class LexiconIndexManager {
       this.queue.clear();
       for (const stream of streams) {
         if (this.stopped) break;
-        if (!this.isRoutingLexiconConfigured(stream)) {
+        if (!(await this.isRoutingLexiconConfigured(stream))) {
           const hadState =
             this.db.getLexiconIndexState(stream, ROUTING_KEY_SOURCE_KIND, ROUTING_KEY_SOURCE_NAME) != null ||
             this.db.listLexiconIndexRunsAll(stream, ROUTING_KEY_SOURCE_KIND, ROUTING_KEY_SOURCE_NAME).length > 0;
@@ -803,9 +803,9 @@ export class LexiconIndexManager {
     this.db.deleteLexiconIndexRuns(deletions.map((run) => run.run_id));
   }
 
-  private isRoutingLexiconConfigured(stream: string): boolean {
+  private async isRoutingLexiconConfigured(stream: string): Promise<boolean> {
     if (!this.registry) return false;
-    const registryRes = this.registry.getRegistryResult(stream);
+    const registryRes = await this.registry.getRegistryResult(stream);
     if (Result.isError(registryRes)) return false;
     return registryRes.value.routingKey != null;
   }

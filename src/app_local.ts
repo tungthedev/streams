@@ -141,7 +141,6 @@ export function createLocalApp(cfg: Config, os?: ObjectStore, opts: CreateLocalA
         segmenter: noopSegmenter,
         uploader: new NoopUploader(),
         indexer,
-        uploadSchemaRegistry: async (): Promise<void> => {},
         getRuntimeMemorySnapshot: () => {
           const sqliteRuntime = readSqliteRuntimeMemoryStats();
           return {

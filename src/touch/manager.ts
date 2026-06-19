@@ -153,6 +153,8 @@ export class TouchProcessorManager {
   private streamScanCursor = 0;
   private restartWorkerPoolRequested = false;
   private lastWorkerPoolRestartAtMs = 0;
+  private seedPromise: Promise<void> | null = null;
+  private seededTouchStateFromProfiles = false;
 
   constructor(
     cfg: Config,
@@ -183,7 +185,7 @@ export class TouchProcessorManager {
   start(): void {
     if (this.timer) return;
     this.stopping = false;
-    this.seedTouchStateFromProfiles();
+    void this.ensureTouchStateSeeded();
     const liveMetricsRes = this.liveMetrics.ensureStreamResult();
     if (Result.isError(liveMetricsRes)) {
       // eslint-disable-next-line no-console
@@ -268,6 +270,7 @@ export class TouchProcessorManager {
     if (this.cfg.touchWorkers <= 0) return;
     this.running = true;
     try {
+      await this.ensureTouchStateSeeded();
       const nowMs = Date.now();
       const dirtyNow = new Set(this.dirty);
       this.dirty.clear();
@@ -279,7 +282,7 @@ export class TouchProcessorManager {
       const ordered: string[] = [];
       for (const s of dirtyNow) if (stateByStream.has(s)) ordered.push(s);
       for (const s of stateByStream.keys()) if (!dirtyNow.has(s)) ordered.push(s);
-      const prioritized = this.prioritizeStreamsForProcessing(ordered, nowMs);
+      const prioritized = await this.prioritizeStreamsForProcessing(ordered, nowMs);
 
       const maxConcurrent = Math.max(1, this.cfg.touchWorkers);
       const tasks: Promise<void>[] = [];
@@ -333,7 +336,7 @@ export class TouchProcessorManager {
       let persistIntervalMin = Number.POSITIVE_INFINITY;
       for (const stream of stateByStream.keys()) {
         if (this.stopping) break;
-        const profileRes = this.profiles.getProfileResult(stream);
+        const profileRes = await this.profiles.getProfileResult(stream);
         if (Result.isError(profileRes)) {
           // eslint-disable-next-line no-console
           console.error("touch profile read failed", stream, profileRes.error.message);
@@ -382,7 +385,7 @@ export class TouchProcessorManager {
     const toOffset = next - 1n;
     if (fromOffset > toOffset) return;
 
-    const profileRes = this.profiles.getProfileResult(stream, srow);
+    const profileRes = await this.profiles.getProfileResult(stream, srow);
     if (Result.isError(profileRes)) {
       // eslint-disable-next-line no-console
       console.error("touch profile read failed", stream, profileRes.error.message);
@@ -657,7 +660,7 @@ export class TouchProcessorManager {
     }
   }
 
-  private seedTouchStateFromProfiles(): void {
+  private async seedTouchStateFromProfiles(): Promise<void> {
     // Bootstrap support: bootstrapFromR2 restores profile state but does not
     // populate stream_touch_state. Seeding here makes touch processing start working
     // after bootstraps and restarts without requiring a no-op config update.
@@ -665,7 +668,7 @@ export class TouchProcessorManager {
       for (const kind of listTouchCapableProfileKinds()) {
         const streams = this.db.listStreamsByProfile(kind);
         for (const stream of streams) {
-          const profileRes = this.profiles.getProfileResult(stream);
+          const profileRes = await this.profiles.getProfileResult(stream);
           if (Result.isError(profileRes)) continue;
           const touchCapability = resolveTouchCapability(profileRes.value);
           if (!touchCapability) continue;
@@ -675,6 +678,17 @@ export class TouchProcessorManager {
     } catch {
       // ignore
     }
+  }
+
+  private ensureTouchStateSeeded(): Promise<void> {
+    if (this.seededTouchStateFromProfiles) return Promise.resolve();
+    if (!this.seedPromise) {
+      this.seedPromise = this.seedTouchStateFromProfiles().finally(() => {
+        this.seededTouchStateFromProfiles = true;
+        this.seedPromise = null;
+      });
+    }
+    return this.seedPromise;
   }
 
   activateTemplates(args: {
@@ -940,13 +954,13 @@ export class TouchProcessorManager {
     return next;
   }
 
-  private prioritizeStreamsForProcessing(ordered: string[], nowMs: number): string[] {
+  private async prioritizeStreamsForProcessing(ordered: string[], nowMs: number): Promise<string[]> {
     if (ordered.length <= 1) return ordered;
     const hot: string[] = [];
     const cold: string[] = [];
     for (const stream of ordered) {
       let hasActiveWaiters = false;
-      const profileRes = this.profiles.getProfileResult(stream);
+      const profileRes = await this.profiles.getProfileResult(stream);
       if (Result.isError(profileRes)) {
         hasActiveWaiters = false;
       } else {

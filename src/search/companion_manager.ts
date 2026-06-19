@@ -400,7 +400,7 @@ export class SearchCompanionManager {
     try {
       let sectionGetMs = 0;
       let decodeMs = 0;
-      const planRow = this.getCurrentPlanRow(stream);
+      const planRow = await this.getCurrentPlanRow(stream);
       if (!planRow) return { companion: null, stats: { sectionGetMs, decodeMs } };
       const row = this.db.getSearchSegmentCompanion(stream, segmentIndex);
       if (!row || row.plan_generation !== planRow.generation) return { companion: null, stats: { sectionGetMs, decodeMs } };
@@ -464,8 +464,8 @@ export class SearchCompanionManager {
     }
   }
 
-  private getCurrentPlanRow(stream: string): SearchCompanionPlanRow | null {
-    const regRes = this.registry.getRegistryResult(stream);
+  private async getCurrentPlanRow(stream: string): Promise<SearchCompanionPlanRow | null> {
+    const regRes = await this.registry.getRegistryResult(stream);
     if (Result.isError(regRes)) return null;
     const desiredPlan = buildDesiredSearchCompanionPlan(regRes.value);
     const desiredHash = hashSearchCompanionPlan(desiredPlan);
@@ -569,7 +569,7 @@ export class SearchCompanionManager {
     if (this.building.has(stream)) return Result.ok(undefined);
     this.building.add(stream);
     try {
-      const regRes = this.registry.getRegistryResult(stream);
+      const regRes = await this.registry.getRegistryResult(stream);
       if (Result.isError(regRes)) return invalidCompanionBuild(regRes.error.message);
       const desiredPlan = buildDesiredSearchCompanionPlan(regRes.value);
       const desiredHash = hashSearchCompanionPlan(desiredPlan);

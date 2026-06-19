@@ -20,7 +20,7 @@ import {
   type SchemaRegistryMutationError,
   type SchemaRegistryReadError,
 } from "./schema/registry";
-import { decodeJsonPayloadResult } from "./schema/read_json";
+import { decodeJsonPayloadWithRegistryResult } from "./schema/read_json";
 import { resolvePointerResult } from "./util/json_pointer";
 import { ExpirySweeper } from "./expiry_sweeper";
 import type { StatsCollector } from "./stats";
@@ -78,6 +78,7 @@ import {
 } from "./observe/request";
 import { buildRequestObservabilityPairingDescriptor } from "./observe/pairing";
 import { dsError } from "./util/ds_error.ts";
+import type { SchemaPublicationStore } from "./store/schema_publication";
 import { streamHash16Hex } from "./util/stream_paths";
 
 function withNosniff(headers: HeadersInit = {}): HeadersInit {
@@ -451,6 +452,7 @@ function contiguousCoveredSegmentCount(rows: Array<{ segment_index: number; sect
 export type App = {
   fetch: (req: Request) => Promise<Response>;
   close: () => void;
+  ready: Promise<void>;
   deps: {
     config: Config;
     db: SqliteDurableStore;
@@ -502,7 +504,7 @@ type AppRuntimeDeps = {
   uploader: UploaderController;
   indexer?: StreamIndexLookup;
   segmentDiskCache?: SegmentDiskCache;
-  uploadSchemaRegistry: (stream: string, registry: SchemaRegistry) => Promise<void>;
+  schemaPublication?: SchemaPublicationStore;
   getRuntimeMemorySnapshot?: () => RuntimeMemorySubsystemSnapshot;
   getLocalStorageUsage?: (stream: string) => {
     segment_cache_bytes: number;
@@ -610,7 +612,7 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
   const ingest = new IngestQueue(cfg, db, stats, backpressure, metrics);
   const notifier = new StreamNotifier();
   const registry = new SchemaRegistryStore(db);
-  const profiles = new StreamProfileStore(db, registry);
+  const profiles = new StreamProfileStore(db, { touchStore: db });
   const touch = new TouchProcessorManager(cfg, db, ingest, notifier, profiles, backpressure);
   const runtime = opts.createRuntime({
     config: cfg,
@@ -628,7 +630,7 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
     metrics,
     memorySampler,
   });
-  const { store, reader, segmenter, uploader, indexer, uploadSchemaRegistry, getRuntimeMemorySnapshot, getLocalStorageUsage } = runtime;
+  const { store, reader, segmenter, uploader, indexer, schemaPublication, getRuntimeMemorySnapshot, getLocalStorageUsage } = runtime;
   const runtimeHighWater: RuntimeMemoryHighWaterSnapshot = {
     process: {},
     process_breakdown: {},
@@ -1112,40 +1114,45 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
     runtime.segmentDiskCache,
     (stream) => notifier.notifyDetailsChanged(stream)
   );
+  let closing = false;
 
-  const metricsStreamRow = db.ensureStream(INTERNAL_METRICS_STREAM, { contentType: "application/json", profile: "metrics" });
-  const metricsProfileRes = profiles.updateProfileResult(INTERNAL_METRICS_STREAM, metricsStreamRow, { kind: "metrics" });
-  if (Result.isError(metricsProfileRes)) {
-    throw dsError(`failed to initialize ${INTERNAL_METRICS_STREAM} profile: ${metricsProfileRes.error.message}`);
-  }
+  db.ensureStream(INTERNAL_METRICS_STREAM, { contentType: "application/json", profile: "metrics" });
   clearInternalMetricsAccelerationState(db);
-  runtime.start();
-  if (metricsProfileRes.value.schemaRegistry) {
-    void (async () => {
-      try {
-        await uploadSchemaRegistry(INTERNAL_METRICS_STREAM, metricsProfileRes.value.schemaRegistry!);
-        await uploader.publishManifest(INTERNAL_METRICS_STREAM);
-      } catch {
-        // background best-effort; next manifest publication will reconcile
-      }
-    })();
-  }
-  metricsEmitter.start();
-  expirySweeper.start();
-  touch.start();
-  streamSizeReconciler.start();
+  const startupPromise = (async () => {
+    const metricsProfileRes = await profiles.updateProfileResult(INTERNAL_METRICS_STREAM, { kind: "metrics" });
+    if (Result.isError(metricsProfileRes)) {
+      throw dsError(`failed to initialize ${INTERNAL_METRICS_STREAM} profile: ${metricsProfileRes.error.message}`);
+    }
+    if (closing) return;
+    runtime.start();
+    metricsEmitter.start();
+    expirySweeper.start();
+    touch.start();
+    streamSizeReconciler.start();
+    if (schemaPublication && metricsProfileRes.value.schemaRegistry) {
+      void schemaPublication
+        .publishProfileSchemaRegistry(INTERNAL_METRICS_STREAM, metricsProfileRes.value.schemaRegistry)
+        .catch(() => {
+          // background best-effort; next manifest publication will reconcile
+      });
+    }
+  })();
+  const ready = startupPromise.catch((err) => {
+    throw err;
+  });
+  void ready.catch(() => {});
 
-  const buildJsonRows = (
+  const buildJsonRows = async (
     stream: string,
     bodyBytes: Uint8Array,
     routingKeyHeader: string | null,
     allowEmptyArray: boolean
-  ): Result<{ rows: AppendRow[] }, { status: 400 | 500; message: string }> => {
-    const regRes = registry.getRegistryResult(stream);
+  ): Promise<Result<{ rows: AppendRow[] }, { status: 400 | 500; message: string }>> => {
+    const regRes = await registry.getRegistryResult(stream);
     if (Result.isError(regRes)) {
       return Result.err({ status: 500, message: regRes.error.message });
     }
-    const profileRes = profiles.getProfileResult(stream);
+    const profileRes = await profiles.getProfileResult(stream);
     if (Result.isError(profileRes)) {
       return Result.err({ status: 500, message: profileRes.error.message });
     }
@@ -1196,11 +1203,11 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
     return Result.ok({ rows });
   };
 
-  const buildPreparedJsonRows = (
+  const buildPreparedJsonRows = async (
     stream: string,
     records: PreparedJsonRecord[]
-  ): Result<{ rows: AppendRow[] }, { status: 400 | 500; message: string }> => {
-    const regRes = registry.getRegistryResult(stream);
+  ): Promise<Result<{ rows: AppendRow[] }, { status: 400 | 500; message: string }>> => {
+    const regRes = await registry.getRegistryResult(stream);
     if (Result.isError(regRes)) return Result.err({ status: 500, message: regRes.error.message });
     const reg = regRes.value;
     const validator = reg.currentVersion > 0 ? registry.getValidatorForVersion(reg, reg.currentVersion) : null;
@@ -1222,17 +1229,17 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
     return Result.ok({ rows });
   };
 
-  const buildAppendRowsResult = (
+  const buildAppendRowsResult = async (
     stream: string,
     bodyBytes: Uint8Array,
     contentType: string,
     routingKeyHeader: string | null,
     allowEmptyJsonArray: boolean
-  ): Result<{ rows: AppendRow[] }, { status: 400 | 500; message: string }> => {
+  ): Promise<Result<{ rows: AppendRow[] }, { status: 400 | 500; message: string }>> => {
     if (isJsonContentType(contentType)) {
       return buildJsonRows(stream, bodyBytes, routingKeyHeader, allowEmptyJsonArray);
     }
-    const regRes = registry.getRegistryResult(stream);
+    const regRes = await registry.getRegistryResult(stream);
     if (Result.isError(regRes)) return Result.err({ status: 500, message: regRes.error.message });
     const reg = regRes.value;
     if (reg.currentVersion > 0) return Result.err({ status: 400, message: "stream requires JSON" });
@@ -1296,24 +1303,26 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
     }
   };
 
-  const decodeJsonRecords = (
+  const decodeJsonRecords = async (
     stream: string,
     records: Array<{ offset: bigint; payload: Uint8Array }>
-  ): Result<{ values: any[] }, { status: 400 | 500; message: string }> => {
+  ): Promise<Result<{ values: any[] }, { status: 400 | 500; message: string }>> => {
+    const regRes = await registry.getRegistryResult(stream);
+    if (Result.isError(regRes)) return Result.err({ status: 500, message: regRes.error.message });
     const values: any[] = [];
     for (const r of records) {
-      const valueRes = decodeJsonPayloadResult(registry, stream, r.offset, r.payload);
+      const valueRes = decodeJsonPayloadWithRegistryResult(registry, regRes.value, r.offset, r.payload);
       if (Result.isError(valueRes)) return valueRes;
       values.push(valueRes.value);
     }
     return Result.ok({ values });
   };
 
-  const encodeStoredJsonArrayResult = (
+  const encodeStoredJsonArrayResult = async (
     stream: string,
     records: Array<{ payload: Uint8Array }>
-  ): Result<Buffer | null, { status: 400 | 500; message: string }> => {
-    const regRes = registry.getRegistryResult(stream);
+  ): Promise<Result<Buffer | null, { status: 400 | 500; message: string }>> => {
+    const regRes = await registry.getRegistryResult(stream);
     if (Result.isError(regRes)) return Result.err({ status: 500, message: regRes.error.message });
     if (regRes.value.currentVersion !== 0) return Result.ok(null);
     const parts: Buffer[] = [Buffer.from("[")];
@@ -1610,19 +1619,19 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
 
   type DetailsSnapshot = { etag: string; body: string; version: bigint };
 
-  const buildDetailsSnapshotResult = (
+  const buildDetailsSnapshotResult = async (
     stream: string,
     mode: "details" | "index_status"
-  ): Result<DetailsSnapshot, { status: 404 | 500; message: string }> => {
+  ): Promise<Result<DetailsSnapshot, { status: 404 | 500; message: string }>> => {
     for (let attempt = 0; attempt < 3; attempt++) {
       const beforeVersion = notifier.currentDetailsVersion(stream);
       const srow = db.getStream(stream);
       if (!srow || db.isDeleted(srow)) return Result.err({ status: 404, message: "not_found" });
       if (srow.expires_at_ms != null && db.nowMs() > srow.expires_at_ms) return Result.err({ status: 404, message: "stream expired" });
 
-      const regRes = registry.getRegistryResult(stream);
+      const regRes = await registry.getRegistryResult(stream);
       if (Result.isError(regRes)) return Result.err({ status: 500, message: regRes.error.message });
-      const profileRes = profiles.getProfileResourceResult(stream, srow);
+      const profileRes = await profiles.getProfileResourceResult(stream, srow);
       if (Result.isError(profileRes)) return Result.err({ status: 500, message: profileRes.error.message });
 
       const profileKind = profileRes.value.profile.kind;
@@ -1655,7 +1664,6 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
     return Result.err({ status: 500, message: "details changed too quickly" });
   };
 
-  let closing = false;
   const fetch = async (req: Request): Promise<Response> => {
     if (closing) {
       return unavailable();
@@ -1679,6 +1687,7 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
       const runForegroundWithGate = async <T>(gate: ConcurrencyGate, fn: () => Promise<T>): Promise<T> =>
         runForeground(() => runWithGate(gate, fn));
       const requestPromise = (async (): Promise<Response> => {
+      await ready;
       let url: URL;
       try {
         url = new URL(req.url, "http://localhost");
@@ -1701,13 +1710,12 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
             let srow = db.getStream(stream);
             if (!srow && autoCreate) {
               srow = db.ensureStream(stream, { contentType: "application/json" });
-              const profileRes = profiles.updateProfileResult(stream, srow, { kind: "otel-traces" });
+              const profileRes = await profiles.updateProfileResult(stream, { kind: "otel-traces" });
               if (Result.isError(profileRes)) return badRequest(profileRes.error.message);
               try {
                 if (profileRes.value.schemaRegistry) {
-                  await uploadSchemaRegistry(stream, profileRes.value.schemaRegistry);
+                  if (schemaPublication) await schemaPublication.publishProfileSchemaRegistry(stream, profileRes.value.schemaRegistry);
                 }
-                await uploader.publishManifest(stream);
               } catch {
                 return json(500, { error: { code: "internal", message: "profile upload failed" } });
               }
@@ -1718,7 +1726,7 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
             if (!srow || db.isDeleted(srow)) return notFound();
             if (srow.expires_at_ms != null && db.nowMs() > srow.expires_at_ms) return notFound("stream expired");
 
-            const profileRes = profiles.getProfileResult(stream, srow);
+            const profileRes = await profiles.getProfileResult(stream, srow);
             if (Result.isError(profileRes)) return internalError("invalid stream profile");
             const capability = resolveOtlpTracesCapability(profileRes.value);
             if (!capability) return badRequest("stream profile does not support OTLP traces");
@@ -1740,7 +1748,7 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
               return badRequest(decodedRes.error.message);
             }
 
-            const rowsRes = buildPreparedJsonRows(stream, decodedRes.value.records);
+            const rowsRes = await buildPreparedJsonRows(stream, decodedRes.value.records);
             if (Result.isError(rowsRes)) {
               if (rowsRes.error.status === 500) return internalError(rowsRes.error.message);
               return badRequest(rowsRes.error.message);
@@ -1807,14 +1815,14 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
         if (Result.isError(requestRes)) return badRequest(requestRes.error.message);
         const observeReq = requestRes.value;
 
-        const loadCorrelationCapability = (
+        const loadCorrelationCapability = async (
           stream: string,
           role: "events" | "traces"
-        ): ReturnType<typeof resolveCorrelationCapability> | Response => {
+        ): Promise<ReturnType<typeof resolveCorrelationCapability> | Response> => {
           const srow = db.getStream(stream);
           if (!srow || db.isDeleted(srow)) return notFound();
           if (srow.expires_at_ms != null && db.nowMs() > srow.expires_at_ms) return notFound("stream expired");
-          const profileRes = profiles.getProfileResult(stream, srow);
+          const profileRes = await profiles.getProfileResult(stream, srow);
           if (Result.isError(profileRes)) return internalError("invalid stream profile");
           if (role === "events" && profileRes.value.kind !== "evlog") {
             return badRequest(`streams.events must reference an evlog stream; ${stream} has profile ${profileRes.value.kind}`);
@@ -1824,17 +1832,17 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
           }
           const capability = resolveCorrelationCapability(profileRes.value);
           if (!capability) return badRequest(`stream ${stream} profile does not support observability correlation`);
-          const regRes = registry.getRegistryResult(stream);
+          const regRes = await registry.getRegistryResult(stream);
           if (Result.isError(regRes)) return internalError(regRes.error.message);
           if (!regRes.value.search) return badRequest(`stream ${stream} does not have search configured`);
           return capability;
         };
 
         const eventCorrelation =
-          observeReq.include.events && observeReq.streams.events ? loadCorrelationCapability(observeReq.streams.events, "events") : null;
+          observeReq.include.events && observeReq.streams.events ? await loadCorrelationCapability(observeReq.streams.events, "events") : null;
         if (eventCorrelation instanceof Response) return eventCorrelation;
         const traceCorrelation =
-          observeReq.include.trace && observeReq.streams.traces ? loadCorrelationCapability(observeReq.streams.traces, "traces") : null;
+          observeReq.include.trace && observeReq.streams.traces ? await loadCorrelationCapability(observeReq.streams.traces, "traces") : null;
         if (traceCorrelation instanceof Response) return traceCorrelation;
 
         const runPagedSearch = async (
@@ -1843,7 +1851,7 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
           limit: number,
           sort: string[]
         ): Promise<{ hits: SearchHit[]; batches: SearchResultBatch[]; limitReached: boolean; query: ObserveSearchQueryCoverage } | Response> => {
-          const regRes = registry.getRegistryResult(stream);
+          const regRes = await registry.getRegistryResult(stream);
           if (Result.isError(regRes)) return internalError(regRes.error.message);
           const hits: SearchHit[] = [];
           const batches: SearchResultBatch[] = [];
@@ -2099,7 +2107,7 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
         const rows = db.listStreams(Math.max(0, Math.min(limit, 1000)), Math.max(0, offset));
         const out = [];
         for (const r of rows) {
-          const profileRes = profiles.getProfileResult(r.stream, r);
+          const profileRes = await profiles.getProfileResult(r.stream, r);
           if (Result.isError(profileRes)) return internalError("invalid stream profile");
           const profile = profileRes.value;
           const observability = buildRequestObservabilityPairingDescriptor(r.stream, profile);
@@ -2196,7 +2204,7 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
           if (srow.expires_at_ms != null && db.nowMs() > srow.expires_at_ms) return notFound("stream expired");
 
           if (req.method === "GET") {
-            const regRes = registry.getRegistryResult(stream);
+            const regRes = await registry.getRegistryResult(stream);
             if (Result.isError(regRes)) return schemaReadErrorResponse(regRes.error);
             return json(200, regRes.value);
           }
@@ -2211,10 +2219,10 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
             if (Result.isError(updateRes)) return badRequest(updateRes.error.message);
             const update = updateRes.value;
             if (update.schema === undefined && update.routingKey !== undefined && update.search === undefined) {
-              const regRes = registry.updateRoutingKeyResult(stream, update.routingKey ?? null);
+              const regRes = await registry.updateRoutingKeyResult(stream, update.routingKey ?? null);
               if (Result.isError(regRes)) return schemaMutationErrorResponse(regRes.error);
               try {
-                await uploadSchemaRegistry(stream, regRes.value);
+                if (schemaPublication) await schemaPublication.uploadSchemaRegistry(stream, regRes.value);
               } catch {
                 return json(500, { error: { code: "internal", message: "schema upload failed" } });
               }
@@ -2223,10 +2231,10 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
               return json(200, regRes.value);
             }
             if (update.schema === undefined && update.search !== undefined && update.routingKey === undefined) {
-              const regRes = registry.updateSearchResult(stream, update.search ?? null);
+              const regRes = await registry.updateSearchResult(stream, update.search ?? null);
               if (Result.isError(regRes)) return schemaMutationErrorResponse(regRes.error);
               try {
-                await uploadSchemaRegistry(stream, regRes.value);
+                if (schemaPublication) await schemaPublication.uploadSchemaRegistry(stream, regRes.value);
               } catch {
                 return json(500, { error: { code: "internal", message: "schema upload failed" } });
               }
@@ -2234,7 +2242,7 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
               notifier.notifyDetailsChanged(stream);
               return json(200, regRes.value);
             }
-            const regRes = registry.updateRegistryResult(stream, srow, {
+            const regRes = await registry.updateRegistryResult(stream, {
               schema: update.schema,
               lens: update.lens,
               routingKey: update.routingKey ?? undefined,
@@ -2242,7 +2250,7 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
             });
             if (Result.isError(regRes)) return schemaMutationErrorResponse(regRes.error);
             try {
-              await uploadSchemaRegistry(stream, regRes.value);
+              if (schemaPublication) await schemaPublication.uploadSchemaRegistry(stream, regRes.value);
             } catch {
               return json(500, { error: { code: "internal", message: "schema upload failed" } });
             }
@@ -2259,7 +2267,7 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
           if (srow.expires_at_ms != null && db.nowMs() > srow.expires_at_ms) return notFound("stream expired");
 
           if (req.method === "GET") {
-            const profileRes = profiles.getProfileResourceResult(stream, srow);
+            const profileRes = await profiles.getProfileResourceResult(stream, srow);
             if (Result.isError(profileRes)) return internalError("invalid stream profile");
             return json(200, profileRes.value);
           }
@@ -2273,13 +2281,12 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
             }
             const nextProfileRes = parseProfileUpdateResult(body);
             if (Result.isError(nextProfileRes)) return badRequest(nextProfileRes.error.message);
-            const profileRes = profiles.updateProfileResult(stream, srow, nextProfileRes.value);
+            const profileRes = await profiles.updateProfileResult(stream, nextProfileRes.value);
             if (Result.isError(profileRes)) return badRequest(profileRes.error.message);
             try {
               if (profileRes.value.schemaRegistry) {
-                await uploadSchemaRegistry(stream, profileRes.value.schemaRegistry);
+                if (schemaPublication) await schemaPublication.publishProfileSchemaRegistry(stream, profileRes.value.schemaRegistry);
               }
-              await uploader.publishManifest(stream);
             } catch {
               return json(500, { error: { code: "internal", message: "profile upload failed" } });
             }
@@ -2311,8 +2318,8 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
             }
           }
 
-          const loadSnapshot = (): Response | DetailsSnapshot => {
-            const snapshotRes = buildDetailsSnapshotResult(stream, isIndexStatus ? "index_status" : "details");
+          const loadSnapshot = async (): Promise<Response | DetailsSnapshot> => {
+            const snapshotRes = await buildDetailsSnapshotResult(stream, isIndexStatus ? "index_status" : "details");
             if (Result.isError(snapshotRes)) {
               if (snapshotRes.error.status === 404) {
                 return snapshotRes.error.message === "stream expired" ? notFound("stream expired") : notFound();
@@ -2322,7 +2329,7 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
             return snapshotRes.value;
           };
 
-          let snapshotOrResponse = loadSnapshot();
+          let snapshotOrResponse = await loadSnapshot();
           if (snapshotOrResponse instanceof Response) return snapshotOrResponse;
           let snapshot = snapshotOrResponse;
           const ifNoneMatch = req.headers.get("if-none-match");
@@ -2366,7 +2373,7 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
             }
             await notifier.waitForDetailsChange(stream, snapshot.version, remaining, req.signal);
             if (req.signal.aborted) return new Response(null, { status: 204 });
-            snapshotOrResponse = loadSnapshot();
+            snapshotOrResponse = await loadSnapshot();
             if (snapshotOrResponse instanceof Response) return snapshotOrResponse;
             snapshot = snapshotOrResponse;
           }
@@ -2386,7 +2393,7 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
           if (!srow || db.isDeleted(srow)) return notFound();
           if (srow.expires_at_ms != null && db.nowMs() > srow.expires_at_ms) return notFound("stream expired");
           if (req.method !== "GET") return badRequest("unsupported method");
-          const regRes = registry.getRegistryResult(stream);
+          const regRes = await registry.getRegistryResult(stream);
           if (Result.isError(regRes)) return internalError();
           if (regRes.value.routingKey == null) return badRequest("routing key not configured");
           const limitRaw = url.searchParams.get("limit");
@@ -2433,7 +2440,7 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
           if (!srow || db.isDeleted(srow)) return notFound();
           if (srow.expires_at_ms != null && db.nowMs() > srow.expires_at_ms) return notFound("stream expired");
 
-          const regRes = registry.getRegistryResult(stream);
+          const regRes = await registry.getRegistryResult(stream);
           if (Result.isError(regRes)) return internalError();
 
           const respondSearch = async (requestBody: unknown, fromQuery: boolean): Promise<Response> => {
@@ -2512,7 +2519,7 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
           if (srow.expires_at_ms != null && db.nowMs() > srow.expires_at_ms) return notFound("stream expired");
           if (req.method !== "POST") return badRequest("unsupported method");
 
-          const regRes = registry.getRegistryResult(stream);
+          const regRes = await registry.getRegistryResult(stream);
           if (Result.isError(regRes)) return internalError();
 
           let body: unknown;
@@ -2558,7 +2565,7 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
           if (!srow || db.isDeleted(srow)) return notFound();
           if (srow.expires_at_ms != null && db.nowMs() > srow.expires_at_ms) return notFound("stream expired");
 
-          const profileRes = profiles.getProfileResult(stream, srow);
+          const profileRes = await profiles.getProfileResult(stream, srow);
           if (Result.isError(profileRes)) return internalError("invalid stream profile");
           const touchCapability = resolveTouchCapability(profileRes.value);
           if (!touchCapability?.handleRoute) return notFound("touch not enabled");
@@ -2647,7 +2654,7 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
               let closedNow = false;
 
               if (bodyBytes.byteLength > 0) {
-                const rowsRes = buildAppendRowsResult(stream, bodyBytes, contentType, routingKeyHeader, true);
+                const rowsRes = await buildAppendRowsResult(stream, bodyBytes, contentType, routingKeyHeader, true);
                 if (Result.isError(rowsRes)) {
                   if (rowsRes.error.status === 500) return internalError();
                   return badRequest(rowsRes.error.message);
@@ -2801,7 +2808,7 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
               const routingKeyHeader = req.headers.get("stream-key");
               let rows: AppendRow[] = [];
               if (!isCloseOnly) {
-                const rowsRes = buildAppendRowsResult(stream, bodyBytes, reqContentType!, routingKeyHeader, false);
+                const rowsRes = await buildAppendRowsResult(stream, bodyBytes, reqContentType!, routingKeyHeader, false);
                 if (Result.isError(rowsRes)) {
                   if (rowsRes.error.status === 500) return internalError();
                   return badRequest(rowsRes.error.message);
@@ -2914,7 +2921,7 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
           if (rawFilter != null) {
             if (!isJsonStream) return badRequest("filter requires application/json stream content-type");
             filterInput = rawFilter.trim();
-            const regRes = registry.getRegistryResult(stream);
+            const regRes = await registry.getRegistryResult(stream);
             if (Result.isError(regRes)) return internalError();
             const filterRes = parseReadFilterResult(regRes.value, filterInput);
             if (Result.isError(filterRes)) return badRequest(filterRes.error.message);
@@ -2995,7 +3002,7 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
             }
 
             if (format === "json") {
-              const encodedRes = encodeStoredJsonArrayResult(stream, batch.records);
+              const encodedRes = await encodeStoredJsonArrayResult(stream, batch.records);
               if (Result.isError(encodedRes)) {
                 if (encodedRes.error.status === 500) return internalError();
                 return badRequest(encodedRes.error.message);
@@ -3009,7 +3016,7 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
                 return new Response(bodyBufferFromBytes(encodedRes.value), { status: 200, headers: withNosniff(headers) });
               }
 
-              const decoded = decodeJsonRecords(stream, batch.records);
+              const decoded = await decodeJsonRecords(stream, batch.records);
               if (Result.isError(decoded)) {
                 if (decoded.error.status === 500) return internalError();
                 return badRequest(decoded.error.message);
@@ -3084,7 +3091,7 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
                     if (batch.records.length > 0) {
                       let dataPayload = "";
                       if (format === "json") {
-                        const encodedRes = encodeStoredJsonArrayResult(stream, batch.records);
+                        const encodedRes = await encodeStoredJsonArrayResult(stream, batch.records);
                         if (Result.isError(encodedRes)) {
                           fail(encodedRes.error.message);
                           return;
@@ -3092,7 +3099,7 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
                         if (encodedRes.value) {
                           dataPayload = new TextDecoder().decode(encodedRes.value);
                         } else {
-                          const decoded = decodeJsonRecords(stream, batch.records);
+                          const decoded = await decodeJsonRecords(stream, batch.records);
                           if (Result.isError(decoded)) {
                             fail(decoded.error.message);
                             return;
@@ -3331,6 +3338,7 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
 
   const close = async () => {
     closing = true;
+    await ready.catch(() => {});
     // Await the worker-thread pools so their threads are fully gone before we
     // return. The host process (e.g. @prisma/dev) frees other native resources
     // -- PGlite's WebAssembly JIT pages -- right after this resolves; a worker
@@ -3352,6 +3360,7 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
   return {
     fetch,
     close,
+    ready,
     deps: {
       config: cfg,
       db,

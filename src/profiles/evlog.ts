@@ -425,7 +425,7 @@ export const EVLOG_STREAM_PROFILE_DEFINITION: StreamProfileDefinition = {
     });
   },
 
-  persistProfileResult({ db, registry, stream, streamRow, profile }): Result<StreamProfilePersistResult, { kind: "bad_request"; message: string; code?: string }> {
+  persistProfileResult({ stream, streamRow, profile }): Result<StreamProfilePersistResult, { kind: "bad_request"; message: string; code?: string }> {
     if (!isEvlogProfile(profile)) {
       return Result.err({ kind: "bad_request", message: "invalid evlog profile" });
     }
@@ -444,21 +444,17 @@ export const EVLOG_STREAM_PROFILE_DEFINITION: StreamProfileDefinition = {
     }
 
     const persistedProfile = cloneEvlogProfile(profile);
-    const registryRes = registry.replaceRegistryResult(stream, buildEvlogDefaultRegistry(stream));
-    if (Result.isError(registryRes)) {
-      return Result.err({ kind: "bad_request", message: registryRes.error.message });
-    }
-    db.updateStreamProfile(stream, persistedProfile.kind);
-    db.upsertStreamProfile(stream, JSON.stringify(persistedProfile));
-    db.deleteStreamTouchState(stream);
-    const row = db.getStreamProfile(stream);
+    const registry = buildEvlogDefaultRegistry(stream);
     return Result.ok({
       profile: cloneEvlogProfile(persistedProfile),
       cache: {
         profile: persistedProfile,
-        updatedAtMs: row?.updated_at_ms ?? db.nowMs(),
+        updatedAtMs: 0n,
       },
-      schemaRegistry: registryRes.value,
+      schemaRegistry: registry,
+      streamProfile: persistedProfile.kind,
+      profileJson: JSON.stringify(persistedProfile),
+      touchState: streamRow.profile === "state-protocol" ? "delete" : "preserve",
     });
   },
 

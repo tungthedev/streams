@@ -12,8 +12,7 @@ const EXACT_FINE_WAIT_MAX_KEYS = 16;
 
 function countActiveTemplates(stream: string, db: StreamTouchRouteArgs["db"]): number {
   try {
-    const row = db.db.query(`SELECT COUNT(*) as cnt FROM live_templates WHERE stream=? AND state='active';`).get(stream) as any;
-    return Number(row?.cnt ?? 0);
+    return db.countActiveLiveTemplates(stream);
   } catch {
     return 0;
   }

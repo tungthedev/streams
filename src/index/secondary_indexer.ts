@@ -216,7 +216,7 @@ export class SecondaryIndexManager {
     keyBytes: Uint8Array
   ): Promise<{ segments: Set<number>; indexedThrough: number } | null> {
     if (this.span <= 0) return null;
-    const regRes = this.registry.getRegistryResult(stream);
+    const regRes = await this.registry.getRegistryResult(stream);
     if (Result.isError(regRes)) return null;
     const configured = getConfiguredSecondaryIndexes(regRes.value).find((entry) => entry.name === indexName);
     if (!configured) return null;
@@ -289,7 +289,7 @@ export class SecondaryIndexManager {
       this.queue.clear();
       for (const stream of streams) {
         if (this.stopped) break;
-        const regRes = this.registry.getRegistryResult(stream);
+        const regRes = await this.registry.getRegistryResult(stream);
         if (Result.isError(regRes)) continue;
         if (this.shouldPauseExactBackgroundWork(stream)) {
           this.queue.add(stream);
@@ -653,7 +653,7 @@ export class SecondaryIndexManager {
     segments: SegmentRow[],
     secret: Uint8Array
   ): Promise<Result<IndexRun, SecondaryIndexBuildError>> {
-    const regRes = this.registry.getRegistryResult(stream);
+    const regRes = await this.registry.getRegistryResult(stream);
     if (Result.isError(regRes)) return invalidIndexBuild(regRes.error.message);
     const registry = regRes.value;
     const maskByFp = new Map<bigint, number>();

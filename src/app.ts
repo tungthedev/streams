@@ -183,13 +183,7 @@ export function createApp(cfg: Config, os?: ObjectStore, opts: CreateAppOptions 
           ? new SegmenterWorkerPool(config, config.segmenterWorkers, {}, segmenterHooks)
           : new Segmenter(config, db, {}, segmenterHooks, memorySampler);
 
-      return {
-        store,
-        reader,
-        segmenter,
-        uploader,
-        indexer,
-        segmentDiskCache: diskCache,
+      const schemaPublication = {
         uploadSchemaRegistry: async (stream: string, reg: SchemaRegistry): Promise<void> => {
           const shash = streamHash16Hex(stream);
           const key = schemaObjectKey(shash);
@@ -205,6 +199,20 @@ export function createApp(cfg: Config, os?: ObjectStore, opts: CreateAppOptions 
           );
           db.setSchemaUploadedSizeBytes(stream, body.byteLength);
         },
+        publishProfileSchemaRegistry: async (stream: string, reg: SchemaRegistry): Promise<void> => {
+          await schemaPublication.uploadSchemaRegistry(stream, reg);
+          await uploader.publishManifest(stream);
+        },
+      };
+
+      return {
+        store,
+        reader,
+        segmenter,
+        uploader,
+        indexer,
+        segmentDiskCache: diskCache,
+        schemaPublication,
         getLocalStorageUsage: (stream: string) => ({
           segment_cache_bytes: diskCache.bytesForObjectKeyPrefix(`streams/${streamHash16Hex(stream)}/segments/`),
           ...indexer.getLocalStorageUsage?.(stream),

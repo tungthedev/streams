@@ -1,6 +1,7 @@
 import { Result } from "better-result";
-import type { SqliteDurableStore, StreamRow } from "../db/db";
-import type { SchemaRegistry, SchemaRegistryStore } from "../schema/registry";
+import type { SchemaRegistry } from "../schema/registry";
+import type { StreamReadRow as StreamRow } from "../store/segment_read_store";
+import type { ProfileTouchStatePlan } from "../store/profile_touch_store";
 import type { TouchProcessorManager } from "../touch/manager";
 import type { CanonicalChange } from "../touch/canonical_change";
 import type { TouchConfig } from "../touch/spec";
@@ -57,11 +58,12 @@ export type StreamProfilePersistResult = {
   profile: StreamProfileSpec;
   cache: CachedStreamProfile | null;
   schemaRegistry?: SchemaRegistry | null;
+  streamProfile: string | null;
+  profileJson: string | null;
+  touchState: ProfileTouchStatePlan;
 };
 
 export type PersistProfileArgs = {
-  db: SqliteDurableStore;
-  registry: SchemaRegistryStore;
   stream: string;
   streamRow: StreamRow;
   profile: StreamProfileSpec;
@@ -142,20 +144,25 @@ export type StreamProfileTouchResponder = {
   notFound(message?: string): Response;
 };
 
+export type StreamTouchRouteStore = {
+  countActiveLiveTemplates(stream: string): number;
+  getStreamTouchState(stream: string): { stream: string; processed_through: bigint; updated_at_ms: bigint } | null;
+};
+
 export type StreamTouchRouteArgs = {
   route: StreamTouchRoute;
   req: Request;
   stream: string;
   streamRow: StreamRow;
   profile: StreamProfileSpec;
-  db: SqliteDurableStore;
+  db: StreamTouchRouteStore;
   touchManager: TouchProcessorManager;
   respond: StreamProfileTouchResponder;
 };
 
 export interface StreamTouchCapability {
   getTouchConfig(profile: StreamProfileSpec): TouchConfig | null;
-  syncState(args: { db: SqliteDurableStore; stream: string; profile: StreamProfileSpec }): void;
+  syncState(args: { db: { ensureStreamTouchState(stream: string): void; deleteStreamTouchState(stream: string): void }; stream: string; profile: StreamProfileSpec }): void;
   deriveCanonicalChanges(record: unknown, profile: StreamProfileSpec): CanonicalChange[];
   handleRoute?(args: StreamTouchRouteArgs): Promise<Response>;
 }

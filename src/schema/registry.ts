@@ -1,6 +1,5 @@
 import Ajv from "ajv";
 import { createHash } from "node:crypto";
-import type { SqliteDurableStore, StreamRow } from "../db/db";
 import { Result } from "better-result";
 import { LruCache } from "../util/lru";
 import { DURABLE_LENS_V1_SCHEMA } from "./lens_schema";
@@ -9,6 +8,8 @@ import { validateLensAgainstSchemasResult, fillLensDefaultsResult } from "./proo
 import { parseJsonPointerResult } from "../util/json_pointer";
 import { parseDurationMsResult } from "../util/duration";
 import { dsError } from "../util/ds_error.ts";
+import type { SchemaRegistryRow, SchemaStore } from "../store/schema_profile_store";
+import type { StreamReadRow } from "../store/segment_read_store";
 
 export const SCHEMA_REGISTRY_API_VERSION = "durable.streams/schema-registry/v1" as const;
 
@@ -96,8 +97,6 @@ export type SchemaRegistryReadError = {
   message: string;
   code?: string;
 };
-
-type RegistryRow = { stream: string; registry_json: string; updated_at_ms: bigint };
 
 type Validator = ReturnType<Ajv["compile"]>;
 
@@ -664,59 +663,79 @@ function bigintToNumberSafeResult(v: bigint): Result<number, { message: string }
 }
 
 export class SchemaRegistryStore {
-  private readonly db: SqliteDurableStore;
-  private readonly registryCache: LruCache<string, { reg: SchemaRegistry; updatedAtMs: bigint }>;
+  private readonly store: SchemaStore;
+  private readonly registryCache: LruCache<string, { reg: SchemaRegistry; registryJson: string; updatedAtMs: bigint }>;
   private readonly validatorCache: LruCache<string, Validator>;
   private readonly lensCache: LruCache<string, CompiledLens>;
   private readonly lensChainCache: LruCache<string, CompiledLens[]>;
 
-  constructor(db: SqliteDurableStore, opts?: { registryCacheEntries?: number; validatorCacheEntries?: number; lensCacheEntries?: number }) {
-    this.db = db;
+  constructor(store: SchemaStore, opts?: { registryCacheEntries?: number; validatorCacheEntries?: number; lensCacheEntries?: number }) {
+    this.store = store;
     this.registryCache = new LruCache(opts?.registryCacheEntries ?? 1024);
     this.validatorCache = new LruCache(opts?.validatorCacheEntries ?? 256);
     this.lensCache = new LruCache(opts?.lensCacheEntries ?? 256);
     this.lensChainCache = new LruCache(opts?.lensCacheEntries ?? 256);
   }
 
-  private loadRow(stream: string): RegistryRow | null {
-    return this.db.getSchemaRegistry(stream);
+  private async loadRow(stream: string): Promise<SchemaRegistryRow | null> {
+    return this.store.getSchemaRegistryForRead(stream);
   }
 
-  getRegistry(stream: string): SchemaRegistry {
-    const res = this.getRegistryResult(stream);
+  async getRegistry(stream: string): Promise<SchemaRegistry> {
+    const res = await this.getRegistryResult(stream);
     if (Result.isError(res)) throw dsError(res.error.message, { code: res.error.code });
     return res.value;
   }
 
-  getRegistryResult(stream: string): Result<SchemaRegistry, SchemaRegistryReadError> {
-    const row = this.loadRow(stream);
+  async getRegistryResult(stream: string): Promise<Result<SchemaRegistry, SchemaRegistryReadError>> {
+    const row = await this.loadRow(stream);
     if (!row) return Result.ok(defaultRegistry(stream));
     const cached = this.registryCache.get(stream);
-    if (cached && cached.updatedAtMs === row.updated_at_ms) return Result.ok(cached.reg);
+    if (cached && cached.updatedAtMs === row.updated_at_ms && cached.registryJson === row.registry_json) return Result.ok(cached.reg);
     const parseRes = parseRegistryResult(stream, row.registry_json);
     if (Result.isError(parseRes)) {
       return Result.err({ kind: "invalid_registry", message: parseRes.error.message });
     }
     const reg = parseRes.value;
-    this.registryCache.set(stream, { reg, updatedAtMs: row.updated_at_ms });
+    this.registryCache.set(stream, { reg, registryJson: row.registry_json, updatedAtMs: row.updated_at_ms });
     return Result.ok(reg);
   }
 
   updateRegistry(
     stream: string,
-    streamRow: StreamRow,
     update: { schema: any; lens?: any; routingKey?: RoutingKeyConfig; search?: SearchConfig | null }
-  ): SchemaRegistry {
-    const res = this.updateRegistryResult(stream, streamRow, update);
-    if (Result.isError(res)) throw dsError(res.error.message, { code: res.error.code });
-    return res.value;
+  ): Promise<SchemaRegistry> {
+    return (async () => {
+      const res = await this.updateRegistryResult(stream, update);
+      if (Result.isError(res)) throw dsError(res.error.message, { code: res.error.code });
+      return res.value;
+    })();
   }
 
-  updateRegistryResult(
+  async updateRegistryResult(
     stream: string,
-    streamRow: StreamRow,
     update: { schema: any; lens?: any; routingKey?: RoutingKeyConfig; search?: SearchConfig | null }
-  ): Result<SchemaRegistry, SchemaRegistryMutationError> {
+  ): Promise<Result<SchemaRegistry, SchemaRegistryMutationError>> {
+    const validationRes = this.validateSchemaUpdate(stream, update);
+    if (Result.isError(validationRes)) return validationRes;
+
+    const commitRes = await this.store.commitSchemaMetadataMutation<SchemaRegistry, SchemaRegistryMutationError>(stream, ({ streamRow, registryRow }) => {
+      return this.buildRegistryUpdatePlan(stream, streamRow, registryRow, update);
+    });
+    if (Result.isError(commitRes)) return commitRes;
+    this.registryCache.set(stream, {
+      reg: commitRes.value.registry,
+      registryJson: serializeRegistry(commitRes.value.registry),
+      updatedAtMs: commitRes.value.updatedAtMs,
+    });
+    return Result.ok(commitRes.value.registry);
+  }
+
+  private validateSchemaUpdate(
+    stream: string,
+    update: { schema: any; lens?: any; routingKey?: RoutingKeyConfig; search?: SearchConfig | null }
+  ): Result<void, SchemaRegistryMutationError> {
+    void stream;
     if (update.routingKey) {
       const pointerRes = parseJsonPointerResult(update.routingKey.jsonPointer);
       if (Result.isError(pointerRes)) {
@@ -729,9 +748,18 @@ export class SchemaRegistryStore {
     if (update.schema === undefined) return Result.err({ kind: "bad_request", message: "missing schema" });
     const schemaRes = validateJsonSchemaResult(update.schema);
     if (Result.isError(schemaRes)) return Result.err({ kind: "bad_request", message: schemaRes.error.message });
+    return Result.ok(undefined);
+  }
 
-    const regRes = this.getRegistryResult(stream);
-    if (Result.isError(regRes)) return Result.err({ kind: "bad_request", message: regRes.error.message, code: regRes.error.code });
+  private buildRegistryUpdatePlan(
+    stream: string,
+    streamRow: StreamReadRow | null,
+    registryRow: SchemaRegistryRow | null,
+    update: { schema: any; lens?: any; routingKey?: RoutingKeyConfig; search?: SearchConfig | null }
+  ): Result<{ registry: SchemaRegistry; registryJson: string; value: SchemaRegistry }, SchemaRegistryMutationError> {
+    if (!streamRow) return Result.err({ kind: "bad_request", message: "stream not found" });
+    const regRes = registryRow ? parseRegistryResult(stream, registryRow.registry_json) : Result.ok(defaultRegistry(stream));
+    if (Result.isError(regRes)) return Result.err({ kind: "bad_request", message: regRes.error.message });
     const reg = regRes.value;
     const currentVersion = reg.currentVersion ?? 0;
     const streamEmpty = streamRow.next_offset === 0n;
@@ -759,8 +787,7 @@ export class SchemaRegistryStore {
         schemas: { ...reg.schemas, ["1"]: update.schema },
         lenses: { ...reg.lenses },
       };
-      this.persist(stream, nextReg);
-      return Result.ok(nextReg);
+      return Result.ok({ registry: nextReg, registryJson: serializeRegistry(nextReg), value: nextReg });
     }
 
     if (!update.lens) return Result.err({ kind: "bad_request", message: "lens required" });
@@ -797,17 +824,16 @@ export class SchemaRegistryStore {
       schemas: { ...reg.schemas, [String(nextVersion)]: update.schema },
       lenses: { ...reg.lenses, [String(currentVersion)]: defaultsRes.value },
     };
-    this.persist(stream, nextReg);
-    return Result.ok(nextReg);
+    return Result.ok({ registry: nextReg, registryJson: serializeRegistry(nextReg), value: nextReg });
   }
 
-  updateRoutingKey(stream: string, routingKey: RoutingKeyConfig | null): SchemaRegistry {
-    const res = this.updateRoutingKeyResult(stream, routingKey);
+  async updateRoutingKey(stream: string, routingKey: RoutingKeyConfig | null): Promise<SchemaRegistry> {
+    const res = await this.updateRoutingKeyResult(stream, routingKey);
     if (Result.isError(res)) throw dsError(res.error.message, { code: res.error.code });
     return res.value;
   }
 
-  updateRoutingKeyResult(stream: string, routingKey: RoutingKeyConfig | null): Result<SchemaRegistry, SchemaRegistryMutationError> {
+  async updateRoutingKeyResult(stream: string, routingKey: RoutingKeyConfig | null): Promise<Result<SchemaRegistry, SchemaRegistryMutationError>> {
     if (routingKey) {
       const pointerRes = parseJsonPointerResult(routingKey.jsonPointer);
       if (Result.isError(pointerRes)) {
@@ -817,58 +843,76 @@ export class SchemaRegistryStore {
         return Result.err({ kind: "bad_request", message: "routingKey.required must be boolean" });
       }
     }
-    const regRes = this.getRegistryResult(stream);
-    if (Result.isError(regRes)) return Result.err({ kind: "bad_request", message: regRes.error.message, code: regRes.error.code });
-    const nextReg: SchemaRegistry = {
-      ...regRes.value,
-      routingKey: routingKey ?? undefined,
-    };
-    this.persist(stream, nextReg);
-    return Result.ok(nextReg);
+    const commitRes = await this.store.commitSchemaMetadataMutation<SchemaRegistry, SchemaRegistryMutationError>(stream, ({ registryRow }) => {
+      const regRes = registryRow ? parseRegistryResult(stream, registryRow.registry_json) : Result.ok(defaultRegistry(stream));
+      if (Result.isError(regRes)) return Result.err({ kind: "bad_request", message: regRes.error.message });
+      const nextReg: SchemaRegistry = {
+        ...regRes.value,
+        routingKey: routingKey ?? undefined,
+      };
+      return Result.ok({ registry: nextReg, registryJson: serializeRegistry(nextReg), value: nextReg });
+    });
+    if (Result.isError(commitRes)) return commitRes;
+    this.registryCache.set(stream, {
+      reg: commitRes.value.registry,
+      registryJson: serializeRegistry(commitRes.value.registry),
+      updatedAtMs: commitRes.value.updatedAtMs,
+    });
+    return Result.ok(commitRes.value.registry);
   }
 
-  updateSearch(stream: string, search: SearchConfig | null): SchemaRegistry {
-    const res = this.updateSearchResult(stream, search);
+  async updateSearch(stream: string, search: SearchConfig | null): Promise<SchemaRegistry> {
+    const res = await this.updateSearchResult(stream, search);
     if (Result.isError(res)) throw dsError(res.error.message, { code: res.error.code });
     return res.value;
   }
 
-  updateSearchResult(stream: string, search: SearchConfig | null): Result<SchemaRegistry, SchemaRegistryMutationError> {
+  async updateSearchResult(stream: string, search: SearchConfig | null): Promise<Result<SchemaRegistry, SchemaRegistryMutationError>> {
     const searchRes = parseSearchConfigResult(search, "search");
     if (Result.isError(searchRes)) return Result.err({ kind: "bad_request", message: searchRes.error.message });
-    const regRes = this.getRegistryResult(stream);
-    if (Result.isError(regRes)) return Result.err({ kind: "bad_request", message: regRes.error.message, code: regRes.error.code });
-    if (searchRes.value && (regRes.value.currentVersion <= 0 || regRes.value.boundaries.length === 0)) {
-      return Result.err({
-        kind: "bad_request",
-        message: "search config requires an installed schema version",
-      });
-    }
-    const nextReg: SchemaRegistry = {
-      ...regRes.value,
-      search: searchRes.value ?? undefined,
-    };
-    this.persist(stream, nextReg);
-    return Result.ok(nextReg);
+    const commitRes = await this.store.commitSchemaMetadataMutation<SchemaRegistry, SchemaRegistryMutationError>(stream, ({ registryRow }) => {
+      const regRes = registryRow ? parseRegistryResult(stream, registryRow.registry_json) : Result.ok(defaultRegistry(stream));
+      if (Result.isError(regRes)) return Result.err({ kind: "bad_request", message: regRes.error.message });
+      if (searchRes.value && (regRes.value.currentVersion <= 0 || regRes.value.boundaries.length === 0)) {
+        return Result.err({
+          kind: "bad_request",
+          message: "search config requires an installed schema version",
+        });
+      }
+      const nextReg: SchemaRegistry = {
+        ...regRes.value,
+        search: searchRes.value ?? undefined,
+      };
+      return Result.ok({ registry: nextReg, registryJson: serializeRegistry(nextReg), value: nextReg });
+    });
+    if (Result.isError(commitRes)) return commitRes;
+    this.registryCache.set(stream, {
+      reg: commitRes.value.registry,
+      registryJson: serializeRegistry(commitRes.value.registry),
+      updatedAtMs: commitRes.value.updatedAtMs,
+    });
+    return Result.ok(commitRes.value.registry);
   }
 
-  replaceRegistry(stream: string, registry: SchemaRegistry): SchemaRegistry {
-    const res = this.replaceRegistryResult(stream, registry);
+  async replaceRegistry(stream: string, registry: SchemaRegistry): Promise<SchemaRegistry> {
+    const res = await this.replaceRegistryResult(stream, registry);
     if (Result.isError(res)) throw dsError(res.error.message, { code: res.error.code });
     return res.value;
   }
 
-  replaceRegistryResult(stream: string, registry: SchemaRegistry): Result<SchemaRegistry, SchemaRegistryMutationError> {
+  async replaceRegistryResult(stream: string, registry: SchemaRegistry): Promise<Result<SchemaRegistry, SchemaRegistryMutationError>> {
     const parseRes = parseRegistryResult(stream, JSON.stringify(registry));
     if (Result.isError(parseRes)) return Result.err({ kind: "bad_request", message: parseRes.error.message });
-    this.persist(stream, parseRes.value);
-    return Result.ok(parseRes.value);
-  }
-
-  private persist(stream: string, reg: SchemaRegistry): void {
-    const json = serializeRegistry(reg);
-    this.db.upsertSchemaRegistry(stream, json);
-    this.registryCache.set(stream, { reg, updatedAtMs: this.db.nowMs() });
+    const commitRes = await this.store.commitSchemaMetadataMutation<SchemaRegistry, SchemaRegistryMutationError>(stream, () =>
+      Result.ok({ registry: parseRes.value, registryJson: serializeRegistry(parseRes.value), value: parseRes.value })
+    );
+    if (Result.isError(commitRes)) return commitRes;
+    this.registryCache.set(stream, {
+      reg: commitRes.value.registry,
+      registryJson: serializeRegistry(commitRes.value.registry),
+      updatedAtMs: commitRes.value.updatedAtMs,
+    });
+    return Result.ok(commitRes.value.registry);
   }
 
   getValidatorForVersion(reg: SchemaRegistry, version: number): Validator | null {

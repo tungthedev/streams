@@ -969,7 +969,7 @@ describe("bundled companions and backfill", () => {
         expect(res.status).toBe(204);
 
         const segment = await waitForSegment(app, 0);
-        const registryRes = app.deps.registry.getRegistryResult(STREAM);
+        const registryRes = await app.deps.registry.getRegistryResult(STREAM);
         expect(Result.isError(registryRes)).toBeFalse();
         const registry = registryRes.value;
         const plan = buildDesiredSearchCompanionPlan(registry);

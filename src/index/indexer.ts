@@ -225,7 +225,7 @@ export class IndexManager {
 
   async candidateSegmentsForRoutingKey(stream: string, keyBytes: Uint8Array): Promise<IndexCandidate | null> {
     if (this.span <= 0) return null;
-    if (!this.isRoutingConfigured(stream)) return null;
+    if (!(await this.isRoutingConfigured(stream))) return null;
     const state = this.db.getIndexState(stream);
     if (!state) return null;
     const runs = this.db.listIndexRuns(stream);
@@ -316,7 +316,7 @@ export class IndexManager {
       this.queue.clear();
       for (const stream of streams) {
         if (this.stopped) break;
-        if (!this.isRoutingConfigured(stream)) {
+        if (!(await this.isRoutingConfigured(stream))) {
           const hadRoutingState = !!this.db.getIndexState(stream) || this.db.listIndexRunsAll(stream).length > 0;
           if (hadRoutingState) {
             this.db.deleteIndex(stream);
@@ -779,12 +779,12 @@ export class IndexManager {
     return Result.ok(run);
   }
 
-  private isRoutingConfigured(stream: string): boolean {
+  private async isRoutingConfigured(stream: string): Promise<boolean> {
     const streamRow = this.db.getStream(stream);
     const contentType = streamRow?.content_type.split(";")[0]?.trim().toLowerCase() ?? null;
     if (contentType != null && contentType !== "application/json") return true;
     if (!this.registry) return false;
-    const regRes = this.registry.getRegistryResult(stream);
+    const regRes = await this.registry.getRegistryResult(stream);
     if (Result.isError(regRes)) return false;
     return !!regRes.value.routingKey;
   }

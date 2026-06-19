@@ -4,6 +4,17 @@ import { Result } from "better-result";
 import type { StoreAppendBatch, StoreAppendTask } from "../store/append";
 import type { WalReadRow, WalStore } from "../store/wal_store";
 import type { SegmentReadStore, StreamReadStore } from "../store/segment_read_store";
+import type {
+  ProfileMetadataCommit,
+  ProfileMetadataMutationContext,
+  ProfileMetadataMutationPlan,
+  ProfileStore,
+  SchemaMetadataCommit,
+  SchemaMetadataMutationContext,
+  SchemaMetadataMutationPlan,
+  SchemaStore,
+} from "../store/schema_profile_store";
+import type { ProfileTouchStateStore } from "../store/profile_touch_store";
 import { SqliteWalStore } from "./sqlite_wal_store";
 
 export const STREAM_FLAG_DELETED = 1 << 0;
@@ -176,7 +187,7 @@ function legacyWalReadRow(row: WalReadRow): {
   };
 }
 
-export class SqliteDurableStore implements WalStore, SegmentReadStore, StreamReadStore {
+export class SqliteDurableStore implements WalStore, SegmentReadStore, StreamReadStore, SchemaStore, ProfileStore, ProfileTouchStateStore {
   public readonly db: SqliteDatabase;
   private readonly walStore: SqliteWalStore;
   private dbstatReady: boolean | null = null;
@@ -1126,6 +1137,32 @@ export class SqliteDurableStore implements WalStore, SegmentReadStore, StreamRea
     };
   }
 
+  async getSchemaRegistryForRead(
+    stream: string
+  ): Promise<{ stream: string; registry_json: string; updated_at_ms: bigint; uploaded_size_bytes: bigint } | null> {
+    return this.getSchemaRegistry(stream);
+  }
+
+  async commitSchemaMetadataMutation<T, E>(
+    stream: string,
+    mutation: (ctx: SchemaMetadataMutationContext) => Result<SchemaMetadataMutationPlan<T>, E>
+  ): Promise<Result<SchemaMetadataCommit<T>, E>> {
+    const tx = this.db.transaction(() => {
+      const streamRow = this.getStream(stream);
+      const registryRow = this.getSchemaRegistry(stream);
+      const mutationRes = mutation({ streamRow, registryRow });
+      if (Result.isError(mutationRes)) return mutationRes;
+      const updatedAtMs = this.nowMs();
+      this.stmts.upsertSchemaRegistry.run(stream, mutationRes.value.registryJson, updatedAtMs);
+      return Result.ok({
+        registry: mutationRes.value.registry,
+        updatedAtMs,
+        value: mutationRes.value.value,
+      });
+    });
+    return tx();
+  }
+
   upsertSchemaRegistry(stream: string, registryJson: string): void {
     this.stmts.upsertSchemaRegistry.run(stream, registryJson, this.nowMs());
   }
@@ -1144,6 +1181,43 @@ export class SqliteDurableStore implements WalStore, SegmentReadStore, StreamRea
     };
   }
 
+  async getStreamProfileForRead(stream: string): Promise<{ stream: string; profile_json: string; updated_at_ms: bigint } | null> {
+    return this.getStreamProfile(stream);
+  }
+
+  async commitProfileMetadataMutation<T, E>(
+    stream: string,
+    mutation: (ctx: ProfileMetadataMutationContext) => Result<ProfileMetadataMutationPlan<T>, E>
+  ): Promise<Result<ProfileMetadataCommit<T>, E>> {
+    const tx = this.db.transaction(() => {
+      const streamRow = this.getStream(stream);
+      const profileRow = this.getStreamProfile(stream);
+      const mutationRes = mutation({ streamRow, profileRow });
+      if (Result.isError(mutationRes)) return mutationRes;
+
+      const updatedAtMs = this.nowMs();
+      const metadata = mutationRes.value.metadata;
+      this.stmts.setStreamProfile.run(metadata.streamProfile, updatedAtMs, stream);
+      if (metadata.schemaRegistry) {
+        this.stmts.upsertSchemaRegistry.run(stream, JSON.stringify(metadata.schemaRegistry), updatedAtMs);
+      }
+      if (metadata.profileJson == null) this.stmts.deleteStreamProfile.run(stream);
+      else this.stmts.upsertStreamProfile.run(stream, metadata.profileJson, updatedAtMs);
+
+      return Result.ok({
+        schemaRegistry: metadata.schemaRegistry,
+        profileUpdatedAtMs: updatedAtMs,
+        value: mutationRes.value.value,
+      });
+    });
+    return tx();
+  }
+
+  async updateProfileTouchState(stream: string, plan: "ensure" | "delete"): Promise<void> {
+    if (plan === "ensure") this.ensureStreamTouchState(stream);
+    else this.deleteStreamTouchState(stream);
+  }
+
   upsertStreamProfile(stream: string, profileJson: string): void {
     this.stmts.upsertStreamProfile.run(stream, profileJson, this.nowMs());
   }
@@ -1160,6 +1234,11 @@ export class SqliteDurableStore implements WalStore, SegmentReadStore, StreamRea
       processed_through: this.toBigInt(row.processed_through),
       updated_at_ms: this.toBigInt(row.updated_at_ms),
     };
+  }
+
+  countActiveLiveTemplates(stream: string): number {
+    const row = this.db.query(`SELECT COUNT(*) as cnt FROM live_templates WHERE stream=? AND state='active';`).get(stream) as any;
+    return Number(row?.cnt ?? 0);
   }
 
   listStreamTouchStates(): Array<{ stream: string; processed_through: bigint; updated_at_ms: bigint }> {

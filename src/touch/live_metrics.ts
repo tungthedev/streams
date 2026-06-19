@@ -525,11 +525,8 @@ export class LiveMetricsV2 {
       const regRow = this.db.getStream(stream);
       if (!regRow) continue;
 
-      const touchCfg = ((): TouchConfig | null => {
-        const profileRes = this.profiles.getProfileResult(stream, regRow);
-        if (Result.isError(profileRes)) return null;
-        return resolveEnabledTouchCapability(profileRes.value)?.touchCfg ?? null;
-      })();
+      const profileRes = await this.profiles.getProfileResult(stream, regRow);
+      const touchCfg = Result.isError(profileRes) ? null : (resolveEnabledTouchCapability(profileRes.value)?.touchCfg ?? null);
       if (!touchCfg) continue;
 
       const c = this.get(stream, touchCfg);

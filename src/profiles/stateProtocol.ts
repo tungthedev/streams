@@ -72,7 +72,7 @@ export const STATE_PROTOCOL_STREAM_PROFILE_DEFINITION: StreamProfileDefinition =
     });
   },
 
-  persistProfileResult({ db, stream, streamRow, profile }): Result<StreamProfilePersistResult, { kind: "bad_request"; message: string; code?: string }> {
+  persistProfileResult({ streamRow, profile }): Result<StreamProfilePersistResult, { kind: "bad_request"; message: string; code?: string }> {
     if (!isStateProtocolProfile(profile)) {
       return Result.err({ kind: "bad_request", message: "invalid state-protocol profile" });
     }
@@ -85,17 +85,16 @@ export const STATE_PROTOCOL_STREAM_PROFILE_DEFINITION: StreamProfileDefinition =
     }
 
     const persistedProfile = cloneStateProtocolProfile(profile);
-    db.updateStreamProfile(stream, persistedProfile.kind);
-    db.upsertStreamProfile(stream, JSON.stringify(persistedProfile));
-    STATE_PROTOCOL_TOUCH_CAPABILITY.syncState({ db, stream, profile: persistedProfile });
-    const row = db.getStreamProfile(stream);
     return Result.ok({
       profile: cloneStateProtocolProfile(persistedProfile),
       cache: {
         profile: persistedProfile,
-        updatedAtMs: row?.updated_at_ms ?? db.nowMs(),
+        updatedAtMs: 0n,
       },
       schemaRegistry: null,
+      streamProfile: persistedProfile.kind,
+      profileJson: JSON.stringify(persistedProfile),
+      touchState: getStateProtocolTouchConfig(persistedProfile) ? "ensure" : "delete",
     });
   },
 

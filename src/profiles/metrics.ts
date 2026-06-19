@@ -43,7 +43,7 @@ export const METRICS_STREAM_PROFILE_DEFINITION: StreamProfileDefinition = {
     return Result.ok({ profile: cloneMetricsProfile(), cache: null });
   },
 
-  persistProfileResult({ db, registry, stream, streamRow, profile }): Result<StreamProfilePersistResult, { kind: "bad_request"; message: string }> {
+  persistProfileResult({ stream, streamRow, profile }): Result<StreamProfilePersistResult, { kind: "bad_request"; message: string }> {
     if (profile.kind !== "metrics") return Result.err({ kind: "bad_request", message: "invalid metrics profile" });
     const contentType = normalizeProfileContentType(streamRow.content_type);
     if (contentType !== "application/json") {
@@ -54,15 +54,13 @@ export const METRICS_STREAM_PROFILE_DEFINITION: StreamProfileDefinition = {
     }
     const desiredRegistry =
       stream === INTERNAL_METRICS_STREAM ? buildInternalMetricsRegistry(stream) : buildMetricsDefaultRegistry(stream);
-    const registryRes = registry.replaceRegistryResult(stream, desiredRegistry);
-    if (Result.isError(registryRes)) return Result.err({ kind: "bad_request", message: registryRes.error.message });
-    db.updateStreamProfile(stream, "metrics");
-    db.deleteStreamProfile(stream);
-    db.deleteStreamTouchState(stream);
     return Result.ok({
       profile: cloneStreamProfileSpec(cloneMetricsProfile()),
       cache: null,
-      schemaRegistry: registryRes.value,
+      schemaRegistry: desiredRegistry,
+      streamProfile: "metrics",
+      profileJson: null,
+      touchState: streamRow.profile === "state-protocol" ? "delete" : "preserve",
     });
   },
 

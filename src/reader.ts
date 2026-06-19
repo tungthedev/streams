@@ -14,7 +14,7 @@ import {
   collectPositiveExactFilterClauses,
   evaluateReadFilterResult,
 } from "./read_filter";
-import { decodeJsonPayloadResult } from "./schema/read_json";
+import { decodeJsonPayloadWithRegistryResult } from "./schema/read_json";
 import { SchemaRegistryStore } from "./schema/registry";
 import { parseOffsetResult, offsetToSeqOrNeg1, encodeOffset } from "./offset";
 import {
@@ -769,7 +769,7 @@ export class StreamReader {
       const candidateSegments = candidateInfo.segments;
       const indexedThrough = candidateInfo.indexedThrough;
       const columnClauses = filter ? collectPositiveColumnFilterClauses(filter) : [];
-      const filterRegistryRes = filter ? this.registry.getRegistryResult(stream) : Result.ok(null);
+      const filterRegistryRes = filter ? await this.registry.getRegistryResult(stream) : Result.ok(null);
       if (Result.isError(filterRegistryRes)) return Result.err({ kind: "internal", message: filterRegistryRes.error.message });
       const filterRegistry = filterRegistryRes.value;
 
@@ -788,7 +788,7 @@ export class StreamReader {
           });
         }
         if (!filter) return Result.ok({ matched: true, stop: false });
-        const valueRes = decodeJsonPayloadResult(this.registry, stream, offset, payload);
+        const valueRes = decodeJsonPayloadWithRegistryResult(this.registry, filterRegistry!, offset, payload);
         if (Result.isError(valueRes)) {
           return Result.err({ kind: "internal", message: valueRes.error.message });
         }
@@ -1215,7 +1215,7 @@ export class StreamReader {
       const segmentCapabilityError = this.missingSegmentCapabilityError(srow);
       if (segmentCapabilityError) return Result.err(segmentCapabilityError);
 
-      const regRes = this.registry.getRegistryResult(stream);
+      const regRes = await this.registry.getRegistryResult(stream);
       if (Result.isError(regRes)) return Result.err({ kind: "internal", message: regRes.error.message });
       const registry = regRes.value;
       if (!registry.search) return Result.err({ kind: "internal", message: "search is not configured for this stream" });
@@ -1278,7 +1278,7 @@ export class StreamReader {
         payload: Uint8Array
       ): Result<void, ReaderError> => {
         const parseStartedAt = Date.now();
-        const parsedRes = decodeJsonPayloadResult(this.registry, stream, offsetSeq, payload);
+        const parsedRes = decodeJsonPayloadWithRegistryResult(this.registry, registry, offsetSeq, payload);
         jsonParseTimeMs += Date.now() - parseStartedAt;
         if (Result.isError(parsedRes)) return Result.err({ kind: "internal", message: parsedRes.error.message });
         const evalRes = evaluateSearchQueryResult(registry, offsetSeq, request.q, parsedRes.value);
@@ -1838,7 +1838,7 @@ export class StreamReader {
       const segmentCapabilityError = this.missingSegmentCapabilityError(srow);
       if (segmentCapabilityError) return Result.err(segmentCapabilityError);
 
-      const regRes = this.registry.getRegistryResult(stream);
+      const regRes = await this.registry.getRegistryResult(stream);
       if (Result.isError(regRes)) return Result.err({ kind: "internal", message: regRes.error.message });
       const registry = regRes.value;
       const rollup = registry.search?.rollups?.[request.rollup];
@@ -1918,7 +1918,7 @@ export class StreamReader {
         for (const blockRes of iterateBlocksResult(segBytes)) {
           if (Result.isError(blockRes)) return Result.err({ kind: "internal", message: blockRes.error.message });
           for (const record of blockRes.value.decoded.records) {
-            const parsedRes = decodeJsonPayloadResult(this.registry, stream, curOffset, record.payload);
+            const parsedRes = decodeJsonPayloadWithRegistryResult(this.registry, registry, curOffset, record.payload);
             if (Result.isError(parsedRes)) return Result.err({ kind: "internal", message: parsedRes.error.message });
             const contributionRes = extractRollupContributionResult(registry, rollup, curOffset, parsedRes.value);
             if (Result.isError(contributionRes)) return Result.err({ kind: "internal", message: contributionRes.error.message });
@@ -2046,7 +2046,7 @@ export class StreamReader {
       if (coverageState.canSearchWalTail && tailStart <= tailEnd) {
         for await (const record of this.store.readWalRange(stream, tailStart, tailEnd)) {
           scannedTailDocs += 1;
-          const parsedRes = decodeJsonPayloadResult(this.registry, stream, record.offset, record.payload);
+          const parsedRes = decodeJsonPayloadWithRegistryResult(this.registry, registry, record.offset, record.payload);
           if (Result.isError(parsedRes)) return Result.err({ kind: "internal", message: parsedRes.error.message });
           const contributionRes = extractRollupContributionResult(registry, rollup, record.offset, parsedRes.value);
           if (Result.isError(contributionRes)) return Result.err({ kind: "internal", message: contributionRes.error.message });
@@ -2414,7 +2414,7 @@ export class StreamReader {
     if (startSeq <= endSeq) {
       for await (const record of this.store.readWalRange(stream, startSeq, endSeq)) {
         const offsetSeq = record.offset;
-        const parsedRes = decodeJsonPayloadResult(this.registry, stream, offsetSeq, record.payload);
+        const parsedRes = decodeJsonPayloadWithRegistryResult(this.registry, registry, offsetSeq, record.payload);
         if (Result.isError(parsedRes)) return Result.err({ kind: "internal", message: parsedRes.error.message });
         const docRes = buildSearchDocumentResult(registry, offsetSeq, parsedRes.value);
         if (Result.isError(docRes)) return Result.err({ kind: "internal", message: docRes.error.message });

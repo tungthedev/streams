@@ -14,15 +14,12 @@ export function schemaVersionForOffset(reg: SchemaRegistry, offset: bigint): num
   return version;
 }
 
-export function decodeJsonPayloadResult(
+export function decodeJsonPayloadWithRegistryResult(
   registry: SchemaRegistryStore,
-  stream: string,
+  reg: SchemaRegistry,
   offset: bigint,
   payload: Uint8Array
 ): Result<any, { status: 400 | 500; message: string }> {
-  const regRes = registry.getRegistryResult(stream);
-  if (Result.isError(regRes)) return Result.err({ status: 500, message: regRes.error.message });
-  const reg = regRes.value;
   try {
     const text = new TextDecoder().decode(payload);
     let value: any = JSON.parse(text);
@@ -40,4 +37,15 @@ export function decodeJsonPayloadResult(
   } catch (e: unknown) {
     return Result.err({ status: 400, message: String((e as any)?.message ?? e) });
   }
+}
+
+export async function decodeJsonPayloadResult(
+  registry: SchemaRegistryStore,
+  stream: string,
+  offset: bigint,
+  payload: Uint8Array
+): Promise<Result<any, { status: 400 | 500; message: string }>> {
+  const regRes = await registry.getRegistryResult(stream);
+  if (Result.isError(regRes)) return Result.err({ status: 500, message: regRes.error.message });
+  return decodeJsonPayloadWithRegistryResult(registry, regRes.value, offset, payload);
 }
