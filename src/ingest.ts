@@ -57,9 +57,11 @@ export class IngestQueue {
     }, this.cfg.ingestFlushIntervalMs);
   }
 
-  stop(): void {
+  async stop(): Promise<void> {
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
+    await this.flushPromise;
+    if (this.q.length > 0) await this.flush();
   }
 
   /**

@@ -6,30 +6,14 @@ import { StreamReader } from "./reader";
 import type { StreamIndexLookup } from "./index/indexer";
 import type { RoutingKeyLexiconListResult } from "./index/lexicon_indexer";
 import type { StatsCollector } from "./stats";
-import type { UploaderController, UploaderHooks } from "./uploader";
-import type { SegmenterController } from "./segment/segmenter_workers";
 import { readSqliteRuntimeMemoryStats } from "./sqlite/runtime_stats";
 import { Result } from "better-result";
+import { SqliteDurableStore } from "./db/db";
 
 const TEXT_DECODER = new TextDecoder();
 
-class NoopUploader implements UploaderController {
-  start(): void {}
-  stop(_hard?: boolean): void {}
-  countSegmentsWaiting(): number {
-    return 0;
-  }
-  setHooks(_hooks: UploaderHooks | undefined): void {}
-  async publishManifest(_stream: string): Promise<void> {}
-}
-
-const noopSegmenter: SegmenterController = {
-  start(): void {},
-  stop(_hard?: boolean): void {},
-};
-
 class LocalIndexLookup implements StreamIndexLookup {
-  constructor(private readonly db: App["deps"]["db"]) {}
+  constructor(private readonly db: SqliteDurableStore) {}
 
   start(): void {}
 
@@ -128,18 +112,25 @@ export type CreateLocalAppOptions = {
 };
 
 export function createLocalApp(cfg: Config, os?: ObjectStore, opts: CreateLocalAppOptions = {}): App {
+  const db = new SqliteDurableStore(cfg.dbPath, { cacheBytes: cfg.sqliteCacheBytes });
   return createAppCore(cfg, {
+    db,
+    store: db,
     stats: opts.stats,
-    createRuntime: ({ config, db, registry, memorySampler, memory }) => {
+    createRuntime: ({ config, registry, memorySampler, memory }) => {
       const store = os ?? new NullObjectStore();
       const indexer = new LocalIndexLookup(db);
-      const reader = new StreamReader(config, db, db, store, registry, undefined, indexer, memorySampler, memory);
+      const reader = new StreamReader(
+        config,
+        db,
+        registry,
+        { segmentReads: db, objectStore: store, index: indexer },
+        memorySampler,
+        memory
+      );
 
       return {
-        store,
         reader,
-        segmenter: noopSegmenter,
-        uploader: new NoopUploader(),
         indexer,
         getRuntimeMemorySnapshot: () => {
           const sqliteRuntime = readSqliteRuntimeMemoryStats();

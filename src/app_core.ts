@@ -1,7 +1,7 @@
 import { mkdirSync } from "node:fs";
 import { createHash } from "node:crypto";
 import type { Config } from "./config";
-import { SqliteDurableStore, type StreamRow } from "./db/db";
+import type { SqliteDurableStore, StreamRow } from "./db/db";
 import { IngestQueue, type ProducerInfo, type AppendRow, type AppendResult } from "./ingest";
 import type { ObjectStore } from "./objectstore/interface";
 import type { StreamReader, ReadBatch, ReaderError, SearchHit, SearchResultBatch } from "./reader";
@@ -79,6 +79,7 @@ import {
 import { buildRequestObservabilityPairingDescriptor } from "./observe/pairing";
 import { dsError } from "./util/ds_error.ts";
 import type { SchemaPublicationStore } from "./store/schema_publication";
+import { requireWalControlPlaneStore, type StoreLifecycle, type WalControlPlaneStore } from "./store/capabilities";
 import { streamHash16Hex } from "./util/stream_paths";
 
 function withNosniff(headers: HeadersInit = {}): HeadersInit {
@@ -451,22 +452,22 @@ function contiguousCoveredSegmentCount(rows: Array<{ segment_index: number; sect
 
 export type App = {
   fetch: (req: Request) => Promise<Response>;
-  close: () => void;
+  close: () => Promise<void>;
   ready: Promise<void>;
   deps: {
     config: Config;
-    db: SqliteDurableStore;
-    os: ObjectStore;
+    db?: SqliteDurableStore;
+    os?: ObjectStore;
     ingest: IngestQueue;
     notifier: StreamNotifier;
     reader: StreamReader;
-    segmenter: SegmenterController;
-    uploader: UploaderController;
+    segmenter?: SegmenterController;
+    uploader?: UploaderController;
     indexer?: StreamIndexLookup;
     metrics: Metrics;
     registry: SchemaRegistryStore;
     profiles: StreamProfileStore;
-    touch: TouchProcessorManager;
+    touch?: TouchProcessorManager;
     stats?: StatsCollector;
     backpressure?: BackpressureGate;
     memory?: MemoryPressureMonitor;
@@ -482,12 +483,13 @@ export type App = {
 
 export type CreateAppRuntimeArgs = {
   config: Config;
-  db: SqliteDurableStore;
+  controlStore: WalControlPlaneStore;
+  db?: SqliteDurableStore;
   ingest: IngestQueue;
   notifier: StreamNotifier;
   registry: SchemaRegistryStore;
   profiles: StreamProfileStore;
-  touch: TouchProcessorManager;
+  touch?: TouchProcessorManager;
   stats?: StatsCollector;
   backpressure?: BackpressureGate;
   memory: MemoryPressureMonitor;
@@ -497,15 +499,14 @@ export type CreateAppRuntimeArgs = {
   memorySampler?: RuntimeMemorySampler;
 };
 
-type AppRuntimeDeps = {
+type FullModeRuntimeDeps = {
   store: ObjectStore;
-  reader: StreamReader;
   segmenter: SegmenterController;
   uploader: UploaderController;
-  indexer?: StreamIndexLookup;
   segmentDiskCache?: SegmentDiskCache;
-  schemaPublication?: SchemaPublicationStore;
-  getRuntimeMemorySnapshot?: () => RuntimeMemorySubsystemSnapshot;
+  manifestPublication?: {
+    publishDeletedStreamManifest(stream: string): Promise<void>;
+  };
   getLocalStorageUsage?: (stream: string) => {
     segment_cache_bytes: number;
     routing_index_cache_bytes: number;
@@ -513,10 +514,20 @@ type AppRuntimeDeps = {
     lexicon_index_cache_bytes: number;
     companion_cache_bytes: number;
   };
+};
+
+type AppRuntimeDeps = {
+  reader: StreamReader;
+  indexer?: StreamIndexLookup;
+  schemaPublication?: SchemaPublicationStore;
+  fullMode?: FullModeRuntimeDeps;
+  getRuntimeMemorySnapshot?: () => RuntimeMemorySubsystemSnapshot;
   start(): void;
 };
 
 export type CreateAppCoreOptions = {
+  store: StoreLifecycle;
+  db?: SqliteDurableStore;
   stats?: StatsCollector;
   createRuntime(args: CreateAppRuntimeArgs): AppRuntimeDeps;
 };
@@ -534,18 +545,23 @@ function gateSnapshot(configuredLimit: number, gate: ConcurrencyGate) {
   };
 }
 
+function unsupportedCapability(name: string): Response {
+  return json(501, { error: { code: "unsupported_capability", message: `${name} capability is not available` } });
+}
+
 export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
   mkdirSync(cfg.rootDir, { recursive: true });
   cleanupTempSegments(cfg.rootDir);
 
-  const db = new SqliteDurableStore(cfg.dbPath, { cacheBytes: cfg.sqliteCacheBytes });
-  db.resetSegmentInProgress();
-  reconcileDeletedStreamAccelerationState(db);
+  const controlStore = requireWalControlPlaneStore(opts.store);
+  const db = opts.db;
+  db?.resetSegmentInProgress();
+  if (db) reconcileDeletedStreamAccelerationState(db);
   const stats = opts.stats;
   const metrics = new Metrics();
   const backpressure =
     cfg.localBacklogMaxBytes > 0
-      ? new BackpressureGate(cfg.localBacklogMaxBytes, db.sumPendingBytes() + db.sumPendingSegmentBytes())
+      ? new BackpressureGate(cfg.localBacklogMaxBytes, db ? db.sumPendingBytes() + db.sumPendingSegmentBytes() : 0)
       : undefined;
   const memorySampler =
     cfg.memorySamplerPath != null
@@ -609,14 +625,15 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
     }
     return withNosniff(headers);
   };
-  const ingest = new IngestQueue(cfg, db, stats, backpressure, metrics);
+  const ingest = new IngestQueue(cfg, controlStore, stats, backpressure, metrics);
   const notifier = new StreamNotifier();
-  const registry = new SchemaRegistryStore(db);
-  const profiles = new StreamProfileStore(db, { touchStore: db });
-  const touch = new TouchProcessorManager(cfg, db, ingest, notifier, profiles, backpressure);
+  const registry = new SchemaRegistryStore(controlStore);
+  const profiles = new StreamProfileStore(controlStore, { touchStore: db });
+  const touch = db && controlStore.capabilities.touch ? new TouchProcessorManager(cfg, db, ingest, notifier, profiles, backpressure) : undefined;
   const runtime = opts.createRuntime({
     config: cfg,
     db,
+    controlStore,
     ingest,
     notifier,
     registry,
@@ -630,7 +647,14 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
     metrics,
     memorySampler,
   });
-  const { store, reader, segmenter, uploader, indexer, schemaPublication, getRuntimeMemorySnapshot, getLocalStorageUsage } = runtime;
+  const {
+    reader,
+    indexer,
+    schemaPublication,
+    fullMode,
+    getRuntimeMemorySnapshot,
+  } = runtime;
+  const getLocalStorageUsage = fullMode?.getLocalStorageUsage;
   const runtimeHighWater: RuntimeMemoryHighWaterSnapshot = {
     process: {},
     process_breakdown: {},
@@ -659,7 +683,7 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
     return groups;
   };
 
-  const buildTopStreamContributors = (limit = 5) => {
+  const buildTopStreamContributors = async (limit = 5) => {
     const safeLimit = Math.max(1, Math.min(limit, 20));
     const localStorageRows: Array<{
       stream: string;
@@ -672,10 +696,10 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
     let offset = 0;
     const pageSize = 1000;
     for (;;) {
-      const rows = db.listStreams(pageSize, offset);
+      const rows = await controlStore.listStreams(pageSize, offset);
       if (rows.length === 0) break;
       for (const row of rows) {
-        if (db.isDeleted(row)) continue;
+        if (controlStore.isDeleted(row)) continue;
         const usage = getLocalStorageUsage?.(row.stream) ?? { segment_cache_bytes: 0 };
         const walRetainedBytes = Number(row.pending_bytes);
         const segmentCacheBytes = Math.max(0, Math.floor(Number((usage as Record<string, number>).segment_cache_bytes ?? 0)));
@@ -709,7 +733,7 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
     return {
       local_storage_bytes: localStorageRows.slice(0, safeLimit),
       pending_wal_bytes: pendingWalRows.slice(0, safeLimit),
-      touch_journal_filter_bytes: touch.getTopStreams(safeLimit),
+      touch_journal_filter_bytes: touch?.getTopStreams(safeLimit) ?? [],
       notifier_waiters: notifier.getTopStreams(safeLimit),
     };
   };
@@ -825,7 +849,23 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
       if (!Number.isFinite(raw)) return 0;
       return Math.max(0, Math.floor(raw));
     };
-    const touchMemory = touch.getMemoryStats();
+    const touchMemory = touch?.getMemoryStats() ?? {
+      journals: 0,
+      journalsCreatedTotal: 0,
+      journalFilterBytesTotal: 0,
+      fineLagCoarseOnlyStreams: 0,
+      touchModeStreams: 0,
+      fineTokenBucketStreams: 0,
+      hotFineStreams: 0,
+      lagSourceOffsetStreams: 0,
+      restrictedTemplateBucketStreams: 0,
+      runtimeTotalsStreams: 0,
+      zeroRowBacklogStreakStreams: 0,
+      templateLastSeenEntries: 0,
+      templateDirtyLastSeenEntries: 0,
+      templateRateStateStreams: 0,
+      liveMetricsCounterStreams: 0,
+    };
     const notifierMemory = notifier.getMemoryStats();
     const metricsMemory = metrics.getMemoryStats();
     return {
@@ -859,7 +899,7 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
     };
   };
 
-  const buildServerMem = () => {
+  const buildServerMem = async () => {
     const runtimeMemory = buildRuntimeMemorySnapshot();
     return {
       ts: new Date().toISOString(),
@@ -872,11 +912,11 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
       runtime_counts: runtimeMemory.subsystems.counts,
       runtime_bytes: buildRuntimeBytes(runtimeMemory),
       runtime_totals: runtimeMemory.totals,
-      top_streams: buildTopStreamContributors(),
+      top_streams: await buildTopStreamContributors(),
     };
   };
   memorySampler?.setSubsystemProvider(() => buildRuntimeMemorySnapshot().subsystems);
-  const buildServerDetails = () => {
+  const buildServerDetails = async () => {
     const runtimeMemory = buildRuntimeMemorySnapshot();
     return {
       auto_tune: {
@@ -961,7 +1001,7 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
           over_limit: backpressure?.isOverLimit() ?? false,
         },
         uploads: {
-          pending_segments: uploader.countSegmentsWaiting(),
+          pending_segments: fullMode?.uploader.countSegmentsWaiting() ?? 0,
         },
         concurrency: {
           ingest: gateSnapshot(cfg.ingestConcurrency, ingestGate),
@@ -969,7 +1009,7 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
           search: gateSnapshot(cfg.searchConcurrency, searchGate),
           async_index: gateSnapshot(cfg.asyncIndexConcurrency, asyncIndexGate),
         },
-        top_streams: buildTopStreamContributors(),
+        top_streams: await buildTopStreamContributors(),
       },
     };
   };
@@ -987,7 +1027,7 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
     emitGate("async_index", cfg.asyncIndexConcurrency, asyncIndexGate);
     metrics.record("tieredstore.ingest.queue.capacity.requests", cfg.ingestMaxQueueRequests, "count");
     metrics.record("tieredstore.ingest.queue.capacity.bytes", cfg.ingestMaxQueueBytes, "bytes");
-    metrics.record("tieredstore.upload.pending_segments", uploader.countSegmentsWaiting(), "count");
+    metrics.record("tieredstore.upload.pending_segments", fullMode?.uploader.countSegmentsWaiting() ?? 0, "count");
     metrics.record("tieredstore.upload.concurrency.limit", cfg.uploadConcurrency, "count");
     if (cfg.memoryLimitBytes > 0) metrics.record("process.memory.limit.bytes", cfg.memoryLimitBytes, "bytes");
     const lastRss = memory.getLastRssBytes();
@@ -1107,29 +1147,35 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
     },
     collectRuntimeMetrics,
   });
-  const expirySweeper = new ExpirySweeper(cfg, db);
-  const streamSizeReconciler = new StreamSizeReconciler(
-    db,
-    store,
-    runtime.segmentDiskCache,
-    (stream) => notifier.notifyDetailsChanged(stream)
-  );
+  const expirySweeper = new ExpirySweeper(cfg, controlStore);
+  const streamSizeReconciler =
+    db && fullMode
+      ? new StreamSizeReconciler(
+          db,
+          fullMode.store,
+          fullMode.segmentDiskCache,
+          (stream) => notifier.notifyDetailsChanged(stream)
+        )
+      : undefined;
   let closing = false;
 
-  db.ensureStream(INTERNAL_METRICS_STREAM, { contentType: "application/json", profile: "metrics" });
-  clearInternalMetricsAccelerationState(db);
   const startupPromise = (async () => {
-    const metricsProfileRes = await profiles.updateProfileResult(INTERNAL_METRICS_STREAM, { kind: "metrics" });
-    if (Result.isError(metricsProfileRes)) {
-      throw dsError(`failed to initialize ${INTERNAL_METRICS_STREAM} profile: ${metricsProfileRes.error.message}`);
+    let metricsProfileRes: Awaited<ReturnType<StreamProfileStore["updateProfileResult"]>> | null = null;
+    if (controlStore.capabilities.internalMetrics) {
+      await controlStore.ensureStream(INTERNAL_METRICS_STREAM, { contentType: "application/json", profile: "metrics" });
+      if (db) clearInternalMetricsAccelerationState(db);
+      metricsProfileRes = await profiles.updateProfileResult(INTERNAL_METRICS_STREAM, { kind: "metrics" });
+      if (Result.isError(metricsProfileRes)) {
+        throw dsError(`failed to initialize ${INTERNAL_METRICS_STREAM} profile: ${metricsProfileRes.error.message}`);
+      }
     }
     if (closing) return;
     runtime.start();
-    metricsEmitter.start();
+    if (controlStore.capabilities.internalMetrics) metricsEmitter.start();
     expirySweeper.start();
-    touch.start();
-    streamSizeReconciler.start();
-    if (schemaPublication && metricsProfileRes.value.schemaRegistry) {
+    touch?.start();
+    streamSizeReconciler?.start();
+    if (schemaPublication && metricsProfileRes && Result.isOk(metricsProfileRes) && metricsProfileRes.value.schemaRegistry) {
       void schemaPublication
         .publishProfileSchemaRegistry(INTERNAL_METRICS_STREAM, metricsProfileRes.value.schemaRegistry)
         .catch(() => {
@@ -1141,6 +1187,26 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
     throw err;
   });
   void ready.catch(() => {});
+
+  const getLiveStreamResult = async (stream: string): Promise<Result<StreamRow, { status: 404; message: string }>> => {
+    const srow = await controlStore.getStream(stream);
+    if (!srow || controlStore.isDeleted(srow)) return Result.err({ status: 404, message: "not_found" });
+    if (srow.expires_at_ms != null && controlStore.nowMs() > srow.expires_at_ms) {
+      return Result.err({ status: 404, message: "stream expired" });
+    }
+    return Result.ok(srow as StreamRow);
+  };
+
+  const liveStreamOrResponse = async (stream: string): Promise<StreamRow | Response> => {
+    const srowRes = await getLiveStreamResult(stream);
+    if (Result.isOk(srowRes)) return srowRes.value;
+    return srowRes.error.message === "stream expired" ? notFound("stream expired") : notFound();
+  };
+
+  const requireSqliteFullModeStore = (): Result<SqliteDurableStore, { status: 500; message: string }> => {
+    if (!db) return Result.err({ status: 500, message: "sqlite full-mode store is not available" });
+    return Result.ok(db);
+  };
 
   const buildJsonRows = async (
     stream: string,
@@ -1291,7 +1357,7 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
       metrics.recordAppend(args.metricsBytes, args.appendedRows);
       notifier.notify(args.stream, args.lastOffset);
       notifier.notifyDetailsChanged(args.stream);
-      touch.notify(args.stream);
+      touch?.notify(args.stream);
     }
     if (stats) {
       if (args.touched) stats.recordStreamTouched(args.stream);
@@ -1340,6 +1406,9 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
     row: StreamRow,
     profile: StreamProfileSpec
   ) => {
+    const sqliteRes = requireSqliteFullModeStore();
+    if (Result.isError(sqliteRes)) throw dsError(sqliteRes.error.message);
+    const sqlite = sqliteRes.value;
     const observability = buildRequestObservabilityPairingDescriptor(stream, profile);
     return {
       name: stream,
@@ -1356,8 +1425,8 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
       next_offset: row.next_offset.toString(),
       sealed_through: row.sealed_through.toString(),
       uploaded_through: row.uploaded_through.toString(),
-      segment_count: db.countSegmentsForStream(stream),
-      uploaded_segment_count: db.countUploadedSegments(stream),
+      segment_count: sqlite.countSegmentsForStream(stream),
+      uploaded_segment_count: sqlite.countUploadedSegments(stream),
       pending_rows: row.pending_rows.toString(),
       pending_bytes: row.pending_bytes.toString(),
       total_size_bytes: row.logical_size_bytes.toString(),
@@ -1370,7 +1439,9 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
 
   const buildIndexLagMs = (stream: string, headRow: StreamRow, coveredSegmentCount: number): string | null => {
     if (coveredSegmentCount <= 0) return null;
-    const coveredLastAppendMs = db.getSegmentLastAppendMsFromMeta(stream, coveredSegmentCount - 1);
+    const sqliteRes = requireSqliteFullModeStore();
+    if (Result.isError(sqliteRes)) throw dsError(sqliteRes.error.message);
+    const coveredLastAppendMs = sqliteRes.value.getSegmentLastAppendMsFromMeta(stream, coveredSegmentCount - 1);
     if (coveredLastAppendMs == null) return null;
     const lagMs = headRow.last_append_ms > coveredLastAppendMs ? headRow.last_append_ms - coveredLastAppendMs : 0n;
     return lagMs.toString();
@@ -1386,17 +1457,20 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
     }>,
     indexStatus: any
   ) => {
-    const manifest = db.getManifestRow(stream);
-    const schemaRow = db.getSchemaRegistry(stream);
-    const uploadedSegmentBytes = db.getUploadedSegmentBytes(stream);
-    const pendingSealedSegmentBytes = db.getPendingSealedSegmentBytes(stream);
-    const routingIndexStorage = db.getRoutingIndexStorage(stream);
+    const sqliteRes = requireSqliteFullModeStore();
+    if (Result.isError(sqliteRes)) throw dsError(sqliteRes.error.message);
+    const sqlite = sqliteRes.value;
+    const manifest = sqlite.getManifestRow(stream);
+    const schemaRow = sqlite.getSchemaRegistry(stream);
+    const uploadedSegmentBytes = sqlite.getUploadedSegmentBytes(stream);
+    const pendingSealedSegmentBytes = sqlite.getPendingSealedSegmentBytes(stream);
+    const routingIndexStorage = sqlite.getRoutingIndexStorage(stream);
     const routingLexiconStorage =
-      db
+      sqlite
         .getLexiconIndexStorage(stream)
         .find((entry) => entry.source_kind === "routing_key" && entry.source_name === "") ?? { object_count: 0, bytes: 0n };
-    const secondaryIndexStorage = new Map(db.getSecondaryIndexStorage(stream).map((entry) => [entry.index_name, entry]));
-    const companionStorage = db.getBundledCompanionStorage(stream);
+    const secondaryIndexStorage = new Map(sqlite.getSecondaryIndexStorage(stream).map((entry) => [entry.index_name, entry]));
+    const companionStorage = sqlite.getBundledCompanionStorage(stream);
     const localStorageUsage = {
       segment_cache_bytes: 0,
       routing_index_cache_bytes: 0,
@@ -1405,7 +1479,7 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
       companion_cache_bytes: 0,
       ...(getLocalStorageUsage?.(stream) ?? {}),
     };
-    const sqliteSharedBytes = BigInt(db.getWalDbSizeBytes() + db.getMetaDbSizeBytes());
+    const sqliteSharedBytes = BigInt(sqlite.getWalDbSizeBytes() + sqlite.getMetaDbSizeBytes());
     const exactIndexBytes = indexStatus.exact_indexes.reduce((sum: bigint, entry: any) => sum + BigInt(entry.bytes_at_rest ?? 0), 0n);
     const familyBytes = new Map<string, bigint>();
     for (const row of currentCompanionRows) {
@@ -1467,7 +1541,9 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
   };
 
   const buildObjectStoreRequestSummary = (stream: string) => {
-    const summary = db.getObjectStoreRequestSummaryByHash(streamHash16Hex(stream));
+    const sqliteRes = requireSqliteFullModeStore();
+    if (Result.isError(sqliteRes)) throw dsError(sqliteRes.error.message);
+    const summary = sqliteRes.value.getObjectStoreRequestSummaryByHash(streamHash16Hex(stream));
     return {
       puts: summary.puts.toString(),
       reads: summary.reads.toString(),
@@ -1488,25 +1564,28 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
   };
 
   const buildIndexStatus = (stream: string, row: StreamRow, reg: SchemaRegistry, profileKind: string) => {
-    const segmentCount = db.countSegmentsForStream(stream);
-    const uploadedSegmentCount = db.countUploadedSegments(stream);
-    const manifest = db.getManifestRow(stream);
+    const sqliteRes = requireSqliteFullModeStore();
+    if (Result.isError(sqliteRes)) throw dsError(sqliteRes.error.message);
+    const sqlite = sqliteRes.value;
+    const segmentCount = sqlite.countSegmentsForStream(stream);
+    const uploadedSegmentCount = sqlite.countUploadedSegments(stream);
+    const manifest = sqlite.getManifestRow(stream);
 
-    const routingState = db.getIndexState(stream);
-    const routingRuns = db.listIndexRuns(stream);
-    const retiredRoutingRuns = db.listRetiredIndexRuns(stream);
-    const routingStorage = db.getRoutingIndexStorage(stream);
-    const routingLexiconState = db.getLexiconIndexState(stream, "routing_key", "");
-    const routingLexiconRuns = db.listLexiconIndexRuns(stream, "routing_key", "");
-    const retiredRoutingLexiconRuns = db.listRetiredLexiconIndexRuns(stream, "routing_key", "");
+    const routingState = sqlite.getIndexState(stream);
+    const routingRuns = sqlite.listIndexRuns(stream);
+    const retiredRoutingRuns = sqlite.listRetiredIndexRuns(stream);
+    const routingStorage = sqlite.getRoutingIndexStorage(stream);
+    const routingLexiconState = sqlite.getLexiconIndexState(stream, "routing_key", "");
+    const routingLexiconRuns = sqlite.listLexiconIndexRuns(stream, "routing_key", "");
+    const retiredRoutingLexiconRuns = sqlite.listRetiredLexiconIndexRuns(stream, "routing_key", "");
     const routingLexiconStorage =
-      db
+      sqlite
         .getLexiconIndexStorage(stream)
         .find((entry) => entry.source_kind === "routing_key" && entry.source_name === "") ?? { object_count: 0, bytes: 0n };
-    const secondaryIndexStorage = new Map(db.getSecondaryIndexStorage(stream).map((entry) => [entry.index_name, entry]));
+    const secondaryIndexStorage = new Map(sqlite.getSecondaryIndexStorage(stream).map((entry) => [entry.index_name, entry]));
 
     const exactIndexes = configuredExactIndexes(reg.search).map(({ name, kind, configHash }) => {
-      const state = db.getSecondaryIndexState(stream, name);
+      const state = sqlite.getSecondaryIndexState(stream, name);
       const configMatches = state?.config_hash === configHash;
       const indexedSegmentCount = configMatches ? (state?.indexed_through ?? 0) : 0;
       const storage = secondaryIndexStorage.get(name);
@@ -1518,8 +1597,8 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
         lag_ms: buildIndexLagMs(stream, row, indexedSegmentCount),
         bytes_at_rest: String(storage?.bytes ?? 0n),
         object_count: storage?.object_count ?? 0,
-        active_run_count: db.listSecondaryIndexRuns(stream, name).length,
-        retired_run_count: db.listRetiredSecondaryIndexRuns(stream, name).length,
+        active_run_count: sqlite.listSecondaryIndexRuns(stream, name).length,
+        retired_run_count: sqlite.listRetiredSecondaryIndexRuns(stream, name).length,
         fully_indexed_uploaded_segments: configMatches && indexedSegmentCount >= uploadedSegmentCount,
         stale_configuration: !configMatches,
         updated_at: timestampToIsoString(state?.updated_at_ms ?? null),
@@ -1528,7 +1607,7 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
 
     const desiredCompanionPlan = buildDesiredSearchCompanionPlan(reg);
     const desiredCompanionHash = hashSearchCompanionPlan(desiredCompanionPlan);
-    const companionPlanRow = db.getSearchCompanionPlan(stream);
+    const companionPlanRow = sqlite.getSearchCompanionPlan(stream);
     const desiredIndexPlanGeneration =
       Object.values(desiredCompanionPlan.families).some(Boolean)
         ? companionPlanRow
@@ -1537,7 +1616,7 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
             : companionPlanRow.generation + 1
           : 1
         : 0;
-    const companionRows = db.listSearchSegmentCompanions(stream);
+    const companionRows = sqlite.listSearchSegmentCompanions(stream);
     const currentCompanionRows = companionRows.filter((row) => row.plan_generation === desiredIndexPlanGeneration);
     const currentCompanionBytes = currentCompanionRows.reduce((sum, entry) => sum + BigInt(entry.size_bytes), 0n);
     const searchFamilies = configuredSearchFamilies(reg.search).map(({ family, fields }) => {
@@ -1625,9 +1704,9 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
   ): Promise<Result<DetailsSnapshot, { status: 404 | 500; message: string }>> => {
     for (let attempt = 0; attempt < 3; attempt++) {
       const beforeVersion = notifier.currentDetailsVersion(stream);
-      const srow = db.getStream(stream);
-      if (!srow || db.isDeleted(srow)) return Result.err({ status: 404, message: "not_found" });
-      if (srow.expires_at_ms != null && db.nowMs() > srow.expires_at_ms) return Result.err({ status: 404, message: "stream expired" });
+      const srowRes = await getLiveStreamResult(stream);
+      if (Result.isError(srowRes)) return srowRes;
+      const srow = srowRes.value;
 
       const regRes = await registry.getRegistryResult(stream);
       if (Result.isError(regRes)) return Result.err({ status: 500, message: regRes.error.message });
@@ -1707,9 +1786,9 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
         });
         try {
           return await runWithGate(ingestGate, async () => {
-            let srow = db.getStream(stream);
+            let srow = await controlStore.getStream(stream);
             if (!srow && autoCreate) {
-              srow = db.ensureStream(stream, { contentType: "application/json" });
+              srow = await controlStore.ensureStream(stream, { contentType: "application/json" });
               const profileRes = await profiles.updateProfileResult(stream, { kind: "otel-traces" });
               if (Result.isError(profileRes)) return badRequest(profileRes.error.message);
               try {
@@ -1721,10 +1800,10 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
               }
               indexer?.enqueue(stream);
               notifier.notifyDetailsChanged(stream);
-              srow = db.getStream(stream);
+              srow = await controlStore.getStream(stream);
             }
-            if (!srow || db.isDeleted(srow)) return notFound();
-            if (srow.expires_at_ms != null && db.nowMs() > srow.expires_at_ms) return notFound("stream expired");
+            if (!srow || controlStore.isDeleted(srow)) return notFound();
+            if (srow.expires_at_ms != null && controlStore.nowMs() > srow.expires_at_ms) return notFound("stream expired");
 
             const profileRes = await profiles.getProfileResult(stream, srow);
             if (Result.isError(profileRes)) return internalError("invalid stream profile");
@@ -1758,7 +1837,7 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
             if (rows.length > 0) {
               const appendResOrResponse = await awaitAppendWithTimeout(enqueueAppend({
                 stream,
-                baseAppendMs: db.nowMs(),
+                baseAppendMs: controlStore.nowMs(),
                 rows,
                 contentType: "application/json",
                 close: false,
@@ -1819,9 +1898,9 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
           stream: string,
           role: "events" | "traces"
         ): Promise<ReturnType<typeof resolveCorrelationCapability> | Response> => {
-          const srow = db.getStream(stream);
-          if (!srow || db.isDeleted(srow)) return notFound();
-          if (srow.expires_at_ms != null && db.nowMs() > srow.expires_at_ms) return notFound("stream expired");
+          const srow = await controlStore.getStream(stream);
+          if (!srow || controlStore.isDeleted(srow)) return notFound();
+          if (srow.expires_at_ms != null && controlStore.nowMs() > srow.expires_at_ms) return notFound("stream expired");
           const profileRes = await profiles.getProfileResult(stream, srow);
           if (Result.isError(profileRes)) return internalError("invalid stream profile");
           if (role === "events" && profileRes.value.kind !== "evlog") {
@@ -2086,17 +2165,19 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
         return json(200, metrics.snapshot());
       }
       if (req.method === "GET" && path === "/v1/server/_details") {
-        return json(200, buildServerDetails());
+        return json(200, await buildServerDetails());
       }
       if (req.method === "GET" && path === "/v1/server/_mem") {
-        return json(200, buildServerMem());
+        return json(200, await buildServerMem());
       }
       if (path === "/v1/traces") {
+        if (!controlStore.capabilities.builtinProfiles) return unsupportedCapability("built-in profile");
         const stream = cfg.otlpTracesStream;
         if (!stream) return badRequest("DS_OTLP_TRACES_STREAM is not configured");
         return handleOtlpTracesIngest(stream, cfg.otlpAutoCreate);
       }
       if (path === "/v1/observe/request") {
+        if (!controlStore.capabilities.indexes) return unsupportedCapability("observe");
         return handleObserveRequest();
       }
 
@@ -2104,7 +2185,7 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
       if (req.method === "GET" && path === "/v1/streams") {
         const limit = Number(url.searchParams.get("limit") ?? "100");
         const offset = Number(url.searchParams.get("offset") ?? "0");
-        const rows = db.listStreams(Math.max(0, Math.min(limit, 1000)), Math.max(0, offset));
+        const rows = await controlStore.listStreams(Math.max(0, Math.min(limit, 1000)), Math.max(0, offset));
         const out = [];
         for (const r of rows) {
           const profileRes = await profiles.getProfileResult(r.stream, r);
@@ -2195,13 +2276,14 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
         const stream = decodeURIComponent(streamPart);
 
         if (isOtlpTraces) {
+          if (!controlStore.capabilities.builtinProfiles) return unsupportedCapability("built-in profile");
           return handleOtlpTracesIngest(stream, false);
         }
 
         if (isSchema) {
-          const srow = db.getStream(stream);
-          if (!srow || db.isDeleted(srow)) return notFound();
-          if (srow.expires_at_ms != null && db.nowMs() > srow.expires_at_ms) return notFound("stream expired");
+          const srow = await controlStore.getStream(stream);
+          if (!srow || controlStore.isDeleted(srow)) return notFound();
+          if (srow.expires_at_ms != null && controlStore.nowMs() > srow.expires_at_ms) return notFound("stream expired");
 
           if (req.method === "GET") {
             const regRes = await registry.getRegistryResult(stream);
@@ -2218,6 +2300,9 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
             const updateRes = parseSchemaUpdateResult(body);
             if (Result.isError(updateRes)) return badRequest(updateRes.error.message);
             const update = updateRes.value;
+            if (update.search !== undefined && !controlStore.capabilities.indexes) {
+              return unsupportedCapability("index");
+            }
             if (update.schema === undefined && update.routingKey !== undefined && update.search === undefined) {
               const regRes = await registry.updateRoutingKeyResult(stream, update.routingKey ?? null);
               if (Result.isError(regRes)) return schemaMutationErrorResponse(regRes.error);
@@ -2262,9 +2347,9 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
         }
 
         if (isProfile) {
-          const srow = db.getStream(stream);
-          if (!srow || db.isDeleted(srow)) return notFound();
-          if (srow.expires_at_ms != null && db.nowMs() > srow.expires_at_ms) return notFound("stream expired");
+          const srowOrResponse = await liveStreamOrResponse(stream);
+          if (srowOrResponse instanceof Response) return srowOrResponse;
+          const srow = srowOrResponse;
 
           if (req.method === "GET") {
             const profileRes = await profiles.getProfileResourceResult(stream, srow);
@@ -2281,6 +2366,9 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
             }
             const nextProfileRes = parseProfileUpdateResult(body);
             if (Result.isError(nextProfileRes)) return badRequest(nextProfileRes.error.message);
+            if (nextProfileRes.value.kind !== "generic" && !controlStore.capabilities.builtinProfiles) {
+              return unsupportedCapability("built-in profile");
+            }
             const profileRes = await profiles.updateProfileResult(stream, nextProfileRes.value);
             if (Result.isError(profileRes)) return badRequest(profileRes.error.message);
             try {
@@ -2300,6 +2388,8 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
 
         if (isDetails || isIndexStatus) {
           if (req.method !== "GET") return badRequest("unsupported method");
+          if (isDetails && !controlStore.capabilities.storageStats) return unsupportedCapability("storage stats");
+          if (isIndexStatus && !controlStore.capabilities.indexes) return unsupportedCapability("index");
           const liveParam = url.searchParams.get("live") ?? "";
           let longPoll = false;
           if (liveParam === "" || liveParam === "false" || liveParam === "0") longPoll = false;
@@ -2389,9 +2479,10 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
         }
 
         if (isRoutingKeys) {
-          const srow = db.getStream(stream);
-          if (!srow || db.isDeleted(srow)) return notFound();
-          if (srow.expires_at_ms != null && db.nowMs() > srow.expires_at_ms) return notFound("stream expired");
+          if (!controlStore.capabilities.indexes) return unsupportedCapability("routing key index");
+          const srowOrResponse = await liveStreamOrResponse(stream);
+          if (srowOrResponse instanceof Response) return srowOrResponse;
+          const srow = srowOrResponse;
           if (req.method !== "GET") return badRequest("unsupported method");
           const regRes = await registry.getRegistryResult(stream);
           if (Result.isError(regRes)) return internalError();
@@ -2436,9 +2527,10 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
         }
 
         if (isSearch) {
-          const srow = db.getStream(stream);
-          if (!srow || db.isDeleted(srow)) return notFound();
-          if (srow.expires_at_ms != null && db.nowMs() > srow.expires_at_ms) return notFound("stream expired");
+          if (!controlStore.capabilities.indexes) return unsupportedCapability("search");
+          const srowOrResponse = await liveStreamOrResponse(stream);
+          if (srowOrResponse instanceof Response) return srowOrResponse;
+          const srow = srowOrResponse;
 
           const regRes = await registry.getRegistryResult(stream);
           if (Result.isError(regRes)) return internalError();
@@ -2514,9 +2606,10 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
         }
 
         if (isAggregate) {
-          const srow = db.getStream(stream);
-          if (!srow || db.isDeleted(srow)) return notFound();
-          if (srow.expires_at_ms != null && db.nowMs() > srow.expires_at_ms) return notFound("stream expired");
+          if (!controlStore.capabilities.indexes) return unsupportedCapability("aggregate");
+          const srowOrResponse = await liveStreamOrResponse(stream);
+          if (srowOrResponse instanceof Response) return srowOrResponse;
+          const srow = srowOrResponse;
           if (req.method !== "POST") return badRequest("unsupported method");
 
           const regRes = await registry.getRegistryResult(stream);
@@ -2561,9 +2654,10 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
         }
 
         if (touchMode) {
-          const srow = db.getStream(stream);
-          if (!srow || db.isDeleted(srow)) return notFound();
-          if (srow.expires_at_ms != null && db.nowMs() > srow.expires_at_ms) return notFound("stream expired");
+          if (!controlStore.capabilities.touch || !touch || !db) return unsupportedCapability("touch");
+          const srowOrResponse = await liveStreamOrResponse(stream);
+          if (srowOrResponse instanceof Response) return srowOrResponse;
+          const srow = srowOrResponse;
 
           const profileRes = await profiles.getProfileResult(stream, srow);
           if (Result.isError(profileRes)) return internalError("invalid stream profile");
@@ -2594,7 +2688,7 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
             const ttlRes = parseStreamTtlSeconds(ttlHeader);
             if (Result.isError(ttlRes)) return badRequest(ttlRes.error.message);
             ttlSeconds = ttlRes.value;
-            expiresAtMs = db.nowMs() + BigInt(ttlSeconds) * 1000n;
+            expiresAtMs = controlStore.nowMs() + BigInt(ttlSeconds) * 1000n;
           } else if (expiresHeader) {
             const expiresRes = parseTimestampMsResult(expiresHeader);
             if (Result.isError(expiresRes)) return badRequest(expiresRes.error.message);
@@ -2614,13 +2708,13 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
               if (ab.byteLength > cfg.appendMaxBodyBytes) return tooLarge(`body too large (max ${cfg.appendMaxBodyBytes})`);
               const bodyBytes = new Uint8Array(ab);
 
-              let srow = db.getStream(stream);
-              if (srow && db.isDeleted(srow)) {
-                db.hardDeleteStream(stream);
+              let srow = await controlStore.getStream(stream);
+              if (srow && controlStore.isDeleted(srow)) {
+                await controlStore.hardDeleteStream(stream);
                 srow = null;
               }
-              if (srow && srow.expires_at_ms != null && db.nowMs() > srow.expires_at_ms) {
-                db.hardDeleteStream(stream);
+              if (srow && srow.expires_at_ms != null && controlStore.nowMs() > srow.expires_at_ms) {
+                await controlStore.hardDeleteStream(stream);
                 srow = null;
               }
 
@@ -2647,7 +2741,7 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
                 return new Response(null, { status: 200, headers: appendResponseHeaders(headers) });
               }
 
-              db.ensureStream(stream, { contentType, expiresAtMs, ttlSeconds, closed: false });
+              await controlStore.ensureStream(stream, { contentType, expiresAtMs, ttlSeconds, closed: false });
               notifier.notifyDetailsChanged(stream);
               let lastOffset = -1n;
               let appendedRows = 0;
@@ -2664,7 +2758,7 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
                 if (rows.length > 0 || streamClosed) {
                   const appendResOrResponse = await awaitAppendWithTimeout(enqueueAppend({
                     stream,
-                    baseAppendMs: db.nowMs(),
+                    baseAppendMs: controlStore.nowMs(),
                     rows,
                     contentType,
                     close: streamClosed,
@@ -2681,7 +2775,7 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
               } else if (streamClosed) {
                 const appendResOrResponse = await awaitAppendWithTimeout(enqueueAppend({
                   stream,
-                  baseAppendMs: db.nowMs(),
+                  baseAppendMs: controlStore.nowMs(),
                   rows: [],
                   contentType,
                   close: true,
@@ -2706,7 +2800,7 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
                 closed: closedNow,
               });
 
-              const createdRow = db.getStream(stream)!;
+              const createdRow = (await controlStore.getStream(stream))!;
               const tailOffset = encodeOffset(createdRow.epoch, createdRow.next_offset - 1n);
               const headers: Record<string, string> = {
                 "content-type": contentType,
@@ -2723,18 +2817,18 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
         }
 
         if (req.method === "DELETE") {
-          const deleted = db.deleteStream(stream);
+          const deleted = await controlStore.deleteStream(stream);
           if (!deleted) return notFound();
           notifier.notifyDetailsChanged(stream);
           notifier.notifyClose(stream);
-          await uploader.publishManifest(stream);
+          await fullMode?.manifestPublication?.publishDeletedStreamManifest(stream);
           return new Response(null, { status: 204, headers: withNosniff() });
         }
 
         if (req.method === "HEAD") {
-          const srow = db.getStream(stream);
-          if (!srow || db.isDeleted(srow)) return notFound();
-          if (srow.expires_at_ms != null && db.nowMs() > srow.expires_at_ms) return notFound("stream expired");
+          const srowOrResponse = await liveStreamOrResponse(stream);
+          if (srowOrResponse instanceof Response) return srowOrResponse;
+          const srow = srowOrResponse;
           const tailOffset = encodeOffset(srow.epoch, srow.next_offset - 1n);
           const headers: Record<string, string> = {
             "content-type": normalizeContentType(srow.content_type) ?? srow.content_type,
@@ -2744,7 +2838,7 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
           };
           if (srow.closed !== 0) headers["stream-closed"] = "true";
           if (srow.ttl_seconds != null && srow.expires_at_ms != null) {
-            const remainingMs = Number(srow.expires_at_ms - db.nowMs());
+            const remainingMs = Number(srow.expires_at_ms - controlStore.nowMs());
             const remaining = Math.max(0, Math.ceil(remainingMs / 1000));
             headers["stream-ttl"] = String(remaining);
           }
@@ -2753,9 +2847,9 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
         }
 
         if (req.method === "POST") {
-          const srow = db.getStream(stream);
-          if (!srow || db.isDeleted(srow)) return notFound();
-          if (srow.expires_at_ms != null && db.nowMs() > srow.expires_at_ms) return notFound("stream expired");
+          const srowOrResponse = await liveStreamOrResponse(stream);
+          if (srowOrResponse instanceof Response) return srowOrResponse;
+          const srow = srowOrResponse;
 
           const streamClosed = parseStreamClosedHeader(req.headers.get("stream-closed"));
           const streamContentType = normalizeContentType(srow.content_type) ?? srow.content_type;
@@ -2779,7 +2873,7 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
           streamSeq = streamSeqRes.value;
 
           const tsHdr = req.headers.get("stream-timestamp");
-          let baseAppendMs = db.nowMs();
+          let baseAppendMs = controlStore.nowMs();
           if (tsHdr) {
             const tsRes = parseTimestampMsResult(tsHdr);
             if (Result.isError(tsRes)) return badRequest(tsRes.error.message);
@@ -2898,9 +2992,9 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
         }
 
         if (req.method === "GET") {
-          const srow = db.getStream(stream);
-          if (!srow || db.isDeleted(srow)) return notFound();
-          if (srow.expires_at_ms != null && db.nowMs() > srow.expires_at_ms) return notFound("stream expired");
+          const srowOrResponse = await liveStreamOrResponse(stream);
+          if (srowOrResponse instanceof Response) return srowOrResponse;
+          const srow = srowOrResponse;
 
           const streamContentType = normalizeContentType(srow.content_type) ?? srow.content_type;
           const isJsonStream = streamContentType === "application/json";
@@ -3117,7 +3211,7 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
                     }
 
                     const upToDate = batch.nextOffsetSeq === batch.endOffsetSeq;
-                    const latest = db.getStream(stream);
+                    const latest = await controlStore.getStream(stream);
                     const closedNow = !!latest && latest.closed !== 0 && upToDate;
 
                     const control: Record<string, any> = { streamNextOffset: batch.nextOffset };
@@ -3203,7 +3297,7 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
                   headers.set("stream-cursor", cursor);
                   return new Response(resp.body, { status: resp.status, headers });
                 }
-                const latest = db.getStream(stream);
+                const latest = await controlStore.getStream(stream);
                 if (latest && latest.closed !== 0 && batch.nextOffsetSeq === batch.endOffsetSeq) {
                   const latestTail = encodeOffset(latest.epoch, latest.next_offset - 1n);
                   const headers: Record<string, string> = {
@@ -3222,7 +3316,7 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
                 await notifier.waitFor(stream, batch.endOffsetSeq, remaining, req.signal);
                 if (req.signal.aborted) return new Response(null, { status: 204 });
               }
-              const latest = db.getStream(stream);
+              const latest = await controlStore.getStream(stream);
               const latestTail = latest ? encodeOffset(latest.epoch, latest.next_offset - 1n) : tailOffset;
               const headers: Record<string, string> = {
                 "stream-next-offset": latestTail,
@@ -3264,7 +3358,7 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
                 headers.set("stream-cursor", cursor);
                 return new Response(resp.body, { status: resp.status, headers });
               }
-              const latest = db.getStream(stream);
+              const latest = await controlStore.getStream(stream);
               if (latest && latest.closed !== 0 && batch.nextOffsetSeq === batch.endOffsetSeq) {
                 const latestTail = encodeOffset(latest.epoch, latest.next_offset - 1n);
                 const headers: Record<string, string> = {
@@ -3283,7 +3377,7 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
               await notifier.waitFor(stream, batch.endOffsetSeq, remaining, req.signal);
               if (req.signal.aborted) return new Response(null, { status: 204 });
             }
-            const latest = db.getStream(stream);
+            const latest = await controlStore.getStream(stream);
             const latestTail = latest ? encodeOffset(latest.epoch, latest.next_offset - 1n) : currentOffset;
             const headers: Record<string, string> = {
               "stream-next-offset": latestTail,
@@ -3344,17 +3438,18 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
     // -- PGlite's WebAssembly JIT pages -- right after this resolves; a worker
     // thread still tearing down at that moment races V8's process-global JIT
     // bookkeeping and can abort the process on Linux.
-    await touch.stop();
-    await segmenter.stop(true);
-    uploader.stop(true);
+    await touch?.stop();
+    await fullMode?.segmenter.stop(true);
+    fullMode?.uploader.stop(true);
     await indexer?.stop();
-    metricsEmitter.stop();
-    expirySweeper.stop();
-    streamSizeReconciler.stop();
-    ingest.stop();
+    await metricsEmitter.stop();
+    await expirySweeper.stop();
+    streamSizeReconciler?.stop();
+    await ingest.stop();
     memorySampler?.stop();
     memory.stop();
-    db.close();
+    await controlStore.close();
+    if (db && db !== controlStore) db.close();
   };
 
   return {
@@ -3364,12 +3459,12 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
     deps: {
       config: cfg,
       db,
-      os: store,
+      os: fullMode?.store,
       ingest,
       notifier,
       reader,
-      segmenter,
-      uploader,
+      segmenter: fullMode?.segmenter,
+      uploader: fullMode?.uploader,
       indexer,
       metrics,
       registry,

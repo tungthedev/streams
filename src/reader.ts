@@ -236,6 +236,12 @@ type PlannedReadSegments = {
 type PlannedReadOrder = "asc" | "desc";
 type PrimaryTimestampTopKSort = Extract<SearchSortSpec, { kind: "field" }>;
 type ReaderStore = StreamReadStore & WalReadStore;
+export type SegmentReadBundle = {
+  segmentReads: SegmentReadStore;
+  objectStore: ObjectStore;
+  diskCache?: SegmentDiskCache;
+  index?: StreamIndexLookup;
+};
 
 function errorMessage(e: unknown): string {
   return String((e as any)?.message ?? e);
@@ -307,7 +313,7 @@ export class StreamReader {
   private readonly config: Config;
   private readonly store: ReaderStore;
   private readonly segmentReads?: SegmentReadStore;
-  private readonly os: ObjectStore;
+  private readonly os?: ObjectStore;
   private readonly registry: SchemaRegistryStore;
   private readonly diskCache?: SegmentDiskCache;
   private readonly index?: StreamIndexLookup;
@@ -318,23 +324,24 @@ export class StreamReader {
   constructor(
     config: Config,
     store: ReaderStore,
-    segmentReads: SegmentReadStore | undefined,
-    os: ObjectStore,
     registry: SchemaRegistryStore,
-    diskCache?: SegmentDiskCache,
-    index?: StreamIndexLookup,
+    segmentBundle?: SegmentReadBundle,
     memorySampler?: RuntimeMemorySampler,
     memory?: MemoryPressureMonitor
   ) {
     this.config = config;
     this.store = store;
-    this.segmentReads = segmentReads;
-    this.os = os;
+    this.segmentReads = segmentBundle?.segmentReads;
+    this.os = segmentBundle?.objectStore;
     this.registry = registry;
-    this.diskCache = diskCache;
-    this.index = index;
+    this.diskCache = segmentBundle?.diskCache;
+    this.index = segmentBundle?.index;
     this.memorySampler = memorySampler;
     this.memory = memory;
+  }
+
+  private requireObjectStore(): Result<ObjectStore, ReaderError> {
+    return this.os ? Result.ok(this.os) : Result.err({ kind: "internal", message: "object store capability required for segment reads" });
   }
 
   private listSegmentsForStream(stream: string): Promise<SegmentRow[]> {
@@ -648,6 +655,15 @@ export class StreamReader {
     try {
       const sinceNs = sinceMs * 1_000_000n;
       const keyBytes = key ? utf8Bytes(key) : null;
+      const objectStore =
+        srow.sealed_through >= 0n
+          ? (() => {
+              const res = this.requireObjectStore();
+              if (Result.isError(res)) return res;
+              return Result.ok(res.value);
+            })()
+          : Result.ok(null);
+      if (Result.isError(objectStore)) return Result.err(objectStore.error);
       const candidateInfo = await this.resolveCandidateSegments(stream, keyBytes, null);
       const plannedSealedSegments = await this.planSealedReadSegments(
         stream,
@@ -659,7 +675,7 @@ export class StreamReader {
       );
 
       for (const seg of plannedSealedSegments?.segments ?? await this.listSegmentsForStream(stream)) {
-        const segBytes = await loadSegmentBytes(this.os, seg, this.diskCache, this.retryOpts());
+        const segBytes = await loadSegmentBytes(objectStore.value!, seg, this.diskCache, this.retryOpts());
         let curOffset = seg.start_offset;
         for (const blockRes of iterateBlocksResult(segBytes)) {
           if (Result.isError(blockRes)) return Result.err({ kind: "internal", message: blockRes.error.message });
@@ -735,6 +751,15 @@ export class StreamReader {
 
       const endOffsetNum = srow.next_offset - 1n;
       const endOffset = encodeOffset(srow.epoch, endOffsetNum);
+      const objectStore =
+        desiredOffset <= srow.sealed_through
+          ? (() => {
+              const res = this.requireObjectStore();
+              if (Result.isError(res)) return res;
+              return Result.ok(res.value);
+            })()
+          : Result.ok(null);
+      if (Result.isError(objectStore)) return Result.err(objectStore.error);
 
       const results: Array<{ offset: bigint; payload: Uint8Array }> = [];
       let bytesOut = 0;
@@ -1058,13 +1083,13 @@ export class StreamReader {
           }
           const preferFull = !keyBytes && this.config.readMaxBytes >= seg.size_bytes;
           if (preferFull) {
-            const segBytes = await loadSegmentBytes(this.os, seg, this.diskCache, this.retryOpts());
+            const segBytes = await loadSegmentBytes(objectStore.value!, seg, this.diskCache, this.retryOpts());
             const scanRes = await scanSegmentBytes(segBytes, seg, allowedDocIds);
             if (Result.isError(scanRes)) return scanRes;
             if (filterScanLimitReached) return Result.ok(finalize());
             if (results.length >= this.config.readMaxRecords || bytesOut >= this.config.readMaxBytes) return Result.ok(finalize());
           } else {
-            const source = await loadSegmentSource(this.os, seg, this.diskCache, this.retryOpts());
+            const source = await loadSegmentSource(objectStore.value!, seg, this.diskCache, this.retryOpts());
             const scanRes = await scanSegmentSource(source, seg, allowedDocIds);
             if (Result.isError(scanRes)) return scanRes;
             if (filterScanLimitReached) return Result.ok(finalize());
@@ -1100,13 +1125,13 @@ export class StreamReader {
         }
         const preferFull = !keyBytes && this.config.readMaxBytes >= seg.size_bytes;
         if (preferFull) {
-          const segBytes = await loadSegmentBytes(this.os, seg, this.diskCache, this.retryOpts());
+          const segBytes = await loadSegmentBytes(objectStore.value!, seg, this.diskCache, this.retryOpts());
           const scanRes = await scanSegmentBytes(segBytes, seg, allowedDocIds);
           if (Result.isError(scanRes)) return scanRes;
           if (filterScanLimitReached) return Result.ok(finalize());
           if (results.length >= this.config.readMaxRecords || bytesOut >= this.config.readMaxBytes) return Result.ok(finalize());
         } else {
-          const source = await loadSegmentSource(this.os, seg, this.diskCache, this.retryOpts());
+          const source = await loadSegmentSource(objectStore.value!, seg, this.diskCache, this.retryOpts());
           const scanRes = await scanSegmentSource(source, seg, allowedDocIds);
           if (Result.isError(scanRes)) return scanRes;
           if (filterScanLimitReached) return Result.ok(finalize());
@@ -1229,6 +1254,15 @@ export class StreamReader {
       const visibleSealedThrough = coverageState.canSearchWalTail
         ? srow.sealed_through
         : (coverageState.visibleThroughSeq < srow.sealed_through ? coverageState.visibleThroughSeq : srow.sealed_through);
+      const objectStore =
+        visibleSealedThrough >= 0n
+          ? (() => {
+              const res = this.requireObjectStore();
+              if (Result.isError(res)) return res;
+              return Result.ok(res.value);
+            })()
+          : Result.ok(null);
+      if (Result.isError(objectStore)) return Result.err(objectStore.error);
       const deadline = request.timeoutMs == null ? null : Date.now() + request.timeoutMs;
       const leadingSort = request.sort[0] ?? null;
       const offsetSearchAfter =
@@ -1331,7 +1365,7 @@ export class StreamReader {
         rangeEndSeq: bigint
       ): Promise<Result<void, ReaderError>> => {
         if (markTimedOutIfNeeded()) return Result.ok(undefined);
-        const segBytes = await loadSegmentBytes(this.os, seg, this.diskCache, this.retryOpts());
+        const segBytes = await loadSegmentBytes(objectStore.value!, seg, this.diskCache, this.retryOpts());
         segmentPayloadBytesFetched += seg.size_bytes;
         if (markTimedOutIfNeeded()) return Result.ok(undefined);
         let curOffset = seg.start_offset;
@@ -1847,6 +1881,15 @@ export class StreamReader {
       }
 
       const coverageState = await this.computePublishedCoverageState(stream, srow, registry);
+      const objectStore =
+        srow.sealed_through >= 0n
+          ? (() => {
+              const res = this.requireObjectStore();
+              if (Result.isError(res)) return res;
+              return Result.ok(res.value);
+            })()
+          : Result.ok(null);
+      if (Result.isError(objectStore)) return Result.err(objectStore.error);
       const intervalMs = request.intervalMs;
       const intervalBig = BigInt(intervalMs);
       const fromMs = Number(request.fromMs);
@@ -1913,7 +1956,7 @@ export class StreamReader {
         seg: SegmentRow,
         scanRanges: Array<{ startMs: number; endMs: number }>
       ): Promise<Result<void, ReaderError>> => {
-        const segBytes = await loadSegmentBytes(this.os, seg, this.diskCache, this.retryOpts());
+        const segBytes = await loadSegmentBytes(objectStore.value!, seg, this.diskCache, this.retryOpts());
         let curOffset = seg.start_offset;
         for (const blockRes of iterateBlocksResult(segBytes)) {
           if (Result.isError(blockRes)) return Result.err({ kind: "internal", message: blockRes.error.message });
@@ -2118,12 +2161,15 @@ export class StreamReader {
   }
 
   private async loadSegmentRangeBlockReaderResult(seg: SegmentRow): Promise<Result<SegmentRangeBlockReader | null, ReaderError>> {
+    const objectStoreRes = this.requireObjectStore();
+    if (Result.isError(objectStoreRes)) return Result.err(objectStoreRes.error);
+    const objectStore = objectStoreRes.value;
     const objectKey = segmentObjectKey(streamHash16Hex(seg.stream), seg.segment_index);
     let fetchedBytes = 0;
     const readRange = async (start: number, end: number): Promise<Result<Uint8Array, ReaderError>> => {
       const bytes = await retry(
         async () => {
-          const res = await this.os.get(objectKey, { range: { start, end } });
+          const res = await objectStore.get(objectKey, { range: { start, end } });
           if (!res) throw dsError(`object store missing segment: ${objectKey}`);
           return res;
         },
@@ -2300,7 +2346,9 @@ export class StreamReader {
       }
     }
 
-    const source = await loadSegmentSource(this.os, seg, this.diskCache, this.retryOpts());
+    const objectStoreRes = this.requireObjectStore();
+    if (Result.isError(objectStoreRes)) return Result.err(objectStoreRes.error);
+    const source = await loadSegmentSource(objectStoreRes.value, seg, this.diskCache, this.retryOpts());
     state.addSegmentPayloadBytesFetched(seg.size_bytes);
     if (markTimedOutIfNeeded()) return Result.ok(undefined);
     const footerBlocks = loadSegmentFooterBlocksFromSource(seg, source);

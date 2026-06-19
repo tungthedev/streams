@@ -15,6 +15,7 @@ import type {
   SchemaStore,
 } from "../store/schema_profile_store";
 import type { ProfileTouchStateStore } from "../store/profile_touch_store";
+import type { WalControlPlaneStore, DurableStoreCapabilities } from "../store/capabilities";
 import { SqliteWalStore } from "./sqlite_wal_store";
 
 export const STREAM_FLAG_DELETED = 1 << 0;
@@ -187,7 +188,26 @@ function legacyWalReadRow(row: WalReadRow): {
   };
 }
 
-export class SqliteDurableStore implements WalStore, SegmentReadStore, StreamReadStore, SchemaStore, ProfileStore, ProfileTouchStateStore {
+export class SqliteDurableStore
+  implements WalControlPlaneStore, WalStore, SegmentReadStore, StreamReadStore, SchemaStore, ProfileStore, ProfileTouchStateStore
+{
+  readonly kind = "sqlite" as const;
+  readonly capabilities: DurableStoreCapabilities = {
+    wal: true,
+    schemas: true,
+    profiles: true,
+    streamLifecycle: true,
+    segmentReads: true,
+    indexes: true,
+    manifests: true,
+    objectStoreAccounting: true,
+    storageStats: true,
+    schemaPublication: true,
+    builtinProfiles: true,
+    internalMetrics: true,
+    touch: true,
+  };
+
   public readonly db: SqliteDatabase;
   private readonly walStore: SqliteWalStore;
   private dbstatReady: boolean | null = null;

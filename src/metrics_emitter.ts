@@ -12,6 +12,7 @@ export class MetricsEmitter {
   }) => void;
   private readonly collectRuntimeMetrics?: () => void;
   private timer: any | null = null;
+  private flushPromise: Promise<void> | null = null;
 
   constructor(
     metrics: Metrics,
@@ -36,12 +37,21 @@ export class MetricsEmitter {
     }, this.intervalMs);
   }
 
-  stop(): void {
+  async stop(): Promise<void> {
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
+    await this.flushPromise;
   }
 
   private async flush(): Promise<void> {
+    if (this.flushPromise) return this.flushPromise;
+    this.flushPromise = this.runFlush().finally(() => {
+      this.flushPromise = null;
+    });
+    return this.flushPromise;
+  }
+
+  private async runFlush(): Promise<void> {
     const queue = this.ingest.getQueueStats();
     this.metrics.record("tieredstore.ingest.queue.bytes", queue.bytes, "bytes");
     this.metrics.record("tieredstore.ingest.queue.requests", queue.requests, "count");

@@ -18,6 +18,7 @@ import { SearchCompanionManager } from "./search/companion_manager";
 import { LexiconIndexManager } from "./index/lexicon_indexer";
 import { readSqliteRuntimeMemoryStats } from "./sqlite/runtime_stats";
 import { sumRuntimeMemoryValues } from "./runtime_memory";
+import { SqliteDurableStore } from "./db/db";
 
 export type { App } from "./app_core";
 
@@ -103,9 +104,12 @@ class CombinedIndexController implements StreamIndexLookup {
 }
 
 export function createApp(cfg: Config, os?: ObjectStore, opts: CreateAppOptions = {}): App {
+  const db = new SqliteDurableStore(cfg.dbPath, { cacheBytes: cfg.sqliteCacheBytes });
   return createAppCore(cfg, {
+    db,
+    store: db,
     stats: opts.stats,
-    createRuntime: ({ config, db, ingest, registry, notifier, stats, backpressure, metrics, memorySampler, memory, asyncIndexGate, foregroundActivity }) => {
+    createRuntime: ({ config, ingest, registry, notifier, stats, backpressure, metrics, memorySampler, memory, asyncIndexGate, foregroundActivity }) => {
       const rawStore = os ?? new MockR2Store();
       const store = new AccountingObjectStore(rawStore, db, metrics);
       const segmenterHooks: SegmenterHooks = {
@@ -177,7 +181,14 @@ export function createApp(cfg: Config, os?: ObjectStore, opts: CreateAppOptions 
         onSegmentsUploaded: (stream) => indexer.enqueue(stream),
         onMetadataChanged: (stream) => notifier.notifyDetailsChanged(stream),
       });
-      const reader = new StreamReader(config, db, db, store, registry, diskCache, indexer, memorySampler, memory);
+      const reader = new StreamReader(
+        config,
+        db,
+        registry,
+        { segmentReads: db, objectStore: store, diskCache, index: indexer },
+        memorySampler,
+        memory
+      );
       const segmenter =
         config.segmenterWorkers > 0
           ? new SegmenterWorkerPool(config, config.segmenterWorkers, {}, segmenterHooks)
@@ -206,17 +217,22 @@ export function createApp(cfg: Config, os?: ObjectStore, opts: CreateAppOptions 
       };
 
       return {
-        store,
         reader,
-        segmenter,
-        uploader,
         indexer,
-        segmentDiskCache: diskCache,
         schemaPublication,
-        getLocalStorageUsage: (stream: string) => ({
-          segment_cache_bytes: diskCache.bytesForObjectKeyPrefix(`streams/${streamHash16Hex(stream)}/segments/`),
-          ...indexer.getLocalStorageUsage?.(stream),
-        }),
+        fullMode: {
+          store,
+          segmenter,
+          uploader,
+          segmentDiskCache: diskCache,
+          manifestPublication: {
+            publishDeletedStreamManifest: (stream: string) => uploader.publishManifest(stream),
+          },
+          getLocalStorageUsage: (stream: string) => ({
+            segment_cache_bytes: diskCache.bytesForObjectKeyPrefix(`streams/${streamHash16Hex(stream)}/segments/`),
+            ...indexer.getLocalStorageUsage?.(stream),
+          }),
+        },
         getRuntimeMemorySnapshot: () => {
           const ingestMemory = ingest.getMemoryStats();
           const segmenterMemory = segmenter.getMemoryStats?.() ?? {

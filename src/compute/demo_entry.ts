@@ -166,9 +166,10 @@ function createColocatedStreamsTarget(streamsApp: App): StreamsFetchTarget {
   const generateStreamsToEnqueue = new Set<string>();
 
   return {
-    appendGenerateBatch: async (stream, events) => {
-      const { db, ingest, metrics, notifier, profiles, registry, stats, touch } = streamsApp.deps;
-      const streamRow = db.getStream(stream);
+		appendGenerateBatch: async (stream, events) => {
+			const { db, ingest, metrics, notifier, profiles, registry, stats, touch } = streamsApp.deps;
+			if (!db || !touch) throw dsError("colocated streams target requires SQLite touch runtime");
+			const streamRow = db.getStream(stream);
       if (!streamRow || db.isDeleted(streamRow)) throw dsError("stream not found");
 
       const regRes = await registry.getRegistryResult(stream);
@@ -225,15 +226,15 @@ function createColocatedStreamsTarget(streamsApp: App): StreamsFetchTarget {
     beginGenerateJob: (stream) => {
       activeGenerateJobs += 1;
       generateStreamsToEnqueue.add(stream);
-      if (activeGenerateJobs !== 1) return;
-      streamsApp.deps.indexer?.stop();
-      streamsApp.deps.segmenter.stop(true);
-    },
+			if (activeGenerateJobs !== 1) return;
+			streamsApp.deps.indexer?.stop();
+			streamsApp.deps.segmenter?.stop(true);
+		},
     endGenerateJob: (stream) => {
       generateStreamsToEnqueue.add(stream);
-      activeGenerateJobs = Math.max(0, activeGenerateJobs - 1);
-      if (activeGenerateJobs !== 0) return;
-      streamsApp.deps.segmenter.start();
+			activeGenerateJobs = Math.max(0, activeGenerateJobs - 1);
+			if (activeGenerateJobs !== 0) return;
+			streamsApp.deps.segmenter?.start();
       streamsApp.deps.indexer?.start();
       for (const pendingStream of generateStreamsToEnqueue) {
         streamsApp.deps.indexer?.enqueue(pendingStream);
@@ -254,7 +255,7 @@ async function main(): Promise<void> {
   const studioAssets = await loadStudioAssets();
   const externalStreamsServerUrl = resolveExternalStreamsServerUrl();
   let streamsTarget: StreamsFetchTarget;
-  let closeStreamsTarget: (() => void) | null = null;
+  let closeStreamsTarget: (() => Promise<void>) | null = null;
   let cfg: ReturnType<typeof loadConfig>;
 
   if (externalStreamsServerUrl) {
@@ -375,7 +376,7 @@ async function main(): Promise<void> {
   });
 
   let shuttingDown = false;
-  const shutdown = (signal: NodeJS.Signals): void => {
+  const shutdown = async (signal: NodeJS.Signals): Promise<void> => {
     if (shuttingDown) return;
     shuttingDown = true;
     console.log(`received ${signal}, shutting down prisma-streams compute demo`);
@@ -391,7 +392,7 @@ async function main(): Promise<void> {
     }
     if (closeStreamsTarget) {
       try {
-        closeStreamsTarget();
+        await closeStreamsTarget();
       } catch (error) {
         console.error("failed to close streams application cleanly", error);
         process.exitCode = 1;
@@ -399,8 +400,8 @@ async function main(): Promise<void> {
     }
   };
 
-  process.once("SIGINT", () => shutdown("SIGINT"));
-  process.once("SIGTERM", () => shutdown("SIGTERM"));
+  process.once("SIGINT", () => void shutdown("SIGINT"));
+  process.once("SIGTERM", () => void shutdown("SIGTERM"));
 
   const listenTarget = cfg.host.includes(":")
     ? `[${cfg.host}]:${server.port}`

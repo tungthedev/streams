@@ -1,15 +1,15 @@
 import type { Config } from "./config";
-import type { SqliteDurableStore } from "./db/db";
+import type { StreamStore } from "./store/capabilities";
 
 export class ExpirySweeper {
   private readonly cfg: Config;
-  private readonly db: SqliteDurableStore;
+  private readonly store: StreamStore;
   private timer: any | null = null;
-  private running = false;
+  private tickPromise: Promise<void> | null = null;
 
-  constructor(cfg: Config, db: SqliteDurableStore) {
+  constructor(cfg: Config, store: StreamStore) {
     this.cfg = cfg;
-    this.db = db;
+    this.store = store;
   }
 
   start(): void {
@@ -19,26 +19,29 @@ export class ExpirySweeper {
     }, this.cfg.expirySweepIntervalMs);
   }
 
-  stop(): void {
+  async stop(): Promise<void> {
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
+    await this.tickPromise;
   }
 
   private async tick(): Promise<void> {
-    if (this.running) return;
-    this.running = true;
-    try {
-      const expired = this.db.listExpiredStreams(this.cfg.expirySweepBatchLimit);
-      if (expired.length === 0) return;
-      for (const stream of expired) {
-        try {
-          this.db.deleteStream(stream);
-        } catch {
-          // ignore deletion errors
-        }
+    if (this.tickPromise) return this.tickPromise;
+    this.tickPromise = this.runTick().finally(() => {
+      this.tickPromise = null;
+    });
+    return this.tickPromise;
+  }
+
+  private async runTick(): Promise<void> {
+    const expired = await this.store.listExpiredStreams(this.cfg.expirySweepBatchLimit);
+    if (expired.length === 0) return;
+    for (const stream of expired) {
+      try {
+        await this.store.deleteStream(stream);
+      } catch {
+        // ignore deletion errors
       }
-    } finally {
-      this.running = false;
     }
   }
 }
