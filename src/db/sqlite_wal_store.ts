@@ -6,7 +6,7 @@ import {
   type StoreAppendResult,
   type StoreAppendTask,
 } from "../store/append";
-import type { WalStore } from "../store/wal_store";
+import type { WalReadRow, WalStore } from "../store/wal_store";
 
 type StreamState = {
   nextOffset: bigint;
@@ -235,6 +235,63 @@ export class SqliteWalStore implements WalStore {
     return Result.ok({ results, walBytesCommitted });
   }
 
+  async *readWalRange(stream: string, startOffset: bigint, endOffset: bigint, routingKey?: Uint8Array): AsyncIterable<WalReadRow> {
+    yield* this.iterWalRange(stream, startOffset, endOffset, routingKey);
+  }
+
+  async *readWalRangeDesc(stream: string, startOffset: bigint, endOffset: bigint, routingKey?: Uint8Array): AsyncIterable<WalReadRow> {
+    yield* this.iterWalRangeDesc(stream, startOffset, endOffset, routingKey);
+  }
+
+  *iterWalRange(stream: string, startOffset: bigint, endOffset: bigint, routingKey?: Uint8Array): Generator<WalReadRow, void, void> {
+    yield* this.readWalRows(stream, startOffset, endOffset, "asc", routingKey);
+  }
+
+  *iterWalRangeDesc(stream: string, startOffset: bigint, endOffset: bigint, routingKey?: Uint8Array): Generator<WalReadRow, void, void> {
+    yield* this.readWalRows(stream, startOffset, endOffset, "desc", routingKey);
+  }
+
+  async getWalOldestTimestampMsForRead(stream: string): Promise<bigint | null> {
+    const row = this.db.query(`SELECT MIN(ts_ms) as min_ts FROM wal WHERE stream=?;`).get(stream) as any;
+    if (!row || row.min_ts == null) return null;
+    return toBigInt(row.min_ts);
+  }
+
+  private *readWalRows(
+    stream: string,
+    startOffset: bigint,
+    endOffset: bigint,
+    order: "asc" | "desc",
+    routingKey?: Uint8Array
+  ): Generator<WalReadRow, void, void> {
+    const start = bindSqliteInt(startOffset);
+    const end = bindSqliteInt(endOffset);
+    const sqlOrder = order === "asc" ? "ASC" : "DESC";
+    const stmt = routingKey
+      ? this.db.prepare(
+          `SELECT offset, ts_ms, routing_key, content_type, payload
+           FROM wal
+           WHERE stream = ? AND offset >= ? AND offset <= ? AND routing_key = ?
+           ORDER BY offset ${sqlOrder};`
+        )
+      : this.db.prepare(
+          `SELECT offset, ts_ms, routing_key, content_type, payload
+           FROM wal
+           WHERE stream = ? AND offset >= ? AND offset <= ?
+           ORDER BY offset ${sqlOrder};`
+        );
+    try {
+      const it = routingKey ? (stmt.iterate(stream, start, end, routingKey) as any) : (stmt.iterate(stream, start, end) as any);
+      for (const row of it) yield coerceWalReadRow(row);
+    } finally {
+      try {
+        stmt.finalize?.();
+      } catch {
+        // ignore
+      }
+    }
+  }
+
   private applyCloseOnly(
     task: StoreAppendTask,
     st: StreamState,
@@ -387,4 +444,29 @@ function isSqliteBusy(e: unknown): boolean {
   const code = String(err?.code ?? "");
   const errno = Number(err?.errno ?? -1);
   return code === "SQLITE_BUSY" || code === "SQLITE_BUSY_SNAPSHOT" || errno === 5 || errno === 517;
+}
+
+function bindSqliteInt(value: bigint): number | string {
+  const min = BigInt(Number.MIN_SAFE_INTEGER);
+  const max = BigInt(Number.MAX_SAFE_INTEGER);
+  return value >= min && value <= max ? Number(value) : value.toString();
+}
+
+function toBigInt(value: unknown): bigint {
+  return typeof value === "bigint" ? value : BigInt(value as any);
+}
+
+function toBytes(value: unknown): Uint8Array | null {
+  if (value == null) return null;
+  return value instanceof Uint8Array ? value : new Uint8Array(value as ArrayBuffer);
+}
+
+function coerceWalReadRow(row: any): WalReadRow {
+  return {
+    offset: toBigInt(row.offset),
+    tsMs: toBigInt(row.ts_ms),
+    routingKey: toBytes(row.routing_key),
+    contentType: row.content_type == null ? null : String(row.content_type),
+    payload: toBytes(row.payload) ?? new Uint8Array(),
+  };
 }

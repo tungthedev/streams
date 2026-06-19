@@ -12,7 +12,7 @@ import {
   type StoreAppendResult,
   type StoreAppendTask,
 } from "./store/append";
-import type { WalStore } from "./store/wal_store";
+import type { WalAppendStore } from "./store/wal_store";
 
 export type AppendError = StoreAppendError | { kind: "overloaded" | "internal" };
 export type AppendResult = Result<AppendSuccess, AppendError>;
@@ -33,7 +33,7 @@ type AppendTask = {
 
 export class IngestQueue {
   private readonly cfg: Config;
-  private readonly wal: WalStore;
+  private readonly wal: WalAppendStore;
   private readonly stats?: StatsCollector;
   private readonly gate?: BackpressureGate;
   private readonly metrics?: Metrics;
@@ -45,7 +45,7 @@ export class IngestQueue {
   private flushPromise: Promise<void> | null = null;
   private flushRequested = false;
 
-  constructor(cfg: Config, wal: WalStore, stats?: StatsCollector, gate?: BackpressureGate, metrics?: Metrics) {
+  constructor(cfg: Config, wal: WalAppendStore, stats?: StatsCollector, gate?: BackpressureGate, metrics?: Metrics) {
     this.cfg = cfg;
     this.wal = wal;
     this.stats = stats;

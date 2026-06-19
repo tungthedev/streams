@@ -133,7 +133,7 @@ export function createLocalApp(cfg: Config, os?: ObjectStore, opts: CreateLocalA
     createRuntime: ({ config, db, registry, memorySampler, memory }) => {
       const store = os ?? new NullObjectStore();
       const indexer = new LocalIndexLookup(db);
-      const reader = new StreamReader(config, db, store, registry, undefined, indexer, memorySampler, memory);
+      const reader = new StreamReader(config, db, db, store, registry, undefined, indexer, memorySampler, memory);
 
       return {
         store,

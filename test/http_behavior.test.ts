@@ -1198,7 +1198,7 @@ describe("http behavior", () => {
           return originalFindSegmentForOffset(stream, offset);
         };
 
-        const planned = (app.deps.reader as any).planSealedReadSegments(
+        const planned = await (app.deps.reader as any).planSealedReadSegments(
           "keyed-plan",
           0n,
           39n,
@@ -1208,7 +1208,7 @@ describe("http behavior", () => {
         );
         expect(planned).not.toBeNull();
         expect(planned.segments.map((seg: any) => seg.segment_index)).toEqual([7, ...Array.from({ length: 24 }, (_, i) => i + 16)]);
-        const reversePlanned = (app.deps.reader as any).planSealedReadSegments(
+        const reversePlanned = await (app.deps.reader as any).planSealedReadSegments(
           "keyed-plan",
           0n,
           39n,

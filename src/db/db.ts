@@ -2,7 +2,8 @@ import { initSchema } from "./schema.ts";
 import { openSqliteDatabase, type SqliteDatabase, type SqliteStatement } from "../sqlite/adapter.ts";
 import { Result } from "better-result";
 import type { StoreAppendBatch, StoreAppendTask } from "../store/append";
-import type { WalStore } from "../store/wal_store";
+import type { WalReadRow, WalStore } from "../store/wal_store";
+import type { SegmentReadStore, StreamReadStore } from "../store/segment_read_store";
 import { SqliteWalStore } from "./sqlite_wal_store";
 
 export const STREAM_FLAG_DELETED = 1 << 0;
@@ -159,9 +160,25 @@ export type SearchSegmentCompanionRow = {
   updated_at_ms: bigint;
 };
 
-export class SqliteDurableStore implements WalStore {
+function legacyWalReadRow(row: WalReadRow): {
+  offset: bigint;
+  ts_ms: bigint;
+  routing_key: Uint8Array | null;
+  content_type: string | null;
+  payload: Uint8Array;
+} {
+  return {
+    offset: row.offset,
+    ts_ms: row.tsMs,
+    routing_key: row.routingKey,
+    content_type: row.contentType,
+    payload: row.payload,
+  };
+}
+
+export class SqliteDurableStore implements WalStore, SegmentReadStore, StreamReadStore {
   public readonly db: SqliteDatabase;
-  private readonly walStore: WalStore;
+  private readonly walStore: SqliteWalStore;
   private dbstatReady: boolean | null = null;
 
   // Prepared statements.
@@ -181,11 +198,6 @@ export class SqliteDurableStore implements WalStore {
     candidateStreams: SqliteStatement;
     candidateStreamsNoInterval: SqliteStatement;
     listExpiredStreams: SqliteStatement;
-
-    streamWalRange: SqliteStatement;
-    streamWalRangeByKey: SqliteStatement;
-    streamWalRangeDesc: SqliteStatement;
-    streamWalRangeDescByKey: SqliteStatement;
 
     createSegment: SqliteStatement;
     listSegmentsForStream: SqliteStatement;
@@ -380,31 +392,6 @@ export class SqliteDurableStore implements WalStore {
            AND expires_at_ms <= ?
          ORDER BY expires_at_ms ASC
          LIMIT ?;`
-      ),
-
-      streamWalRange: this.db.query(
-        `SELECT offset, ts_ms, routing_key, content_type, payload
-         FROM wal
-         WHERE stream = ? AND offset >= ? AND offset <= ?
-         ORDER BY offset ASC;`
-      ),
-      streamWalRangeByKey: this.db.query(
-        `SELECT offset, ts_ms, routing_key, content_type, payload
-         FROM wal
-         WHERE stream = ? AND offset >= ? AND offset <= ? AND routing_key = ?
-         ORDER BY offset ASC;`
-      ),
-      streamWalRangeDesc: this.db.query(
-        `SELECT offset, ts_ms, routing_key, content_type, payload
-         FROM wal
-         WHERE stream = ? AND offset >= ? AND offset <= ?
-         ORDER BY offset DESC;`
-      ),
-      streamWalRangeDescByKey: this.db.query(
-        `SELECT offset, ts_ms, routing_key, content_type, payload
-         FROM wal
-         WHERE stream = ? AND offset >= ? AND offset <= ? AND routing_key = ?
-         ORDER BY offset DESC;`
       ),
 
       createSegment: this.db.query(
@@ -1457,67 +1444,67 @@ export class SqliteDurableStore implements WalStore {
     return this.walStore.appendBatch(batch);
   }
 
+  readWalRange(stream: string, startOffset: bigint, endOffset: bigint, routingKey?: Uint8Array) {
+    return this.walStore.readWalRange(stream, startOffset, endOffset, routingKey);
+  }
+
+  readWalRangeDesc(stream: string, startOffset: bigint, endOffset: bigint, routingKey?: Uint8Array) {
+    return this.walStore.readWalRangeDesc(stream, startOffset, endOffset, routingKey);
+  }
+
+  async getWalOldestTimestampMsForRead(stream: string): Promise<bigint | null> {
+    return this.walStore.getWalOldestTimestampMsForRead(stream);
+  }
+
+  async nowMsForRead(): Promise<bigint> {
+    return this.nowMs();
+  }
+
+  async getStreamForRead(stream: string): Promise<StreamRow | null> {
+    return this.getStream(stream);
+  }
+
+  async listSegmentsForRead(stream: string): Promise<SegmentRow[]> {
+    return this.listSegmentsForStream(stream);
+  }
+
+  async getSegmentByIndexForRead(stream: string, segmentIndex: number): Promise<SegmentRow | null> {
+    return this.getSegmentByIndex(stream, segmentIndex);
+  }
+
+  async findSegmentForOffsetForRead(stream: string, offset: bigint): Promise<SegmentRow | null> {
+    return this.findSegmentForOffset(stream, offset);
+  }
+
+  async countSegmentsForRead(stream: string): Promise<number> {
+    return this.countSegmentsForStream(stream);
+  }
+
+  async getSearchCompanionPlanForRead(stream: string): Promise<SearchCompanionPlanRow | null> {
+    return this.getSearchCompanionPlan(stream);
+  }
+
+  async listSearchSegmentCompanionsForRead(stream: string): Promise<SearchSegmentCompanionRow[]> {
+    return this.listSearchSegmentCompanions(stream);
+  }
+
+  async getSearchSegmentCompanionForRead(stream: string, segmentIndex: number): Promise<SearchSegmentCompanionRow | null> {
+    return this.getSearchSegmentCompanion(stream, segmentIndex);
+  }
+
   /**
    * Query WAL rows within a range.
    * Uses iterate() for bounded memory.
    */
   *iterWalRange(stream: string, startOffset: bigint, endOffset: bigint, routingKey?: Uint8Array): Generator<any, void, void> {
-    const start = this.bindInt(startOffset);
-    const end = this.bindInt(endOffset);
-    const stmt = routingKey
-      ? this.db.prepare(
-          `SELECT offset, ts_ms, routing_key, content_type, payload
-           FROM wal
-           WHERE stream = ? AND offset >= ? AND offset <= ? AND routing_key = ?
-           ORDER BY offset ASC;`
-        )
-      : this.db.prepare(
-          `SELECT offset, ts_ms, routing_key, content_type, payload
-           FROM wal
-           WHERE stream = ? AND offset >= ? AND offset <= ?
-           ORDER BY offset ASC;`
-        );
-    try {
-      const it = routingKey ? (stmt.iterate(stream, start, end, routingKey) as any) : (stmt.iterate(stream, start, end) as any);
-      for (const row of it) {
-        yield row;
-      }
-    } finally {
-      try {
-        stmt.finalize?.();
-      } catch {
-        // ignore
-      }
+    for (const row of this.walStore.iterWalRange(stream, startOffset, endOffset, routingKey)) {
+      yield legacyWalReadRow(row);
     }
   }
 
   *iterWalRangeDesc(stream: string, startOffset: bigint, endOffset: bigint, routingKey?: Uint8Array): Generator<any, void, void> {
-    const start = this.bindInt(startOffset);
-    const end = this.bindInt(endOffset);
-    const stmt = routingKey
-      ? this.db.prepare(
-          `SELECT offset, ts_ms, routing_key, content_type, payload
-           FROM wal
-           WHERE stream = ? AND offset >= ? AND offset <= ? AND routing_key = ?
-           ORDER BY offset DESC;`
-        )
-      : this.db.prepare(
-          `SELECT offset, ts_ms, routing_key, content_type, payload
-           FROM wal
-           WHERE stream = ? AND offset >= ? AND offset <= ?
-           ORDER BY offset DESC;`
-        );
-    try {
-      const it = routingKey ? (stmt.iterate(stream, start, end, routingKey) as any) : (stmt.iterate(stream, start, end) as any);
-      for (const row of it) {
-        yield row;
-      }
-    } finally {
-      try {
-        stmt.finalize?.();
-      } catch {
-        // ignore
-      }
+    for (const row of this.walStore.iterWalRangeDesc(stream, startOffset, endOffset, routingKey)) {
+      yield legacyWalReadRow(row);
     }
   }
 

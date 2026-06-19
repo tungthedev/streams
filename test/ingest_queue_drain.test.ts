@@ -8,7 +8,7 @@ import { MockR2Store } from "../src/objectstore/mock_r2";
 import { Result } from "better-result";
 import { IngestQueue } from "../src/ingest";
 import type { StoreAppendBatch, StoreAppendTask } from "../src/store/append";
-import type { WalStore } from "../src/store/wal_store";
+import type { WalAppendStore } from "../src/store/wal_store";
 
 function makeConfig(rootDir: string, overrides: Partial<Config> = {}): Config {
   const base = loadConfig();
@@ -105,7 +105,7 @@ describe("ingest queue drain", () => {
   });
 });
 
-class ControlledWalStore implements WalStore {
+class ControlledWalStore implements WalAppendStore {
   readonly calls: StoreAppendTask[][] = [];
   private pending: Array<(result: StoreAppendBatch) => void> = [];
   private waiters: Array<() => void> = [];

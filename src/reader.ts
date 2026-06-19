@@ -1,6 +1,12 @@
 import type { Config } from "./config";
-import type { SearchSegmentCompanionRow, SqliteDurableStore, SegmentRow } from "./db/db";
 import type { ObjectStore } from "./objectstore/interface";
+import type {
+  SearchSegmentCompanionReadRow as SearchSegmentCompanionRow,
+  SegmentReadRow as SegmentRow,
+  SegmentReadStore,
+  StreamReadStore,
+} from "./store/segment_read_store";
+import type { WalReadStore } from "./store/wal_store";
 import {
   type CompiledReadFilter,
   type ReadFilterColumnClause,
@@ -229,6 +235,7 @@ type PlannedReadSegments = {
 };
 type PlannedReadOrder = "asc" | "desc";
 type PrimaryTimestampTopKSort = Extract<SearchSortSpec, { kind: "field" }>;
+type ReaderStore = StreamReadStore & WalReadStore;
 
 function errorMessage(e: unknown): string {
   return String((e as any)?.message ?? e);
@@ -298,7 +305,8 @@ function loadSegmentFooterBlocksFromSource(seg: SegmentRow, source: SegmentReadS
 
 export class StreamReader {
   private readonly config: Config;
-  private readonly db: SqliteDurableStore;
+  private readonly store: ReaderStore;
+  private readonly segmentReads?: SegmentReadStore;
   private readonly os: ObjectStore;
   private readonly registry: SchemaRegistryStore;
   private readonly diskCache?: SegmentDiskCache;
@@ -309,7 +317,8 @@ export class StreamReader {
 
   constructor(
     config: Config,
-    db: SqliteDurableStore,
+    store: ReaderStore,
+    segmentReads: SegmentReadStore | undefined,
     os: ObjectStore,
     registry: SchemaRegistryStore,
     diskCache?: SegmentDiskCache,
@@ -318,7 +327,8 @@ export class StreamReader {
     memory?: MemoryPressureMonitor
   ) {
     this.config = config;
-    this.db = db;
+    this.store = store;
+    this.segmentReads = segmentReads;
     this.os = os;
     this.registry = registry;
     this.diskCache = diskCache;
@@ -327,19 +337,53 @@ export class StreamReader {
     this.memory = memory;
   }
 
-  private planSealedReadSegments(
+  private listSegmentsForStream(stream: string): Promise<SegmentRow[]> {
+    return this.segmentReads?.listSegmentsForRead(stream) ?? Promise.resolve([]);
+  }
+
+  private getSegmentByIndex(stream: string, segmentIndex: number): Promise<SegmentRow | null> {
+    return this.segmentReads?.getSegmentByIndexForRead(stream, segmentIndex) ?? Promise.resolve(null);
+  }
+
+  private findSegmentForOffset(stream: string, offset: bigint): Promise<SegmentRow | null> {
+    return this.segmentReads?.findSegmentForOffsetForRead(stream, offset) ?? Promise.resolve(null);
+  }
+
+  private countSegmentsForStream(stream: string): Promise<number> {
+    return this.segmentReads?.countSegmentsForRead(stream) ?? Promise.resolve(0);
+  }
+
+  private getSearchCompanionPlan(stream: string) {
+    return this.segmentReads?.getSearchCompanionPlanForRead(stream) ?? Promise.resolve(null);
+  }
+
+  private listSearchSegmentCompanions(stream: string) {
+    return this.segmentReads?.listSearchSegmentCompanionsForRead(stream) ?? Promise.resolve([]);
+  }
+
+  private getSearchSegmentCompanion(stream: string, segmentIndex: number) {
+    return this.segmentReads?.getSearchSegmentCompanionForRead(stream, segmentIndex) ?? Promise.resolve(null);
+  }
+
+  private missingSegmentCapabilityError(srow: { sealed_through: bigint; uploaded_through: bigint }): ReaderError | null {
+    if (this.segmentReads) return null;
+    if (srow.sealed_through < 0n && srow.uploaded_through < 0n) return null;
+    return { kind: "internal", message: "segment read capability required for sealed stream data" };
+  }
+
+  private async planSealedReadSegments(
     stream: string,
     startSeq: bigint,
     sealedEndSeq: bigint,
     candidateSegments: Set<number> | null,
     indexedThrough: number,
     order: PlannedReadOrder = "asc"
-  ): PlannedReadSegments | null {
+  ): Promise<PlannedReadSegments | null> {
     if (startSeq > sealedEndSeq) return { segments: [], sealedEndSeq };
     if (candidateSegments == null) return null;
 
-    const startSeg = this.db.findSegmentForOffset(stream, startSeq);
-    const endSeg = this.db.findSegmentForOffset(stream, sealedEndSeq);
+    const startSeg = await this.findSegmentForOffset(stream, startSeq);
+    const endSeg = await this.findSegmentForOffset(stream, sealedEndSeq);
     if (!startSeg || !endSeg) return null;
 
     const startIndex = startSeg.segment_index;
@@ -386,33 +430,33 @@ export class StreamReader {
 
     const plannedSegments: SegmentRow[] = [];
     for (const segmentIndex of plannedIndexes) {
-      const seg = this.db.getSegmentByIndex(stream, segmentIndex);
+      const seg = await this.getSegmentByIndex(stream, segmentIndex);
       if (!seg) return null;
       plannedSegments.push(seg);
     }
     return { segments: plannedSegments, sealedEndSeq };
   }
 
-  private planAllSealedReadSegments(
+  private async planAllSealedReadSegments(
     stream: string,
     startSeq: bigint,
     sealedEndSeq: bigint,
     order: PlannedReadOrder = "asc"
-  ): PlannedReadSegments | null {
+  ): Promise<PlannedReadSegments | null> {
     if (startSeq > sealedEndSeq) return { segments: [], sealedEndSeq };
-    const startSeg = this.db.findSegmentForOffset(stream, startSeq);
-    const endSeg = this.db.findSegmentForOffset(stream, sealedEndSeq);
+    const startSeg = await this.findSegmentForOffset(stream, startSeq);
+    const endSeg = await this.findSegmentForOffset(stream, sealedEndSeq);
     if (!startSeg || !endSeg) return null;
     const plannedSegments: SegmentRow[] = [];
     if (order === "asc") {
       for (let segmentIndex = startSeg.segment_index; segmentIndex <= endSeg.segment_index; segmentIndex++) {
-        const seg = this.db.getSegmentByIndex(stream, segmentIndex);
+        const seg = await this.getSegmentByIndex(stream, segmentIndex);
         if (!seg) return null;
         plannedSegments.push(seg);
       }
     } else {
       for (let segmentIndex = endSeg.segment_index; segmentIndex >= startSeg.segment_index; segmentIndex--) {
-        const seg = this.db.getSegmentByIndex(stream, segmentIndex);
+        const seg = await this.getSegmentByIndex(stream, segmentIndex);
         if (!seg) return null;
         plannedSegments.push(seg);
       }
@@ -420,10 +464,10 @@ export class StreamReader {
     return { segments: plannedSegments, sealedEndSeq };
   }
 
-  private currentSearchCompanionRowsBySegment(stream: string, registry: SchemaRegistry): Map<number, SearchSegmentCompanionRow> {
+  private async currentSearchCompanionRowsBySegment(stream: string, registry: SchemaRegistry): Promise<Map<number, SearchSegmentCompanionRow>> {
     const desiredPlan = buildDesiredSearchCompanionPlan(registry);
     const desiredHash = hashSearchCompanionPlan(desiredPlan);
-    const companionPlanRow = this.db.getSearchCompanionPlan(stream);
+    const companionPlanRow = await this.getSearchCompanionPlan(stream);
     const desiredGeneration =
       companionPlanRow == null
         ? 1
@@ -431,7 +475,7 @@ export class StreamReader {
           ? companionPlanRow.generation
           : companionPlanRow.generation + 1;
     const rowsBySegment = new Map<number, SearchSegmentCompanionRow>();
-    for (const row of this.db.listSearchSegmentCompanions(stream)) {
+    for (const row of await this.listSearchSegmentCompanions(stream)) {
       if (row.plan_generation === desiredGeneration) rowsBySegment.set(row.segment_index, row);
     }
     return rowsBySegment;
@@ -457,44 +501,44 @@ export class StreamReader {
     return new Date(ms).toISOString();
   }
 
-  private shouldSearchWalTail(
+  private async shouldSearchWalTail(
     srow: { pending_rows: bigint; pending_bytes: bigint; last_append_ms: bigint; segment_in_progress: number },
     hasOutstandingPublishedSegments: boolean,
     hasOutstandingCompanions: boolean
-  ): boolean {
+  ): Promise<boolean> {
     if (srow.pending_rows <= 0n) return false;
     if (hasOutstandingPublishedSegments || hasOutstandingCompanions) return false;
     if (srow.segment_in_progress !== 0) return false;
     const quietPeriodMs = Math.max(0, this.config.searchWalOverlayQuietPeriodMs);
-    const quietForMs = Number(this.db.nowMs() - srow.last_append_ms);
+    const quietForMs = Number(await this.store.nowMsForRead() - srow.last_append_ms);
     if (!Number.isFinite(quietForMs) || quietForMs < quietPeriodMs) return false;
     if (srow.pending_bytes > BigInt(this.config.searchWalOverlayMaxBytes)) return false;
     if (srow.pending_rows > BigInt(this.config.segmentTargetRows)) return false;
     return true;
   }
 
-  private computeOldestOmittedAppendAt(
+  private async computeOldestOmittedAppendAt(
     stream: string,
     srow: { uploaded_through: bigint; sealed_through: bigint; pending_rows: bigint },
     visiblePublishedSegmentCount: number,
     publishedSegmentCount: number,
     shouldSearchWalTail: boolean
-  ): string | null {
+  ): Promise<string | null> {
     if (visiblePublishedSegmentCount < publishedSegmentCount) {
-      const firstOmittedSegment = this.db.getSegmentByIndex(stream, visiblePublishedSegmentCount);
+      const firstOmittedSegment = await this.getSegmentByIndex(stream, visiblePublishedSegmentCount);
       return this.isoTimestampFromMs(firstOmittedSegment?.last_append_ms ?? null);
     }
     if (srow.sealed_through > srow.uploaded_through) {
-      const firstSealedOmitted = this.db.findSegmentForOffset(stream, srow.uploaded_through + 1n);
+      const firstSealedOmitted = await this.findSegmentForOffset(stream, srow.uploaded_through + 1n);
       return this.isoTimestampFromMs(firstSealedOmitted?.last_append_ms ?? null);
     }
     if (srow.pending_rows > 0n && !shouldSearchWalTail) {
-      return this.isoTimestampFromMs(this.db.getWalOldestTimestampMs(stream));
+      return this.isoTimestampFromMs(await this.store.getWalOldestTimestampMsForRead(stream));
     }
     return null;
   }
 
-  private computePublishedCoverageState(
+  private async computePublishedCoverageState(
     stream: string,
     srow: {
       epoch: number;
@@ -507,11 +551,11 @@ export class StreamReader {
       segment_in_progress: number;
     },
     registry: { search?: { fields: Record<string, unknown> } }
-  ): PublishedCoverageState {
-    const totalSegmentCount = this.db.countSegmentsForStream(stream);
+  ): Promise<PublishedCoverageState> {
+    const totalSegmentCount = await this.countSegmentsForStream(stream);
     const publishedSegmentCount =
       srow.uploaded_through >= 0n
-        ? ((this.db.findSegmentForOffset(stream, srow.uploaded_through)?.segment_index ?? -1) + 1)
+        ? (((await this.findSegmentForOffset(stream, srow.uploaded_through))?.segment_index ?? -1) + 1)
         : 0;
 
     const desiredPlan = buildDesiredSearchCompanionPlan(registry as any);
@@ -520,16 +564,16 @@ export class StreamReader {
     let visibleThroughPrimaryTimestampMax: string | null = null;
     if (planHasFamilies) {
       const desiredHash = hashSearchCompanionPlan(desiredPlan);
-      const companionPlanRow = this.db.getSearchCompanionPlan(stream);
+      const companionPlanRow = await this.getSearchCompanionPlan(stream);
       const desiredGeneration =
         companionPlanRow == null
           ? 1
           : companionPlanRow.plan_hash === desiredHash
             ? companionPlanRow.generation
             : companionPlanRow.generation + 1;
-      const currentCompanions = this.db
-        .listSearchSegmentCompanions(stream)
-        .filter((row) => row.plan_generation === desiredGeneration);
+      const currentCompanions = (await this.listSearchSegmentCompanions(stream)).filter(
+        (row) => row.plan_generation === desiredGeneration
+      );
       const currentSegments = new Set<number>();
       for (const row of currentCompanions) {
         const sections = parseCompanionSections(row.sections_json);
@@ -548,13 +592,13 @@ export class StreamReader {
 
     const hasOutstandingPublishedSegments = publishedSegmentCount < totalSegmentCount;
     const hasOutstandingCompanions = planHasFamilies && visiblePublishedSegmentCount < publishedSegmentCount;
-    const canSearchWalTail = this.shouldSearchWalTail(srow, hasOutstandingPublishedSegments, hasOutstandingCompanions);
+    const canSearchWalTail = await this.shouldSearchWalTail(srow, hasOutstandingPublishedSegments, hasOutstandingCompanions);
     const omitWalTail = srow.pending_rows > 0n && !canSearchWalTail;
 
     let visibleThroughSeq = srow.next_offset - 1n;
     if (hasOutstandingPublishedSegments || hasOutstandingCompanions || omitWalTail) {
       if (visiblePublishedSegmentCount > 0) {
-        visibleThroughSeq = this.db.getSegmentByIndex(stream, visiblePublishedSegmentCount - 1)?.end_offset ?? -1n;
+        visibleThroughSeq = (await this.getSegmentByIndex(stream, visiblePublishedSegmentCount - 1))?.end_offset ?? -1n;
       } else {
         visibleThroughSeq = -1n;
       }
@@ -567,7 +611,7 @@ export class StreamReader {
     const possibleMissingWalRows = omitWalTail ? Number(srow.pending_rows) : 0;
     const possibleMissingEventsUpperBound = possibleMissingUploadedRows + possibleMissingSealedRows + possibleMissingWalRows;
     const streamHeadOffset = encodeOffset(srow.epoch, srow.next_offset - 1n);
-    const oldestOmittedAppendAt = this.computeOldestOmittedAppendAt(
+    const oldestOmittedAppendAt = await this.computeOldestOmittedAppendAt(
       stream,
       srow,
       visiblePublishedSegmentCount,
@@ -594,16 +638,18 @@ export class StreamReader {
   }
 
   async seekOffsetByTimestampResult(stream: string, sinceMs: bigint, key: string | null): Promise<Result<string, ReaderError>> {
-    const srow = this.db.getStream(stream);
-    if (!srow || this.db.isDeleted(srow)) return Result.err({ kind: "not_found", message: "not_found" });
-    if (srow.expires_at_ms != null && this.db.nowMs() > srow.expires_at_ms) {
+    const srow = await this.store.getStreamForRead(stream);
+    if (!srow || this.store.isDeleted(srow)) return Result.err({ kind: "not_found", message: "not_found" });
+    if (srow.expires_at_ms != null && await this.store.nowMsForRead() > srow.expires_at_ms) {
       return Result.err({ kind: "gone", message: "stream expired" });
     }
+    const segmentCapabilityError = this.missingSegmentCapabilityError(srow);
+    if (segmentCapabilityError) return Result.err(segmentCapabilityError);
     try {
       const sinceNs = sinceMs * 1_000_000n;
       const keyBytes = key ? utf8Bytes(key) : null;
       const candidateInfo = await this.resolveCandidateSegments(stream, keyBytes, null);
-      const plannedSealedSegments = this.planSealedReadSegments(
+      const plannedSealedSegments = await this.planSealedReadSegments(
         stream,
         0n,
         srow.sealed_through,
@@ -612,7 +658,7 @@ export class StreamReader {
         "asc"
       );
 
-      for (const seg of plannedSealedSegments?.segments ?? this.db.listSegmentsForStream(stream)) {
+      for (const seg of plannedSealedSegments?.segments ?? await this.listSegmentsForStream(stream)) {
         const segBytes = await loadSegmentBytes(this.os, seg, this.diskCache, this.retryOpts());
         let curOffset = seg.start_offset;
         for (const blockRes of iterateBlocksResult(segBytes)) {
@@ -640,10 +686,10 @@ export class StreamReader {
       const start = srow.sealed_through + 1n;
       const end = srow.next_offset - 1n;
       if (start <= end) {
-        for (const rec of this.db.iterWalRange(stream, start, end, keyBytes ?? undefined)) {
-          const tsNs = BigInt(rec.ts_ms) * 1_000_000n;
+        for await (const rec of this.store.readWalRange(stream, start, end, keyBytes ?? undefined)) {
+          const tsNs = rec.tsMs * 1_000_000n;
           if (tsNs >= sinceNs) {
-            const off = BigInt(rec.offset) - 1n;
+            const off = rec.offset - 1n;
             return Result.ok(encodeOffset(srow.epoch, off));
           }
         }
@@ -670,11 +716,13 @@ export class StreamReader {
     filter?: CompiledReadFilter | null;
   }): Promise<Result<ReadBatch, ReaderError>> {
     const { stream, offset, key, format, filter = null } = args;
-    const srow = this.db.getStream(stream);
-    if (!srow || this.db.isDeleted(srow)) return Result.err({ kind: "not_found", message: "not_found" });
-    if (srow.expires_at_ms != null && this.db.nowMs() > srow.expires_at_ms) {
+    const srow = await this.store.getStreamForRead(stream);
+    if (!srow || this.store.isDeleted(srow)) return Result.err({ kind: "not_found", message: "not_found" });
+    if (srow.expires_at_ms != null && await this.store.nowMsForRead() > srow.expires_at_ms) {
       return Result.err({ kind: "gone", message: "stream expired" });
     }
+    const segmentCapabilityError = this.missingSegmentCapabilityError(srow);
+    if (segmentCapabilityError) return Result.err(segmentCapabilityError);
     const epoch = srow.epoch;
 
     try {
@@ -982,7 +1030,7 @@ export class StreamReader {
       };
 
       const sealedEndSeq = endOffsetNum < srow.sealed_through ? endOffsetNum : srow.sealed_through;
-      const plannedSealedSegments = this.planSealedReadSegments(
+      const plannedSealedSegments = await this.planSealedReadSegments(
         stream,
         seq,
         sealedEndSeq,
@@ -1029,7 +1077,7 @@ export class StreamReader {
         }
       } else {
         while (seq <= endOffsetNum && seq <= srow.sealed_through) {
-          const seg = this.db.findSegmentForOffset(stream, seq);
+          const seg = await this.findSegmentForOffset(stream, seq);
           if (!seg) {
             // Corruption in local metadata: sealed_through points past segments table.
             break;
@@ -1073,16 +1121,10 @@ export class StreamReader {
       // 2) Read remaining from WAL tail.
       if (seq <= endOffsetNum) {
         let hitLimit = false;
-        for (const rec of this.db.iterWalRange(stream, seq, endOffsetNum, keyBytes ?? undefined)) {
-          const s = BigInt(rec.offset);
+        for await (const rec of this.store.readWalRange(stream, seq, endOffsetNum, keyBytes ?? undefined)) {
+          const s = rec.offset;
           const payload: Uint8Array = rec.payload;
-          const routingKey =
-            rec.routing_key == null
-              ? null
-              : rec.routing_key instanceof Uint8Array
-                ? rec.routing_key
-                : new Uint8Array(rec.routing_key);
-          const matchRes = evaluateRecordResult(s, routingKey, payload);
+          const matchRes = evaluateRecordResult(s, rec.routingKey, payload);
           if (Result.isError(matchRes)) return matchRes;
           if (matchRes.value.matched) {
             results.push({ offset: s, payload });
@@ -1164,12 +1206,14 @@ export class StreamReader {
       has_query: request.q != null,
       over_limit: this.memory?.isOverLimit() === true,
     });
-    const srow = this.db.getStream(stream);
+    const srow = await this.store.getStreamForRead(stream);
     try {
-      if (!srow || this.db.isDeleted(srow)) return Result.err({ kind: "not_found", message: "not_found" });
-      if (srow.expires_at_ms != null && this.db.nowMs() > srow.expires_at_ms) {
+      if (!srow || this.store.isDeleted(srow)) return Result.err({ kind: "not_found", message: "not_found" });
+      if (srow.expires_at_ms != null && await this.store.nowMsForRead() > srow.expires_at_ms) {
         return Result.err({ kind: "gone", message: "stream expired" });
       }
+      const segmentCapabilityError = this.missingSegmentCapabilityError(srow);
+      if (segmentCapabilityError) return Result.err(segmentCapabilityError);
 
       const regRes = this.registry.getRegistryResult(stream);
       if (Result.isError(regRes)) return Result.err({ kind: "internal", message: regRes.error.message });
@@ -1178,7 +1222,7 @@ export class StreamReader {
 
       const snapshotEndSeq = srow.next_offset - 1n;
       const snapshotEndOffset = encodeOffset(srow.epoch, snapshotEndSeq);
-      const coverageState = this.computePublishedCoverageState(stream, srow, registry);
+      const coverageState = await this.computePublishedCoverageState(stream, srow, registry);
       const visibleSnapshotEndSeq = coverageState.canSearchWalTail
         ? snapshotEndSeq
         : (coverageState.visibleThroughSeq < snapshotEndSeq ? coverageState.visibleThroughSeq : snapshotEndSeq);
@@ -1192,7 +1236,7 @@ export class StreamReader {
       const cursorFieldBound = resolveSearchCursorFieldBound(request);
       const primaryTimestampTopKSort = resolvePrimaryTimestampTopKSort(registry, request);
       const primaryTimestampRowsBySegment =
-        primaryTimestampTopKSort && request.size > 0 ? this.currentSearchCompanionRowsBySegment(stream, registry) : null;
+        primaryTimestampTopKSort && request.size > 0 ? await this.currentSearchCompanionRowsBySegment(stream, registry) : null;
 
       const hits: SearchHitInternal[] = [];
       let timedOut = false;
@@ -1381,21 +1425,21 @@ export class StreamReader {
       };
 
       const stopIfPageComplete = (): boolean => hits.length >= request.size;
-      const scanWalTailResult = (
+      const scanWalTailResult = async (
         startSeq: bigint,
         endSeq: bigint,
         direction: "asc" | "desc",
         stopOnPageComplete: boolean
-      ): Result<void, ReaderError> => {
+      ): Promise<Result<void, ReaderError>> => {
         const tailStartedAt = Date.now();
-        const hotOffsetsRes = this.hotWalExactOffsetsResult(stream, startSeq, endSeq, exactClauses, registry);
+        const hotOffsetsRes = await this.hotWalExactOffsetsResult(stream, startSeq, endSeq, exactClauses, registry);
         if (Result.isError(hotOffsetsRes)) return hotOffsetsRes;
         const hotOffsets = hotOffsetsRes.value;
         if (hotOffsets) {
           candidateDocIds += hotOffsets.length;
           const orderedOffsets = direction === "desc" ? [...hotOffsets].reverse() : hotOffsets;
           for (const offsetSeq of orderedOffsets) {
-            const record = this.walRecordAt(stream, offsetSeq);
+            const record = await this.walRecordAt(stream, offsetSeq);
             if (!record) continue;
             scannedTailDocs += 1;
             const matchRes = collectSearchMatchResult(record.offset, record.payload);
@@ -1409,11 +1453,11 @@ export class StreamReader {
 
         const rows =
           direction === "desc"
-            ? this.db.iterWalRangeDesc(stream, startSeq, endSeq)
-            : this.db.iterWalRange(stream, startSeq, endSeq);
-        for (const record of rows) {
+            ? this.store.readWalRangeDesc(stream, startSeq, endSeq)
+            : this.store.readWalRange(stream, startSeq, endSeq);
+        for await (const record of rows) {
           scannedTailDocs += 1;
-          const matchRes = collectSearchMatchResult(BigInt(record.offset), record.payload);
+          const matchRes = collectSearchMatchResult(record.offset, record.payload);
           if (Result.isError(matchRes)) return matchRes;
           if (markTimedOutIfNeeded()) break;
           if (stopOnPageComplete && stopIfPageComplete()) break;
@@ -1435,14 +1479,14 @@ export class StreamReader {
               const walStart = rangeStartSeq > tailStart ? rangeStartSeq : tailStart;
               const walEnd = rangeEndSeq;
               if (walStart <= walEnd) {
-                const tailRes = scanWalTailResult(walStart, walEnd, "desc", true);
+                const tailRes = await scanWalTailResult(walStart, walEnd, "desc", true);
                 if (Result.isError(tailRes)) return tailRes;
               }
             }
             if (!timedOut && !stopIfPageComplete()) {
               const sealedEnd = rangeEndSeq < visibleSealedThrough ? rangeEndSeq : visibleSealedThrough;
               if (sealedEnd >= rangeStartSeq) {
-                const plannedSealedSegments = this.planSealedReadSegments(
+                const plannedSealedSegments = await this.planSealedReadSegments(
                   stream,
                   rangeStartSeq,
                   sealedEnd,
@@ -1507,10 +1551,10 @@ export class StreamReader {
                     if (timedOut || stopIfPageComplete()) break;
                   }
                 } else {
-                  const startSeg = this.db.findSegmentForOffset(stream, sealedEnd);
-                  let segmentIndex = startSeg?.segment_index ?? this.db.countSegmentsForStream(stream) - 1;
+                  const startSeg = await this.findSegmentForOffset(stream, sealedEnd);
+                  let segmentIndex = startSeg?.segment_index ?? await this.countSegmentsForStream(stream) - 1;
                   while (segmentIndex >= 0) {
-                    const seg = this.db.getSegmentByIndex(stream, segmentIndex);
+                    const seg = await this.getSegmentByIndex(stream, segmentIndex);
                     if (!seg) {
                       segmentIndex -= 1;
                       continue;
@@ -1581,7 +1625,7 @@ export class StreamReader {
           } else {
             let seq = rangeStartSeq;
             const sealedEnd = rangeEndSeq < visibleSealedThrough ? rangeEndSeq : visibleSealedThrough;
-            const plannedSealedSegments = this.planSealedReadSegments(
+            const plannedSealedSegments = await this.planSealedReadSegments(
               stream,
               rangeStartSeq,
               sealedEnd,
@@ -1599,7 +1643,7 @@ export class StreamReader {
               if (seq <= plannedSealedSegments.sealedEndSeq) seq = plannedSealedSegments.sealedEndSeq + 1n;
             } else {
               while (seq <= rangeEndSeq && seq <= visibleSealedThrough) {
-                const seg = this.db.findSegmentForOffset(stream, seq);
+                const seg = await this.findSegmentForOffset(stream, seq);
                 if (!seg) break;
                 const scanRes = await scanSegmentWithFamiliesResult(seg, rangeStartSeq, rangeEndSeq);
                 if (Result.isError(scanRes)) return scanRes;
@@ -1608,7 +1652,7 @@ export class StreamReader {
               }
             }
             if (!timedOut && !stopIfPageComplete() && coverageState.canSearchWalTail && seq <= rangeEndSeq) {
-              const tailRes = scanWalTailResult(seq, rangeEndSeq, "asc", true);
+              const tailRes = await scanWalTailResult(seq, rangeEndSeq, "asc", true);
               if (Result.isError(tailRes)) return tailRes;
             }
           }
@@ -1669,7 +1713,7 @@ export class StreamReader {
 
       let seq = 0n;
       const sealedEnd = visibleSnapshotEndSeq < visibleSealedThrough ? visibleSnapshotEndSeq : visibleSealedThrough;
-      const plannedSealedSegments = this.planSealedReadSegments(
+      const plannedSealedSegments = await this.planSealedReadSegments(
         stream,
         0n,
         sealedEnd,
@@ -1678,7 +1722,7 @@ export class StreamReader {
         "asc"
       );
       const allSealedSegments =
-        primaryTimestampTopKSort && !plannedSealedSegments ? this.planAllSealedReadSegments(stream, 0n, sealedEnd, "asc") : null;
+        primaryTimestampTopKSort && !plannedSealedSegments ? await this.planAllSealedReadSegments(stream, 0n, sealedEnd, "asc") : null;
       const sealedSegmentPlan = plannedSealedSegments ?? allSealedSegments;
       if (sealedSegmentPlan) {
         const sealedSegments =
@@ -1695,7 +1739,7 @@ export class StreamReader {
         if (seq <= sealedSegmentPlan.sealedEndSeq) seq = sealedSegmentPlan.sealedEndSeq + 1n;
       } else {
         while (seq <= visibleSnapshotEndSeq && seq <= visibleSealedThrough) {
-          const seg = this.db.findSegmentForOffset(stream, seq);
+          const seg = await this.findSegmentForOffset(stream, seq);
           if (!seg) break;
           if (!primaryTimestampSegmentMayBeatTopK(seg)) break;
           const scanRes = await scanSegmentWithFamiliesResult(seg, 0n, snapshotEndSeq);
@@ -1706,7 +1750,7 @@ export class StreamReader {
       }
 
       if (!timedOut && coverageState.canSearchWalTail && seq <= snapshotEndSeq) {
-        const tailRes = scanWalTailResult(seq, snapshotEndSeq, "asc", false);
+        const tailRes = await scanWalTailResult(seq, snapshotEndSeq, "asc", false);
         if (Result.isError(tailRes)) return tailRes;
       }
 
@@ -1785,12 +1829,14 @@ export class StreamReader {
       rollup: request.rollup,
       over_limit: this.memory?.isOverLimit() === true,
     });
-    const srow = this.db.getStream(stream);
+    const srow = await this.store.getStreamForRead(stream);
     try {
-      if (!srow || this.db.isDeleted(srow)) return Result.err({ kind: "not_found", message: "not_found" });
-      if (srow.expires_at_ms != null && this.db.nowMs() > srow.expires_at_ms) {
+      if (!srow || this.store.isDeleted(srow)) return Result.err({ kind: "not_found", message: "not_found" });
+      if (srow.expires_at_ms != null && await this.store.nowMsForRead() > srow.expires_at_ms) {
         return Result.err({ kind: "gone", message: "stream expired" });
       }
+      const segmentCapabilityError = this.missingSegmentCapabilityError(srow);
+      if (segmentCapabilityError) return Result.err(segmentCapabilityError);
 
       const regRes = this.registry.getRegistryResult(stream);
       if (Result.isError(regRes)) return Result.err({ kind: "internal", message: regRes.error.message });
@@ -1800,7 +1846,7 @@ export class StreamReader {
         return Result.err({ kind: "internal", message: "rollup is not configured for this stream" });
       }
 
-      const coverageState = this.computePublishedCoverageState(stream, srow, registry);
+      const coverageState = await this.computePublishedCoverageState(stream, srow, registry);
       const intervalMs = request.intervalMs;
       const intervalBig = BigInt(intervalMs);
       const fromMs = Number(request.fromMs);
@@ -1909,7 +1955,7 @@ export class StreamReader {
         endMs: number
       ): Promise<boolean> => {
         if (usesPrimaryTimestampBounds) {
-          const companionRow = this.db.getSearchSegmentCompanion(stream, seg.segment_index);
+          const companionRow = await this.getSearchSegmentCompanion(stream, seg.segment_index);
           if (companionRow?.primary_timestamp_min_ms != null && companionRow.primary_timestamp_max_ms != null) {
             return companionRow.primary_timestamp_max_ms >= BigInt(startMs) && companionRow.primary_timestamp_min_ms < BigInt(endMs);
           }
@@ -1945,7 +1991,7 @@ export class StreamReader {
         return Result.ok(undefined);
       };
 
-      for (const seg of this.db.listSegmentsForStream(stream)) {
+      for (const seg of await this.listSegmentsForStream(stream)) {
         if (seg.segment_index >= coverageState.visiblePublishedSegmentCount) break;
         let coveredAlignedWindows = false;
         if (eligibility.eligible && this.index && hasFullWindows) {
@@ -1998,16 +2044,16 @@ export class StreamReader {
       const tailStart = srow.sealed_through + 1n;
       const tailEnd = srow.next_offset - 1n;
       if (coverageState.canSearchWalTail && tailStart <= tailEnd) {
-        for (const record of this.db.iterWalRange(stream, tailStart, tailEnd)) {
+        for await (const record of this.store.readWalRange(stream, tailStart, tailEnd)) {
           scannedTailDocs += 1;
-          const parsedRes = decodeJsonPayloadResult(this.registry, stream, BigInt(record.offset), record.payload);
+          const parsedRes = decodeJsonPayloadResult(this.registry, stream, record.offset, record.payload);
           if (Result.isError(parsedRes)) return Result.err({ kind: "internal", message: parsedRes.error.message });
-          const contributionRes = extractRollupContributionResult(registry, rollup, BigInt(record.offset), parsedRes.value);
+          const contributionRes = extractRollupContributionResult(registry, rollup, record.offset, parsedRes.value);
           if (Result.isError(contributionRes)) return Result.err({ kind: "internal", message: contributionRes.error.message });
           const contribution = contributionRes.value;
           if (!contribution || contribution.timestampMs < fromMs || contribution.timestampMs >= toMs) continue;
           if (request.q) {
-            const evalRes = evaluateSearchQueryResult(registry, BigInt(record.offset), request.q, parsedRes.value);
+            const evalRes = evaluateSearchQueryResult(registry, record.offset, request.q, parsedRes.value);
             if (Result.isError(evalRes)) return Result.err({ kind: "internal", message: evalRes.error.message });
             if (!evalRes.value.matched) continue;
           }
@@ -2352,12 +2398,12 @@ export class StreamReader {
     return `${registry.currentVersion}:${JSON.stringify(registry.search ?? null)}`;
   }
 
-  private buildHotWalExactCacheResult(
+  private async buildHotWalExactCacheResult(
     stream: string,
     startSeq: bigint,
     endSeq: bigint,
     registry: SchemaRegistry
-  ): Result<HotWalExactCache, ReaderError> {
+  ): Promise<Result<HotWalExactCache, ReaderError>> {
     const schemaKey = this.searchSchemaKey(registry);
     const cached = this.hotWalExact.get(stream);
     if (cached && cached.startSeq === startSeq && cached.endSeq === endSeq && cached.schemaKey === schemaKey) {
@@ -2366,8 +2412,8 @@ export class StreamReader {
 
     const values = new Map<string, Map<string, bigint[]>>();
     if (startSeq <= endSeq) {
-      for (const record of this.db.iterWalRange(stream, startSeq, endSeq)) {
-        const offsetSeq = BigInt(record.offset);
+      for await (const record of this.store.readWalRange(stream, startSeq, endSeq)) {
+        const offsetSeq = record.offset;
         const parsedRes = decodeJsonPayloadResult(this.registry, stream, offsetSeq, record.payload);
         if (Result.isError(parsedRes)) return Result.err({ kind: "internal", message: parsedRes.error.message });
         const docRes = buildSearchDocumentResult(registry, offsetSeq, parsedRes.value);
@@ -2395,15 +2441,15 @@ export class StreamReader {
     return Result.ok(next);
   }
 
-  private hotWalExactOffsetsResult(
+  private async hotWalExactOffsetsResult(
     stream: string,
     startSeq: bigint,
     endSeq: bigint,
     clauses: SearchExactClause[],
     registry: SchemaRegistry
-  ): Result<bigint[] | null, ReaderError> {
+  ): Promise<Result<bigint[] | null, ReaderError>> {
     if (clauses.length === 0 || startSeq > endSeq) return Result.ok(null);
-    const cacheRes = this.buildHotWalExactCacheResult(stream, startSeq, endSeq, registry);
+    const cacheRes = await this.buildHotWalExactCacheResult(stream, startSeq, endSeq, registry);
     if (Result.isError(cacheRes)) return cacheRes;
 
     const postings = clauses.map((clause) => cacheRes.value.values.get(clause.field)?.get(clause.canonicalValue) ?? []);
@@ -2414,9 +2460,9 @@ export class StreamReader {
     return Result.ok(smallest!.filter((offset) => restSets.every((set) => set.has(offset))));
   }
 
-  private walRecordAt(stream: string, offsetSeq: bigint): { offset: bigint; payload: Uint8Array } | null {
-    for (const record of this.db.iterWalRange(stream, offsetSeq, offsetSeq)) {
-      return { offset: BigInt(record.offset), payload: record.payload };
+  private async walRecordAt(stream: string, offsetSeq: bigint): Promise<{ offset: bigint; payload: Uint8Array } | null> {
+    for await (const record of this.store.readWalRange(stream, offsetSeq, offsetSeq)) {
+      return { offset: record.offset, payload: record.payload };
     }
     return null;
   }
