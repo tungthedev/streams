@@ -5,8 +5,11 @@ protocol.
 
 It provides:
 
-- full server modes with SQLite or Postgres WAL/control-plane storage,
-  segmenting, upload, and index maintenance
+- SQLite and Postgres full server modes with WAL/control-plane storage,
+  segmenting, upload, manifest publication, search, aggregate, touch/live, and
+  index maintenance
+- a Postgres WAL/control-plane mode for deployments that only need durable
+  append/read/tail behavior without object-store publication
 - a trusted local mode for Prisma development workflows
 - a stream profile model that cleanly separates durable storage semantics from
   payload structure
@@ -14,6 +17,48 @@ It provides:
 The canonical documentation index is [docs/index.md](./docs/index.md). The
 dedicated stream profile reference is
 [docs/stream-profiles.md](./docs/stream-profiles.md).
+
+## Server Modes
+
+Prisma Streams supports four runtime modes:
+
+- SQLite full mode: the default self-hosted full server
+- SQLite local mode: embedded single-SQLite local development server
+- Postgres WAL mode: Postgres-backed WAL/control-plane server
+- Postgres full mode: Postgres-backed full-mode metadata with object-store
+  artifacts
+
+SQLite full mode:
+
+```bash
+bun run src/server.ts --object-store local --no-auth
+```
+
+Postgres WAL mode:
+
+```bash
+DS_STORAGE=postgres \
+DS_POSTGRES_URL=postgres://user:pass@host:5432/database \
+bun run src/server.ts --no-auth
+```
+
+Postgres full mode:
+
+```bash
+DS_STORAGE=postgres \
+DS_POSTGRES_MODE=full \
+DS_POSTGRES_URL=postgres://user:pass@host:5432/database \
+bun run src/server.ts --object-store local --no-auth
+```
+
+Postgres WAL mode is the default when `DS_STORAGE=postgres`. It rejects
+`--object-store` and `--bootstrap-from-r2`. Postgres full mode requires
+`DS_POSTGRES_MODE=full` and `--object-store local|r2`; it supports segmenting,
+manifests, search, aggregate, touch/live, metrics, built-in profile side
+effects, and object-store recovery with `--bootstrap-from-r2`.
+
+Use [docs/postgres-store.md](./docs/postgres-store.md) for the full Postgres
+mode matrix and verification commands.
 
 ## Example Implementations
 
@@ -75,6 +120,11 @@ The package Compute entrypoint injects `--object-store r2`, and injects
 `--auto-tune` when `DS_MEMORY_LIMIT_MB` is set. It does not inject auth; keep
 the explicit `--auth-strategy api-key` in your app entrypoint and send requests
 with `Authorization: Bearer $API_KEY`.
+
+The `r2` object-store implementation uses S3 SigV4 requests and can target an
+S3-compatible endpoint by setting `DURABLE_STREAMS_R2_ENDPOINT` and
+`DURABLE_STREAMS_R2_REGION`. For AWS S3, use `--object-store r2` with the S3
+regional endpoint and region; the current implementation uses path-style URLs.
 
 ## Core Model
 
@@ -435,6 +485,13 @@ DS_POSTGRES_URL=postgres://user:pass@host:5432/database \
 bun run src/server.ts --object-store r2 --bootstrap-from-r2 --no-auth
 ```
 
+For R2-backed or S3-compatible object storage, configure
+`DURABLE_STREAMS_R2_BUCKET`, `DURABLE_STREAMS_R2_ACCOUNT_ID`,
+`DURABLE_STREAMS_R2_ACCESS_KEY_ID`, and
+`DURABLE_STREAMS_R2_SECRET_ACCESS_KEY`. Set `DURABLE_STREAMS_R2_ENDPOINT` and
+`DURABLE_STREAMS_R2_REGION` when targeting AWS S3, MinIO, or another
+S3-compatible service instead of Cloudflare R2.
+
 ## Possible Future Durability Modes
 
 Not implemented today:
@@ -464,6 +521,8 @@ surface.
 
 - [docs/index.md](./docs/index.md) for the documentation map
 - [docs/overview.md](./docs/overview.md) for product and package overview
+- [docs/postgres-store.md](./docs/postgres-store.md) for Postgres WAL and full
+  mode behavior
 - [docs/stream-profiles.md](./docs/stream-profiles.md) for the full stream /
   profile / schema reference
 - [docs/durable-streams-spec.md](./docs/durable-streams-spec.md) for the HTTP
