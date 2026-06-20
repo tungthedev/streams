@@ -26,6 +26,25 @@ if search 'SqliteDurableStore|from ["'\''][^"'\'']*(/|^)(db|sqlite)/[^"'\'']*["'
   fail=1
 fi
 
+check_max_lines() {
+  local path="$1"
+  local max="$2"
+  local lines
+  lines="$(wc -l < "$path" | tr -d ' ')"
+  if [ "$lines" -gt "$max" ]; then
+    echo
+    echo "Storage boundary violation: $path has $lines lines; split before it exceeds $max."
+    fail=1
+  fi
+}
+
+check_max_lines src/postgres/routing_index.ts 300
+check_max_lines src/postgres/secondary_index.ts 240
+check_max_lines src/postgres/lexicon_index.ts 260
+check_max_lines src/postgres/companions.ts 220
+check_max_lines src/postgres/rows.ts 180
+check_max_lines src/postgres/details.ts 240
+
 if [ "$fail" -ne 0 ]; then
   exit 1
 fi

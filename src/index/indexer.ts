@@ -227,9 +227,9 @@ export class IndexManager {
   async candidateSegmentsForRoutingKey(stream: string, keyBytes: Uint8Array): Promise<IndexCandidate | null> {
     if (this.span <= 0) return null;
     if (!(await this.isRoutingConfigured(stream))) return null;
-    const state = this.db.getIndexState(stream);
+    const state = await this.db.getIndexState(stream);
     if (!state) return null;
-    const runs = this.db.listIndexRuns(stream);
+    const runs = await this.db.listIndexRuns(stream);
     if (runs.length === 0 && state.indexed_through === 0) return null;
 
     const fp = siphash24(state.index_secret, keyBytes);
@@ -318,9 +318,9 @@ export class IndexManager {
       for (const stream of streams) {
         if (this.stopped) break;
         if (!(await this.isRoutingConfigured(stream))) {
-          const hadRoutingState = !!this.db.getIndexState(stream) || this.db.listIndexRunsAll(stream).length > 0;
+          const hadRoutingState = !!(await this.db.getIndexState(stream)) || (await this.db.listIndexRunsAll(stream)).length > 0;
           if (hadRoutingState) {
-            this.db.deleteIndex(stream);
+            await this.db.deleteIndex(stream);
             this.onMetadataChanged?.(stream);
             if (this.publishManifest) {
               try {
@@ -376,25 +376,25 @@ export class IndexManager {
     this.building.add(stream);
     try {
       return await this.asyncGate.run(async () => {
-        let state = this.db.getIndexState(stream);
+        let state = await this.db.getIndexState(stream);
         if (!state) {
           const secret = randomBytes(16);
-          this.db.upsertIndexState(stream, secret, 0);
-          state = this.db.getIndexState(stream);
+          await this.db.upsertIndexState(stream, secret, 0);
+          state = await this.db.getIndexState(stream);
         }
         if (!state) return Result.ok(undefined);
         if (this.metrics) {
-          const lag = Math.max(0, this.db.countUploadedSegments(stream) - state.indexed_through);
+          const lag = Math.max(0, (await this.db.countUploadedSegments(stream)) - state.indexed_through);
           this.metrics.record("tieredstore.index.lag.segments", lag, "count", undefined, stream);
         }
         const indexedThrough = state.indexed_through;
-        const uploadedCount = this.db.countUploadedSegments(stream);
+        const uploadedCount = await this.db.countUploadedSegments(stream);
         if (uploadedCount < indexedThrough + this.span) return Result.ok(undefined);
         const start = indexedThrough;
         const end = start + this.span - 1;
         const segments: SegmentRow[] = [];
         for (let i = start; i <= end; i++) {
-          const seg = this.db.getSegmentByIndex(stream, i);
+          const seg = await this.db.getSegmentByIndex(stream, i);
           if (!seg || !seg.r2_etag) return Result.ok(undefined);
           segments.push(seg);
         }
@@ -412,7 +412,7 @@ export class IndexManager {
         const persistRes = await this.persistRunResult(run, stream);
         if (Result.isError(persistRes)) return persistRes;
         const sizeBytes = persistRes.value;
-        this.db.insertIndexRun({
+        await this.db.insertIndexRun({
           run_id: run.meta.runId,
           stream,
           level: run.meta.level,
@@ -426,10 +426,10 @@ export class IndexManager {
         if (this.metrics) {
           this.metrics.record("tieredstore.index.build.latency", Number(elapsedNs), "ns", { level: String(run.meta.level) }, stream);
           this.metrics.record("tieredstore.index.runs.built", 1, "count", { level: String(run.meta.level) }, stream);
-          this.recordActiveRuns(stream);
+          await this.recordActiveRuns(stream);
         }
         const nextIndexedThrough = end + 1;
-        this.db.updateIndexedThrough(stream, nextIndexedThrough);
+        await this.db.updateIndexedThrough(stream, nextIndexedThrough);
         state.indexed_through = nextIndexedThrough;
         this.onMetadataChanged?.(stream);
         if (this.publishManifest) {
@@ -439,7 +439,7 @@ export class IndexManager {
             // ignore manifest publish errors; will be retried by uploader/indexer
           }
         }
-        if (this.db.countUploadedSegments(stream) >= nextIndexedThrough + this.span) this.queue.add(stream);
+        if ((await this.db.countUploadedSegments(stream)) >= nextIndexedThrough + this.span) this.queue.add(stream);
         return Result.ok(undefined);
       });
     } finally {
@@ -458,7 +458,7 @@ export class IndexManager {
     this.compacting.add(stream);
     try {
       return await this.asyncGate.run(async () => {
-        const group = this.findCompactionGroup(stream);
+        const group = await this.findCompactionGroup(stream);
         if (!group) {
           await this.gcRetiredRuns(stream);
           return Result.ok(undefined);
@@ -472,7 +472,7 @@ export class IndexManager {
         const persistRes = await this.persistRunResult(run, stream);
         if (Result.isError(persistRes)) return persistRes;
         const sizeBytes = persistRes.value;
-        this.db.insertIndexRun({
+        await this.db.insertIndexRun({
           run_id: run.meta.runId,
           stream,
           level: run.meta.level,
@@ -483,15 +483,15 @@ export class IndexManager {
           filter_len: run.meta.filterLen,
           record_count: run.meta.recordCount,
         });
-        const state = this.db.getIndexState(stream);
+        const state = await this.db.getIndexState(stream);
         if (state && run.meta.endSegment + 1 > state.indexed_through) {
-          this.db.updateIndexedThrough(stream, run.meta.endSegment + 1);
+          await this.db.updateIndexedThrough(stream, run.meta.endSegment + 1);
           state.indexed_through = run.meta.endSegment + 1;
         }
-        const manifestRow = this.db.getManifestRow(stream);
+        const manifestRow = await this.db.getManifestRow(stream);
         const retiredGen = manifestRow.generation + 1;
         const nowMs = this.db.nowMs();
-        this.db.retireIndexRuns(
+        await this.db.retireIndexRuns(
           runs.map((r) => r.run_id),
           retiredGen,
           nowMs
@@ -500,7 +500,7 @@ export class IndexManager {
         if (this.metrics) {
           this.metrics.record("tieredstore.index.compact.latency", Number(elapsedNs), "ns", { level: String(run.meta.level) }, stream);
           this.metrics.record("tieredstore.index.runs.compacted", 1, "count", { level: String(run.meta.level) }, stream);
-          this.recordActiveRuns(stream);
+          await this.recordActiveRuns(stream);
         }
         for (const r of runs) {
           this.runCache.remove(r.object_key);
@@ -522,8 +522,8 @@ export class IndexManager {
     }
   }
 
-  private findCompactionGroup(stream: string): { level: number; runs: IndexRunRow[] } | null {
-    const runs = this.db.listIndexRuns(stream);
+  private async findCompactionGroup(stream: string): Promise<{ level: number; runs: IndexRunRow[] } | null> {
+    const runs = await this.db.listIndexRuns(stream);
     if (runs.length < this.compactionFanout) return null;
     const byLevel = new Map<number, IndexRunRow[]>();
     for (const r of runs) {
@@ -674,9 +674,9 @@ export class IndexManager {
   }
 
   private async gcRetiredRuns(stream: string): Promise<void> {
-    const retired = this.db.listRetiredIndexRuns(stream);
+    const retired = await this.db.listRetiredIndexRuns(stream);
     if (retired.length === 0) return;
-    const manifest = this.db.getManifestRow(stream);
+    const manifest = await this.db.getManifestRow(stream);
     const nowMs = this.db.nowMs();
     const cutoffGen = this.retireGenWindow > 0 && manifest.generation > this.retireGenWindow ? manifest.generation - this.retireGenWindow : 0;
     const toDelete: IndexRunRow[] = [];
@@ -695,7 +695,7 @@ export class IndexManager {
       this.runCache.remove(r.object_key);
       this.runDiskCache?.remove(r.object_key);
     }
-    this.db.deleteIndexRuns(toDelete.map((r) => r.run_id));
+    await this.db.deleteIndexRuns(toDelete.map((r) => r.run_id));
   }
 
   private async buildL0RunResult(
@@ -781,7 +781,7 @@ export class IndexManager {
   }
 
   private async isRoutingConfigured(stream: string): Promise<boolean> {
-    const streamRow = this.db.getStream(stream);
+    const streamRow = await this.db.getStream(stream);
     const contentType = streamRow?.content_type.split(";")[0]?.trim().toLowerCase() ?? null;
     if (contentType != null && contentType !== "application/json") return true;
     if (!this.registry) return false;
@@ -919,9 +919,9 @@ export class IndexManager {
     }
   }
 
-  private recordActiveRuns(stream: string): void {
+  private async recordActiveRuns(stream: string): Promise<void> {
     if (!this.metrics) return;
-    const runs = this.db.listIndexRuns(stream);
+    const runs = await this.db.listIndexRuns(stream);
     this.metrics.record("tieredstore.index.active_runs", runs.length, "count", undefined, stream);
     const byLevel = new Map<number, number>();
     for (const r of runs) byLevel.set(r.level, (byLevel.get(r.level) ?? 0) + 1);

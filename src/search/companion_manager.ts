@@ -398,7 +398,7 @@ export class SearchCompanionManager {
       let decodeMs = 0;
       const planRow = await this.getCurrentPlanRow(stream);
       if (!planRow) return { companion: null, stats: { sectionGetMs, decodeMs } };
-      const row = this.db.getSearchSegmentCompanion(stream, segmentIndex);
+      const row = await this.db.getSearchSegmentCompanion(stream, segmentIndex);
       if (!row || row.plan_generation !== planRow.generation) return { companion: null, stats: { sectionGetMs, decodeMs } };
       if (!parseSectionKinds(row).has(kind)) return { companion: null, stats: { sectionGetMs, decodeMs } };
       const cacheKey = this.decodedSectionCacheKey(row, kind);
@@ -465,7 +465,7 @@ export class SearchCompanionManager {
     if (Result.isError(regRes)) return null;
     const desiredPlan = buildDesiredSearchCompanionPlan(regRes.value);
     const desiredHash = hashSearchCompanionPlan(desiredPlan);
-    const current = this.db.getSearchCompanionPlan(stream);
+    const current = await this.db.getSearchCompanionPlan(stream);
     if (current && current.plan_hash === desiredHash) return current;
     return null;
   }
@@ -535,7 +535,7 @@ export class SearchCompanionManager {
         this.metrics.record("tieredstore.companion.build.queue_len", this.queue.size, "count");
         this.metrics.record("tieredstore.companion.builds_inflight", this.building.size, "count");
       }
-      const streams = Array.from(new Set([...this.db.listSearchCompanionPlanStreams(), ...this.queue]));
+      const streams = Array.from(new Set([...(await this.db.listSearchCompanionPlanStreams()), ...this.queue]));
       this.queue.clear();
       for (const stream of streams) {
         if (this.stopped) break;
@@ -570,11 +570,11 @@ export class SearchCompanionManager {
       const desiredPlan = buildDesiredSearchCompanionPlan(regRes.value);
       const desiredHash = hashSearchCompanionPlan(desiredPlan);
       const wantedFamilies = Object.values(desiredPlan.families).some(Boolean);
-      let planRow = this.db.getSearchCompanionPlan(stream);
+      let planRow = await this.db.getSearchCompanionPlan(stream);
       if (!wantedFamilies) {
         if (planRow) {
-          this.db.deleteSearchSegmentCompanions(stream);
-          this.db.deleteSearchCompanionPlan(stream);
+          await this.db.deleteSearchSegmentCompanions(stream);
+          await this.db.deleteSearchCompanionPlan(stream);
           this.onMetadataChanged?.(stream);
           if (this.publishManifest) {
             try {
@@ -587,18 +587,20 @@ export class SearchCompanionManager {
         return Result.ok(undefined);
       }
       if (!planRow) {
-        this.db.upsertSearchCompanionPlan(stream, 1, desiredHash, JSON.stringify(desiredPlan));
-        planRow = this.db.getSearchCompanionPlan(stream);
+        await this.db.upsertSearchCompanionPlan(stream, 1, desiredHash, JSON.stringify(desiredPlan));
+        planRow = await this.db.getSearchCompanionPlan(stream);
       } else if (planRow.plan_hash !== desiredHash) {
-        this.db.upsertSearchCompanionPlan(stream, planRow.generation + 1, desiredHash, JSON.stringify(desiredPlan));
-        planRow = this.db.getSearchCompanionPlan(stream);
+        await this.db.upsertSearchCompanionPlan(stream, planRow.generation + 1, desiredHash, JSON.stringify(desiredPlan));
+        planRow = await this.db.getSearchCompanionPlan(stream);
       }
       if (!planRow) return Result.ok(undefined);
 
-      const uploadedSegments = this.db.countUploadedSegments(stream);
+      const uploadedSegments = await this.db.countUploadedSegments(stream);
+      const companionRows = await this.db.listSearchSegmentCompanions(stream);
+      const companionBySegment = new Map(companionRows.map((row) => [row.segment_index, row]));
       const stale: number[] = [];
       for (let segmentIndex = 0; segmentIndex < uploadedSegments; segmentIndex++) {
-        const current = this.db.getSearchSegmentCompanion(stream, segmentIndex);
+        const current = companionBySegment.get(segmentIndex);
         if (!current || current.plan_generation !== planRow.generation) stale.push(segmentIndex);
       }
       if (this.metrics) {
@@ -610,7 +612,7 @@ export class SearchCompanionManager {
       const batch = stale.slice(0, batchLimit);
       let builtCount = 0;
       for (const nextSegmentIndex of batch) {
-        const seg = this.db.getSegmentByIndex(stream, nextSegmentIndex);
+        const seg = await this.db.getSegmentByIndex(stream, nextSegmentIndex);
         if (!seg || !seg.r2_etag) continue;
         const startedAt = Date.now();
         const companionRes = await this.asyncGate.run(async () =>
@@ -645,7 +647,7 @@ export class SearchCompanionManager {
           console.warn("bundled companion local cache populate failed", objectKey, cacheRes.error.message);
         }
         const sectionKinds = companionRes.value.sectionKinds;
-        this.db.upsertSearchSegmentCompanion(
+        await this.db.upsertSearchSegmentCompanion(
           stream,
           seg.segment_index,
           objectKey,

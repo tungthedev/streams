@@ -26,6 +26,11 @@ import type { WalReadRow } from "../store/wal_store";
 import { dsError } from "../util/ds_error";
 import { migratePostgresStore } from "./schema";
 import { PostgresSegmentManifestStore } from "./segments";
+import { PostgresRoutingIndexStore } from "./routing_index";
+import { PostgresSecondaryIndexStore } from "./secondary_index";
+import { PostgresLexiconIndexStore } from "./lexicon_index";
+import { PostgresCompanionIndexStore } from "./companions";
+import { PostgresFullModeDetailsStore } from "./details";
 import type { PgExecutor, PgStreamRow } from "./types";
 
 const STREAM_FLAG_DELETED = 1 << 0;
@@ -47,11 +52,19 @@ type StreamState = {
 type ProducerState = { epoch: number; lastSeq: number };
 type ProducerCheck = { duplicate: boolean; update: boolean; epoch: number; seq: number };
 type PostgresStoreOptions = { fullMode?: boolean };
+export type PostgresFullModeIndexStores = {
+  routing: PostgresRoutingIndexStore;
+  secondary: PostgresSecondaryIndexStore;
+  lexicon: PostgresLexiconIndexStore;
+  companions: PostgresCompanionIndexStore;
+};
 
 export class PostgresDurableStore implements WalControlPlaneStore {
   readonly kind = "postgres" as const;
   readonly capabilities: DurableStoreCapabilities;
   private readonly segments?: PostgresSegmentManifestStore;
+  private readonly indexStores?: PostgresFullModeIndexStores;
+  private readonly details?: PostgresFullModeDetailsStore;
 
   constructor(private readonly pool: Pool, private readonly opts: PostgresStoreOptions = {}) {
     this.capabilities = {
@@ -60,7 +73,7 @@ export class PostgresDurableStore implements WalControlPlaneStore {
       profiles: true,
       streamLifecycle: true,
       segmentReads: opts.fullMode === true,
-      indexes: false,
+      indexes: opts.fullMode === true,
       manifests: opts.fullMode === true,
       objectStoreAccounting: false,
       storageStats: false,
@@ -73,6 +86,17 @@ export class PostgresDurableStore implements WalControlPlaneStore {
       this.segments = new PostgresSegmentManifestStore(this.pool, () => this.nowMs(), (stream, startOffset, endOffset, routingKey) =>
         this.readWalRange(stream, startOffset, endOffset, routingKey)
       );
+      this.indexStores = {
+        routing: new PostgresRoutingIndexStore(this.pool, () => this.nowMs()),
+        secondary: new PostgresSecondaryIndexStore(this.pool, () => this.nowMs()),
+        lexicon: new PostgresLexiconIndexStore(
+          this.pool,
+          () => this.nowMs(),
+          (stream, startOffset, endOffset, routingKey) => this.readWalRange(stream, startOffset, endOffset, routingKey)
+        ),
+        companions: new PostgresCompanionIndexStore(this.pool, () => this.nowMs()),
+      };
+      this.details = new PostgresFullModeDetailsStore(this.pool);
     }
   }
 
@@ -189,13 +213,37 @@ export class PostgresDurableStore implements WalControlPlaneStore {
 
   async deleteStream(stream: string): Promise<boolean> {
     const now = this.nowMs();
-    const res = await this.pool.query(
-      `UPDATE streams
-       SET stream_flags = (stream_flags | $1), updated_at_ms = $2
-       WHERE stream = $3 AND (stream_flags & $1) = 0;`,
-      [STREAM_FLAG_DELETED, pgInt(now), stream]
-    );
-    return (res.rowCount ?? 0) > 0;
+    if (!this.opts.fullMode) {
+      const res = await this.pool.query(
+        `UPDATE streams
+         SET stream_flags = (stream_flags | $1), updated_at_ms = $2
+         WHERE stream = $3 AND (stream_flags & $1) = 0;`,
+        [STREAM_FLAG_DELETED, pgInt(now), stream]
+      );
+      return (res.rowCount ?? 0) > 0;
+    }
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      const res = await client.query(
+        `UPDATE streams
+         SET stream_flags = (stream_flags | $1), updated_at_ms = $2
+         WHERE stream = $3 AND (stream_flags & $1) = 0;`,
+        [STREAM_FLAG_DELETED, pgInt(now), stream]
+      );
+      if ((res.rowCount ?? 0) === 0) {
+        await client.query("ROLLBACK");
+        return false;
+      }
+      await this.deleteFullModeAccelerationState(client, stream);
+      await client.query("COMMIT");
+      return true;
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => {});
+      throw error;
+    } finally {
+      client.release();
+    }
   }
 
   async hardDeleteStream(stream: string): Promise<boolean> {
@@ -241,6 +289,16 @@ export class PostgresDurableStore implements WalControlPlaneStore {
     return this.requireSegments();
   }
 
+  fullModeIndexStores(): PostgresFullModeIndexStores {
+    if (!this.indexStores) throw dsError("postgres full-mode index stores are not enabled", { code: "unsupported_capability" });
+    return this.indexStores;
+  }
+
+  fullModeDetails(): PostgresFullModeDetailsStore {
+    if (!this.details) throw dsError("postgres full-mode details store is not enabled", { code: "unsupported_capability" });
+    return this.details;
+  }
+
   async getSchemaRegistryForRead(stream: string): Promise<SchemaRegistryRow | null> {
     return this.getSchemaRegistryWithExecutor(this.pool, stream);
   }
@@ -259,7 +317,7 @@ export class PostgresDurableStore implements WalControlPlaneStore {
         await client.query("ROLLBACK");
         return mutationRes;
       }
-      if (mutationRes.value.registry.search) {
+      if (mutationRes.value.registry.search && !this.opts.fullMode) {
         await client.query("ROLLBACK");
         return Result.err(unsupportedSchemaSearchError() as E);
       }
@@ -737,6 +795,17 @@ export class PostgresDurableStore implements WalControlPlaneStore {
   private requireSegments(): PostgresSegmentManifestStore {
     if (!this.segments) throw dsError("postgres full-mode segment capability is not enabled", { code: "unsupported_capability" });
     return this.segments;
+  }
+
+  private async deleteFullModeAccelerationState(executor: PgExecutor, stream: string): Promise<void> {
+    await executor.query(`DELETE FROM index_runs WHERE stream = $1;`, [stream]);
+    await executor.query(`DELETE FROM index_state WHERE stream = $1;`, [stream]);
+    await executor.query(`DELETE FROM secondary_index_runs WHERE stream = $1;`, [stream]);
+    await executor.query(`DELETE FROM secondary_index_state WHERE stream = $1;`, [stream]);
+    await executor.query(`DELETE FROM lexicon_index_runs WHERE stream = $1;`, [stream]);
+    await executor.query(`DELETE FROM lexicon_index_state WHERE stream = $1;`, [stream]);
+    await executor.query(`DELETE FROM search_segment_companions WHERE stream = $1;`, [stream]);
+    await executor.query(`DELETE FROM search_companion_plans WHERE stream = $1;`, [stream]);
   }
 }
 

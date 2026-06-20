@@ -222,10 +222,10 @@ export class SecondaryIndexManager {
     if (Result.isError(regRes)) return null;
     const configured = getConfiguredSecondaryIndexes(regRes.value).find((entry) => entry.name === indexName);
     if (!configured) return null;
-    const state = this.db.getSecondaryIndexState(stream, indexName);
+    const state = await this.db.getSecondaryIndexState(stream, indexName);
     if (!state) return null;
     if (state.config_hash !== hashSecondaryIndexField(configured)) return null;
-    const runs = this.db.listSecondaryIndexRuns(stream, indexName);
+    const runs = await this.db.listSecondaryIndexRuns(stream, indexName);
     if (runs.length === 0 && state.indexed_through === 0) return null;
 
     const fp = siphash24(state.index_secret, keyBytes);
@@ -293,17 +293,17 @@ export class SecondaryIndexManager {
         if (this.stopped) break;
         const regRes = await this.registry.getRegistryResult(stream);
         if (Result.isError(regRes)) continue;
-        if (this.shouldPauseExactBackgroundWork(stream)) {
+        if (await this.shouldPauseExactBackgroundWork(stream)) {
           this.queue.add(stream);
           continue;
         }
         const configured = getConfiguredSecondaryIndexes(regRes.value);
         const configuredNames = new Set(configured.map((entry) => entry.name));
-        const existing = this.db.listSecondaryIndexStates(stream);
+        const existing = await this.db.listSecondaryIndexStates(stream);
         let removedAny = false;
         for (const state of existing) {
           if (configuredNames.has(state.index_name)) continue;
-          this.db.deleteSecondaryIndex(stream, state.index_name);
+          await this.db.deleteSecondaryIndex(stream, state.index_name);
           removedAny = true;
         }
         if (removedAny) {
@@ -357,14 +357,14 @@ export class SecondaryIndexManager {
     try {
       return await this.asyncGate.run(async () => {
         const configHash = hashSecondaryIndexField(index);
-        let state = this.db.getSecondaryIndexState(stream, index.name);
+        let state = await this.db.getSecondaryIndexState(stream, index.name);
         if (!state) {
-          this.db.upsertSecondaryIndexState(stream, index.name, randomBytes(16), configHash, 0);
-          state = this.db.getSecondaryIndexState(stream, index.name);
+          await this.db.upsertSecondaryIndexState(stream, index.name, randomBytes(16), configHash, 0);
+          state = await this.db.getSecondaryIndexState(stream, index.name);
         } else if (state.config_hash !== configHash) {
-          this.db.deleteSecondaryIndex(stream, index.name);
-          this.db.upsertSecondaryIndexState(stream, index.name, randomBytes(16), configHash, 0);
-          state = this.db.getSecondaryIndexState(stream, index.name);
+          await this.db.deleteSecondaryIndex(stream, index.name);
+          await this.db.upsertSecondaryIndexState(stream, index.name, randomBytes(16), configHash, 0);
+          state = await this.db.getSecondaryIndexState(stream, index.name);
           this.onMetadataChanged?.(stream);
           if (this.publishManifest) {
             try {
@@ -375,18 +375,18 @@ export class SecondaryIndexManager {
           }
         }
         if (!state) return Result.ok(undefined);
-        if (this.shouldPauseExactBackgroundWork(stream)) {
+        if (await this.shouldPauseExactBackgroundWork(stream)) {
           this.queue.add(stream);
           return Result.ok(undefined);
         }
         const indexedThrough = state.indexed_through;
-        const uploadedCount = this.db.countUploadedSegments(stream);
+        const uploadedCount = await this.db.countUploadedSegments(stream);
         if (uploadedCount < indexedThrough + this.span) return Result.ok(undefined);
         const start = indexedThrough;
         const end = start + this.span - 1;
         const segments: SegmentRow[] = [];
         for (let i = start; i <= end; i++) {
-          const seg = this.db.getSegmentByIndex(stream, i);
+          const seg = await this.db.getSegmentByIndex(stream, i);
           if (!seg || !seg.r2_etag) return Result.ok(undefined);
           segments.push(seg);
         }
@@ -403,7 +403,7 @@ export class SecondaryIndexManager {
         const persistRes = await this.persistRunResult(run);
         if (Result.isError(persistRes)) return persistRes;
         const sizeBytes = persistRes.value;
-        this.db.insertSecondaryIndexRun({
+        await this.db.insertSecondaryIndexRun({
           run_id: run.meta.runId,
           stream,
           index_name: index.name,
@@ -416,7 +416,7 @@ export class SecondaryIndexManager {
           record_count: run.meta.recordCount,
         });
         const nextIndexedThrough = end + 1;
-        this.db.updateSecondaryIndexedThrough(stream, index.name, nextIndexedThrough);
+        await this.db.updateSecondaryIndexedThrough(stream, index.name, nextIndexedThrough);
         state.indexed_through = nextIndexedThrough;
         this.onMetadataChanged?.(stream);
         if (this.publishManifest) {
@@ -426,7 +426,7 @@ export class SecondaryIndexManager {
             // ignore and retry later
           }
         }
-        if (this.db.countUploadedSegments(stream) >= nextIndexedThrough + this.span) this.queue.add(stream);
+        if ((await this.db.countUploadedSegments(stream)) >= nextIndexedThrough + this.span) this.queue.add(stream);
         return Result.ok(undefined);
       });
     } finally {
@@ -446,11 +446,11 @@ export class SecondaryIndexManager {
     this.compacting.add(key);
     try {
       return await this.asyncGate.run(async () => {
-        if (this.shouldPauseExactBackgroundWork(stream)) {
+        if (await this.shouldPauseExactBackgroundWork(stream)) {
           this.queue.add(stream);
           return Result.ok(undefined);
         }
-        const group = this.findCompactionGroup(stream, indexName);
+        const group = await this.findCompactionGroup(stream, indexName);
         if (!group) {
           await this.gcRetiredRuns(stream, indexName);
           return Result.ok(undefined);
@@ -462,7 +462,7 @@ export class SecondaryIndexManager {
         const persistRes = await this.persistRunResult(run);
         if (Result.isError(persistRes)) return persistRes;
         const sizeBytes = persistRes.value;
-        this.db.insertSecondaryIndexRun({
+        await this.db.insertSecondaryIndexRun({
           run_id: run.meta.runId,
           stream,
           index_name: indexName,
@@ -474,12 +474,12 @@ export class SecondaryIndexManager {
           filter_len: run.meta.filterLen,
           record_count: run.meta.recordCount,
         });
-        const state = this.db.getSecondaryIndexState(stream, indexName);
+        const state = await this.db.getSecondaryIndexState(stream, indexName);
         if (state && run.meta.endSegment + 1 > state.indexed_through) {
-          this.db.updateSecondaryIndexedThrough(stream, indexName, run.meta.endSegment + 1);
+          await this.db.updateSecondaryIndexedThrough(stream, indexName, run.meta.endSegment + 1);
         }
-        const manifestRow = this.db.getManifestRow(stream);
-        this.db.retireSecondaryIndexRuns(
+        const manifestRow = await this.db.getManifestRow(stream);
+        await this.db.retireSecondaryIndexRuns(
           runs.map((r) => r.run_id),
           manifestRow.generation + 1,
           this.db.nowMs()
@@ -501,8 +501,8 @@ export class SecondaryIndexManager {
     }
   }
 
-  private findCompactionGroup(stream: string, indexName: string): { level: number; runs: SecondaryIndexRunRow[] } | null {
-    const runs = this.db.listSecondaryIndexRuns(stream, indexName);
+  private async findCompactionGroup(stream: string, indexName: string): Promise<{ level: number; runs: SecondaryIndexRunRow[] } | null> {
+    const runs = await this.db.listSecondaryIndexRuns(stream, indexName);
     if (runs.length < this.compactionFanout) return null;
     const byLevel = new Map<number, SecondaryIndexRunRow[]>();
     for (const run of runs) {
@@ -745,9 +745,9 @@ export class SecondaryIndexManager {
   }
 
   private async gcRetiredRuns(stream: string, indexName: string): Promise<void> {
-    const retired = this.db.listRetiredSecondaryIndexRuns(stream, indexName);
+    const retired = await this.db.listRetiredSecondaryIndexRuns(stream, indexName);
     if (retired.length === 0) return;
-    const manifest = this.db.getManifestRow(stream);
+    const manifest = await this.db.getManifestRow(stream);
     const nowMs = this.db.nowMs();
     const cutoffGen =
       this.retireGenWindow > 0 && manifest.generation > this.retireGenWindow
@@ -769,26 +769,28 @@ export class SecondaryIndexManager {
       this.runCache.remove(run.object_key);
       this.runDiskCache?.remove(run.object_key);
     }
-    this.db.deleteSecondaryIndexRuns(toDelete.map((run) => run.run_id));
+    await this.db.deleteSecondaryIndexRuns(toDelete.map((run) => run.run_id));
   }
 
-  private hasCompanionBacklog(stream: string): boolean {
-    const plan = this.companionProgress.getSearchCompanionPlan(stream);
+  private async hasCompanionBacklog(stream: string): Promise<boolean> {
+    const plan = await this.companionProgress.getSearchCompanionPlan(stream);
     if (!plan) return false;
-    const uploadedCount = this.companionProgress.countUploadedSegments(stream);
+    const uploadedCount = await this.companionProgress.countUploadedSegments(stream);
+    const companionRows = await this.companionProgress.listSearchSegmentCompanions(stream);
+    const companionBySegment = new Map(companionRows.map((row) => [row.segment_index, row]));
     for (let segmentIndex = 0; segmentIndex < uploadedCount; segmentIndex++) {
-      const row = this.companionProgress.getSearchSegmentCompanion(stream, segmentIndex);
+      const row = companionBySegment.get(segmentIndex);
       if (!row || row.plan_generation !== plan.generation) return true;
     }
     return false;
   }
 
-  private shouldPauseExactBackgroundWork(stream: string): boolean {
-    if (this.hasCompanionBacklog(stream)) {
+  private async shouldPauseExactBackgroundWork(stream: string): Promise<boolean> {
+    if (await this.hasCompanionBacklog(stream)) {
       this.streamIdleTicks.delete(stream);
       return true;
     }
-    const streamRow = this.db.getStream(stream);
+    const streamRow = await this.db.getStream(stream);
     if (!streamRow) return false;
     if (streamRow.segment_in_progress !== 0) {
       this.streamIdleTicks.delete(stream);
@@ -798,7 +800,7 @@ export class SecondaryIndexManager {
       this.streamIdleTicks.delete(stream);
       return true;
     }
-    if (this.db.countSegmentsForStream(stream) > this.db.countUploadedSegments(stream)) {
+    if ((await this.db.countSegmentsForStream(stream)) > (await this.db.countUploadedSegments(stream))) {
       this.streamIdleTicks.delete(stream);
       return true;
     }

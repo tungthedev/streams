@@ -241,13 +241,13 @@ export class LexiconIndexManager {
       fallbackWalScanMs: 0,
       lexiconRunsLoaded: 0,
     };
-    const sourceState = this.db.getLexiconIndexState(stream, ROUTING_KEY_SOURCE_KIND, ROUTING_KEY_SOURCE_NAME);
-    const uploadedSegmentCount = this.db.countUploadedSegments(stream);
+    const sourceState = await this.db.getLexiconIndexState(stream, ROUTING_KEY_SOURCE_KIND, ROUTING_KEY_SOURCE_NAME);
+    const uploadedSegmentCount = await this.db.countUploadedSegments(stream);
     const indexedThrough = Math.max(0, Math.min(sourceState?.indexed_through ?? 0, uploadedSegmentCount));
     const fallbackScan = await this.scanFallbackKeysResult(stream, indexedThrough, uploadedSegmentCount, after, timing);
     if (Result.isError(fallbackScan)) return fallbackScan;
 
-    const indexedRuns = this.db.listLexiconIndexRuns(stream, ROUTING_KEY_SOURCE_KIND, ROUTING_KEY_SOURCE_NAME);
+    const indexedRuns = await this.db.listLexiconIndexRuns(stream, ROUTING_KEY_SOURCE_KIND, ROUTING_KEY_SOURCE_NAME);
     const indexedPage = await this.listKeysFromRunsResult(indexedRuns, after, safeLimit + 1, timing);
     if (Result.isError(indexedPage)) return indexedPage;
 
@@ -285,10 +285,10 @@ export class LexiconIndexManager {
         if (this.stopped) break;
         if (!(await this.isRoutingLexiconConfigured(stream))) {
           const hadState =
-            this.db.getLexiconIndexState(stream, ROUTING_KEY_SOURCE_KIND, ROUTING_KEY_SOURCE_NAME) != null ||
-            this.db.listLexiconIndexRunsAll(stream, ROUTING_KEY_SOURCE_KIND, ROUTING_KEY_SOURCE_NAME).length > 0;
+            (await this.db.getLexiconIndexState(stream, ROUTING_KEY_SOURCE_KIND, ROUTING_KEY_SOURCE_NAME)) != null ||
+            (await this.db.listLexiconIndexRunsAll(stream, ROUTING_KEY_SOURCE_KIND, ROUTING_KEY_SOURCE_NAME)).length > 0;
           if (hadState) {
-            this.db.deleteLexiconIndexSource(stream, ROUTING_KEY_SOURCE_KIND, ROUTING_KEY_SOURCE_NAME);
+            await this.db.deleteLexiconIndexSource(stream, ROUTING_KEY_SOURCE_KIND, ROUTING_KEY_SOURCE_NAME);
             this.onMetadataChanged?.(stream);
             if (this.publishManifest) {
               try {
@@ -335,19 +335,19 @@ export class LexiconIndexManager {
     this.building.add(stream);
     try {
       return await this.asyncGate.run(async () => {
-        let state = this.db.getLexiconIndexState(stream, sourceKind, sourceName);
+        let state = await this.db.getLexiconIndexState(stream, sourceKind, sourceName);
         if (!state) {
-          this.db.upsertLexiconIndexState(stream, sourceKind, sourceName, 0);
-          state = this.db.getLexiconIndexState(stream, sourceKind, sourceName);
+          await this.db.upsertLexiconIndexState(stream, sourceKind, sourceName, 0);
+          state = await this.db.getLexiconIndexState(stream, sourceKind, sourceName);
         }
         if (!state) return Result.ok(undefined);
-        const uploadedCount = this.db.countUploadedSegments(stream);
+        const uploadedCount = await this.db.countUploadedSegments(stream);
         if (uploadedCount < state.indexed_through + this.span) return Result.ok(undefined);
         const startSegment = state.indexed_through;
         const endSegment = startSegment + this.span - 1;
         const segments: SegmentRow[] = [];
         for (let segmentIndex = startSegment; segmentIndex <= endSegment; segmentIndex += 1) {
-          const segment = this.db.getSegmentByIndex(stream, segmentIndex);
+          const segment = await this.db.getSegmentByIndex(stream, segmentIndex);
           if (!segment || !segment.r2_etag) return Result.ok(undefined);
           segments.push(segment);
         }
@@ -355,7 +355,7 @@ export class LexiconIndexManager {
         if (Result.isError(runRes)) return runRes;
         const persistRes = await this.persistRunResult(runRes.value, stream);
         if (Result.isError(persistRes)) return persistRes;
-        this.db.insertLexiconIndexRun({
+        await this.db.insertLexiconIndexRun({
           run_id: runRes.value.meta.runId,
           stream,
           source_kind: sourceKind,
@@ -367,7 +367,7 @@ export class LexiconIndexManager {
           size_bytes: persistRes.value,
           record_count: runRes.value.meta.recordCount,
         });
-        this.db.updateLexiconIndexedThrough(stream, sourceKind, sourceName, endSegment + 1);
+        await this.db.updateLexiconIndexedThrough(stream, sourceKind, sourceName, endSegment + 1);
         this.onMetadataChanged?.(stream);
         if (this.publishManifest) {
           try {
@@ -376,7 +376,7 @@ export class LexiconIndexManager {
             // retry on next publish
           }
         }
-        if (this.db.countUploadedSegments(stream) >= endSegment + 1 + this.span) {
+        if ((await this.db.countUploadedSegments(stream)) >= endSegment + 1 + this.span) {
           this.queue.add(stream);
         }
         return Result.ok(undefined);
@@ -402,7 +402,7 @@ export class LexiconIndexManager {
     this.compacting.add(stream);
     try {
       return await this.asyncGate.run(async () => {
-        const group = this.findCompactionGroup(stream, sourceKind, sourceName);
+        const group = await this.findCompactionGroup(stream, sourceKind, sourceName);
         if (!group) {
           await this.gcRetiredRuns(stream, sourceKind, sourceName);
           return Result.ok(undefined);
@@ -411,7 +411,7 @@ export class LexiconIndexManager {
         if (Result.isError(runRes)) return runRes;
         const persistRes = await this.persistRunResult(runRes.value, stream);
         if (Result.isError(persistRes)) return persistRes;
-        this.db.insertLexiconIndexRun({
+        await this.db.insertLexiconIndexRun({
           run_id: runRes.value.meta.runId,
           stream,
           source_kind: sourceKind,
@@ -423,12 +423,12 @@ export class LexiconIndexManager {
           size_bytes: persistRes.value,
           record_count: runRes.value.meta.recordCount,
         });
-        const state = this.db.getLexiconIndexState(stream, sourceKind, sourceName);
+        const state = await this.db.getLexiconIndexState(stream, sourceKind, sourceName);
         if (state && runRes.value.meta.endSegment + 1 > state.indexed_through) {
-          this.db.updateLexiconIndexedThrough(stream, sourceKind, sourceName, runRes.value.meta.endSegment + 1);
+          await this.db.updateLexiconIndexedThrough(stream, sourceKind, sourceName, runRes.value.meta.endSegment + 1);
         }
-        const manifestRow = this.db.getManifestRow(stream);
-        this.db.retireLexiconIndexRuns(group.runs.map((run) => run.run_id), manifestRow.generation + 1, this.db.nowMs());
+        const manifestRow = await this.db.getManifestRow(stream);
+        await this.db.retireLexiconIndexRuns(group.runs.map((run) => run.run_id), manifestRow.generation + 1, this.db.nowMs());
         this.onMetadataChanged?.(stream);
         if (this.publishManifest) {
           try {
@@ -448,8 +448,12 @@ export class LexiconIndexManager {
     }
   }
 
-  private findCompactionGroup(stream: string, sourceKind: string, sourceName: string): { level: number; runs: LexiconIndexRunRow[] } | null {
-    const runs = this.db.listLexiconIndexRuns(stream, sourceKind, sourceName);
+  private async findCompactionGroup(
+    stream: string,
+    sourceKind: string,
+    sourceName: string
+  ): Promise<{ level: number; runs: LexiconIndexRunRow[] } | null> {
+    const runs = await this.db.listLexiconIndexRuns(stream, sourceKind, sourceName);
     if (runs.length < this.compactionFanout) return null;
     const byLevel = new Map<number, LexiconIndexRunRow[]>();
     for (const run of runs) {
@@ -720,9 +724,9 @@ export class LexiconIndexManager {
     >
   > {
     const startedAt = Date.now();
-    const streamRow = this.db.getStream(stream);
+    const streamRow = await this.db.getStream(stream);
     if (!streamRow) return invalidLexiconIndex(`missing stream ${stream}`);
-    const segmentCount = this.db.countSegmentsForStream(stream);
+    const segmentCount = await this.db.countSegmentsForStream(stream);
     const fallbackKeys = new Set<string>();
     let scannedUploadedSegments = 0;
     let scannedLocalSegments = 0;
@@ -732,7 +736,7 @@ export class LexiconIndexManager {
     const fallbackStartSegment = shouldScanUploadedSegments ? indexedThrough : uploadedSegmentCount;
     for (let segmentIndex = fallbackStartSegment; segmentIndex < segmentCount; segmentIndex += 1) {
       if (scannedSegments >= segmentScanLimit) break;
-      const segment = this.db.getSegmentByIndex(stream, segmentIndex);
+      const segment = await this.db.getSegmentByIndex(stream, segmentIndex);
       if (!segment) continue;
       const segmentGetStartedAt = Date.now();
       const bytesRes = await this.loadSegmentBytesResult(segment);
@@ -782,9 +786,9 @@ export class LexiconIndexManager {
   }
 
   private async gcRetiredRuns(stream: string, sourceKind: string, sourceName: string): Promise<void> {
-    const retiredRuns = this.db.listRetiredLexiconIndexRuns(stream, sourceKind, sourceName);
+    const retiredRuns = await this.db.listRetiredLexiconIndexRuns(stream, sourceKind, sourceName);
     if (retiredRuns.length === 0) return;
-    const manifest = this.db.getManifestRow(stream);
+    const manifest = await this.db.getManifestRow(stream);
     const nowMs = this.db.nowMs();
     const cutoffGen =
       this.retireGenWindow > 0 && manifest.generation > this.retireGenWindow ? manifest.generation - this.retireGenWindow : 0;
@@ -801,7 +805,7 @@ export class LexiconIndexManager {
         // best effort
       }
     }
-    this.db.deleteLexiconIndexRuns(deletions.map((run) => run.run_id));
+    await this.db.deleteLexiconIndexRuns(deletions.map((run) => run.run_id));
   }
 
   private async isRoutingLexiconConfigured(stream: string): Promise<boolean> {

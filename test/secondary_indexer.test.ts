@@ -22,9 +22,9 @@ async function sleep(ms: number): Promise<void> {
   return new Promise((res) => setTimeout(res, ms));
 }
 
-function waitForExactIdleGate(manager: SecondaryIndexManager, stream: string, attempts = 3000): boolean {
+async function waitForExactIdleGate(manager: SecondaryIndexManager, stream: string, attempts = 3000): Promise<boolean> {
   for (let attempt = 0; attempt < attempts; attempt++) {
-    if (!(manager as any).shouldPauseExactBackgroundWork(stream)) return true;
+    if (!(await (manager as any).shouldPauseExactBackgroundWork(stream))) return true;
   }
   return false;
 }
@@ -108,23 +108,23 @@ describe("secondary indexer", () => {
 
       const manager = createSecondaryIndexManager(cfg, app, store);
       app.deps.db.db.query(`UPDATE streams SET last_append_ms=? WHERE stream=?;`).run(app.deps.db.nowMs() - 600_000n, "evlog");
-      expect(waitForExactIdleGate(manager, "evlog")).toBe(true);
+      expect(await waitForExactIdleGate(manager, "evlog")).toBe(true);
 
       app.deps.db.db.query(`UPDATE streams SET logical_size_bytes=logical_size_bytes+1 WHERE stream=?;`).run("evlog");
-      expect((manager as any).shouldPauseExactBackgroundWork("evlog")).toBe(true);
+      expect(await (manager as any).shouldPauseExactBackgroundWork("evlog")).toBe(true);
 
       app.deps.db.db
         .query(`UPDATE streams SET pending_rows=1, pending_bytes=1, last_append_ms=? WHERE stream=?;`)
         .run(app.deps.db.nowMs(), "evlog");
-      expect((manager as any).shouldPauseExactBackgroundWork("evlog")).toBe(true);
+      expect(await (manager as any).shouldPauseExactBackgroundWork("evlog")).toBe(true);
 
       app.deps.db.db
         .query(`UPDATE streams SET pending_rows=1, pending_bytes=1, last_append_ms=?, segment_in_progress=0 WHERE stream=?;`)
         .run(app.deps.db.nowMs() - 600_000n, "evlog");
-      expect((manager as any).shouldPauseExactBackgroundWork("evlog")).toBe(true);
+      expect(await (manager as any).shouldPauseExactBackgroundWork("evlog")).toBe(true);
 
       app.deps.db.db.query(`UPDATE streams SET pending_rows=0, pending_bytes=0, segment_in_progress=1 WHERE stream=?;`).run("evlog");
-      expect((manager as any).shouldPauseExactBackgroundWork("evlog")).toBe(true);
+      expect(await (manager as any).shouldPauseExactBackgroundWork("evlog")).toBe(true);
 
       app.deps.db.db.query(`UPDATE streams SET segment_in_progress=0 WHERE stream=?;`).run("evlog");
       app.deps.db.createSegmentRow({
@@ -139,7 +139,7 @@ describe("secondary indexer", () => {
         sizeBytes: 1,
         localPath: `${root}/seg-0.bin`,
       });
-      expect((manager as any).shouldPauseExactBackgroundWork("evlog")).toBe(true);
+      expect(await (manager as any).shouldPauseExactBackgroundWork("evlog")).toBe(true);
     } finally {
       await app.close();
       rmSync(root, { recursive: true, force: true });
@@ -237,7 +237,7 @@ describe("secondary indexer", () => {
 
       const manager = createSecondaryIndexManager(cfg, app, store);
       app.deps.db.db.query(`UPDATE streams SET last_append_ms=? WHERE stream=?;`).run(app.deps.db.nowMs() - 600_000n, "evlog");
-      expect(waitForExactIdleGate(manager, "evlog")).toBe(true);
+      expect(await waitForExactIdleGate(manager, "evlog")).toBe(true);
       manager.enqueue("evlog");
       await (manager as any).tick?.();
       const deadline = Date.now() + 10_000;

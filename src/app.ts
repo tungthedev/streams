@@ -431,9 +431,11 @@ export function createPostgresApp(cfg: Config, store: PostgresDurableStore, opts
 export function createPostgresFullApp(cfg: Config, store: PostgresDurableStore, os: ObjectStore, opts: CreateAppOptions = {}): App {
   return createAppCore(cfg, {
     store,
+    detailsStore: store.fullModeDetails(),
     stats: opts.stats,
-    createRuntime: ({ config, registry, notifier, stats, backpressure, memorySampler, memory }) => {
+    createRuntime: ({ config, registry, notifier, stats, backpressure, metrics, memorySampler, memory, asyncIndexGate, foregroundActivity }) => {
       const segmentStore = store.fullModeSegments();
+      const indexStores = store.fullModeIndexStores();
       const diskCache = new SegmentDiskCache(`${config.rootDir}/cache`, config.segmentCacheMaxBytes);
       const segmenterHooks: SegmenterHooks = {
         onSegmentSealed: (stream, payloadBytes, segmentBytes) => {
@@ -443,7 +445,60 @@ export function createPostgresFullApp(cfg: Config, store: PostgresDurableStore, 
         },
       };
       const uploader = new Uploader(config, segmentStore, os, diskCache, stats, backpressure, undefined, memorySampler);
+      const routingIndexer = new IndexManager(
+        config,
+        indexStores.routing,
+        os,
+        diskCache,
+        (stream) => uploader.publishManifest(stream),
+        metrics,
+        (stream) => notifier.notifyDetailsChanged(stream),
+        memorySampler,
+        registry,
+        asyncIndexGate,
+        foregroundActivity
+      );
+      const secondaryIndexer = new SecondaryIndexManager(
+        config,
+        indexStores.secondary,
+        indexStores.companions,
+        os,
+        registry,
+        diskCache,
+        (stream) => uploader.publishManifest(stream),
+        (stream) => notifier.notifyDetailsChanged(stream),
+        memorySampler,
+        asyncIndexGate,
+        foregroundActivity
+      );
+      const companionIndexer = new SearchCompanionManager(
+        config,
+        indexStores.companions,
+        os,
+        registry,
+        diskCache,
+        (stream) => uploader.publishManifest(stream),
+        (stream) => notifier.notifyDetailsChanged(stream),
+        metrics,
+        memorySampler,
+        asyncIndexGate,
+        foregroundActivity
+      );
+      const lexiconIndexer = new LexiconIndexManager(
+        config,
+        indexStores.lexicon,
+        os,
+        diskCache,
+        (stream) => uploader.publishManifest(stream),
+        (stream) => notifier.notifyDetailsChanged(stream),
+        metrics,
+        registry,
+        asyncIndexGate,
+        foregroundActivity
+      );
+      const indexer = new CombinedIndexController(routingIndexer, secondaryIndexer, companionIndexer, lexiconIndexer);
       uploader.setHooks({
+        onSegmentsUploaded: (stream) => indexer.enqueue(stream),
         onMetadataChanged: (stream) => notifier.notifyDetailsChanged(stream),
       });
       const segmenter = new Segmenter(config, segmentStore, {}, segmenterHooks, memorySampler);
@@ -451,7 +506,7 @@ export function createPostgresFullApp(cfg: Config, store: PostgresDurableStore, 
         config,
         store,
         registry,
-        { segmentReads: segmentStore, objectStore: os, diskCache },
+        { segmentReads: segmentStore, objectStore: os, diskCache, index: indexer },
         memorySampler,
         memory
       );
@@ -478,6 +533,7 @@ export function createPostgresFullApp(cfg: Config, store: PostgresDurableStore, 
       };
       return {
         reader,
+        indexer,
         schemaPublication,
         fullMode: {
           store: os,
@@ -489,15 +545,29 @@ export function createPostgresFullApp(cfg: Config, store: PostgresDurableStore, 
           },
           getLocalStorageUsage: (stream: string) => ({
             segment_cache_bytes: diskCache.bytesForObjectKeyPrefix(`streams/${streamHash16Hex(stream)}/segments/`),
-            routing_index_cache_bytes: 0,
-            exact_index_cache_bytes: 0,
-            lexicon_index_cache_bytes: 0,
-            companion_cache_bytes: 0,
+            ...indexer.getLocalStorageUsage?.(stream),
           }),
         },
         start: () => {
           segmenter.start();
           uploader.start();
+          indexer.start();
+          setTimeout(() => {
+            void (async () => {
+              try {
+                let offset = 0;
+                const pageSize = 1000;
+                for (;;) {
+                  const streams = await store.listStreams(pageSize, offset);
+                  for (const row of streams) indexer.enqueue(row.stream);
+                  if (streams.length < pageSize) break;
+                  offset += streams.length;
+                }
+              } catch {
+                // App may have been closed before the startup catch-up kickoff ran.
+              }
+            })();
+          }, 0);
         },
       };
     },

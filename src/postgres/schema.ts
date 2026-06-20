@@ -19,7 +19,10 @@ export async function migratePostgresStore(pool: Pool, opts: PostgresMigrationOp
       throw dsError(`postgres schema version ${currentVersion} is not supported by version ${POSTGRES_SCHEMA_VERSION}`);
     }
     await installWalControlPlaneSchema(client);
-    if (opts.fullMode) await installFullModeSegmentSchema(client);
+    if (opts.fullMode) {
+      await installFullModeSegmentSchema(client);
+      await installFullModeIndexSchema(client);
+    }
     await setPostgresSchemaVersion(client, POSTGRES_SCHEMA_VERSION);
     await client.query("COMMIT");
   } catch (error) {
@@ -184,4 +187,114 @@ async function installFullModeSegmentSchema(executor: PgSchemaExecutor): Promise
   await executor.query(`CREATE INDEX IF NOT EXISTS streams_inprog_pending_idx ON streams(segment_in_progress, pending_bytes, last_segment_cut_ms);`);
   await executor.query(`CREATE INDEX IF NOT EXISTS segments_stream_start_idx ON segments(stream, start_offset);`);
   await executor.query(`CREATE INDEX IF NOT EXISTS segments_pending_upload_idx ON segments(uploaded_at_ms);`);
+}
+
+async function installFullModeIndexSchema(executor: PgSchemaExecutor): Promise<void> {
+  await executor.query(`
+    CREATE TABLE IF NOT EXISTS index_state (
+      stream text PRIMARY KEY REFERENCES streams(stream) ON DELETE CASCADE,
+      index_secret bytea NOT NULL,
+      indexed_through integer NOT NULL,
+      updated_at_ms bigint NOT NULL
+    );
+  `);
+  await executor.query(`
+    CREATE TABLE IF NOT EXISTS index_runs (
+      run_id text PRIMARY KEY,
+      stream text NOT NULL REFERENCES streams(stream) ON DELETE CASCADE,
+      level integer NOT NULL,
+      start_segment integer NOT NULL,
+      end_segment integer NOT NULL,
+      object_key text NOT NULL,
+      size_bytes bigint NOT NULL,
+      filter_len integer NOT NULL,
+      record_count integer NOT NULL,
+      retired_gen integer NULL,
+      retired_at_ms bigint NULL
+    );
+  `);
+  await executor.query(`
+    CREATE TABLE IF NOT EXISTS secondary_index_state (
+      stream text NOT NULL REFERENCES streams(stream) ON DELETE CASCADE,
+      index_name text NOT NULL,
+      index_secret bytea NOT NULL,
+      config_hash text NOT NULL,
+      indexed_through integer NOT NULL,
+      updated_at_ms bigint NOT NULL,
+      PRIMARY KEY(stream, index_name)
+    );
+  `);
+  await executor.query(`
+    CREATE TABLE IF NOT EXISTS secondary_index_runs (
+      run_id text PRIMARY KEY,
+      stream text NOT NULL REFERENCES streams(stream) ON DELETE CASCADE,
+      index_name text NOT NULL,
+      level integer NOT NULL,
+      start_segment integer NOT NULL,
+      end_segment integer NOT NULL,
+      object_key text NOT NULL,
+      size_bytes bigint NOT NULL,
+      filter_len integer NOT NULL,
+      record_count integer NOT NULL,
+      retired_gen integer NULL,
+      retired_at_ms bigint NULL
+    );
+  `);
+  await executor.query(`
+    CREATE TABLE IF NOT EXISTS lexicon_index_state (
+      stream text NOT NULL REFERENCES streams(stream) ON DELETE CASCADE,
+      source_kind text NOT NULL,
+      source_name text NOT NULL,
+      indexed_through integer NOT NULL,
+      updated_at_ms bigint NOT NULL,
+      PRIMARY KEY(stream, source_kind, source_name)
+    );
+  `);
+  await executor.query(`
+    CREATE TABLE IF NOT EXISTS lexicon_index_runs (
+      run_id text PRIMARY KEY,
+      stream text NOT NULL REFERENCES streams(stream) ON DELETE CASCADE,
+      source_kind text NOT NULL,
+      source_name text NOT NULL,
+      level integer NOT NULL,
+      start_segment integer NOT NULL,
+      end_segment integer NOT NULL,
+      object_key text NOT NULL,
+      size_bytes bigint NOT NULL,
+      record_count integer NOT NULL,
+      retired_gen integer NULL,
+      retired_at_ms bigint NULL
+    );
+  `);
+  await executor.query(`
+    CREATE TABLE IF NOT EXISTS search_companion_plans (
+      stream text PRIMARY KEY REFERENCES streams(stream) ON DELETE CASCADE,
+      generation integer NOT NULL,
+      plan_hash text NOT NULL,
+      plan_json text NOT NULL,
+      updated_at_ms bigint NOT NULL
+    );
+  `);
+  await executor.query(`
+    CREATE TABLE IF NOT EXISTS search_segment_companions (
+      stream text NOT NULL REFERENCES streams(stream) ON DELETE CASCADE,
+      segment_index integer NOT NULL,
+      object_key text NOT NULL,
+      plan_generation integer NOT NULL,
+      sections_json text NOT NULL,
+      section_sizes_json text NOT NULL,
+      size_bytes bigint NOT NULL,
+      primary_timestamp_min_ms bigint NULL,
+      primary_timestamp_max_ms bigint NULL,
+      updated_at_ms bigint NOT NULL,
+      PRIMARY KEY(stream, segment_index)
+    );
+  `);
+  await executor.query(`CREATE INDEX IF NOT EXISTS index_runs_active_idx ON index_runs(stream, retired_gen, level, start_segment);`);
+  await executor.query(`CREATE INDEX IF NOT EXISTS index_runs_retired_idx ON index_runs(stream, retired_gen, retired_at_ms);`);
+  await executor.query(`CREATE INDEX IF NOT EXISTS secondary_index_runs_active_idx ON secondary_index_runs(stream, index_name, retired_gen, level, start_segment);`);
+  await executor.query(`CREATE INDEX IF NOT EXISTS secondary_index_runs_retired_idx ON secondary_index_runs(stream, index_name, retired_gen, retired_at_ms);`);
+  await executor.query(`CREATE INDEX IF NOT EXISTS lexicon_index_runs_active_idx ON lexicon_index_runs(stream, source_kind, source_name, retired_gen, level, start_segment);`);
+  await executor.query(`CREATE INDEX IF NOT EXISTS lexicon_index_runs_retired_idx ON lexicon_index_runs(stream, source_kind, source_name, retired_gen, retired_at_ms);`);
+  await executor.query(`CREATE INDEX IF NOT EXISTS search_segment_companions_plan_idx ON search_segment_companions(stream, plan_generation, segment_index);`);
 }

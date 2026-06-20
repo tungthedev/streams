@@ -17,6 +17,15 @@ import { STREAM_FLAG_DELETED } from "../store/rows";
 import { readU64LE } from "../util/endian";
 import { dsError } from "../util/ds_error";
 import type { PgExecutor, PgStreamRow } from "./types";
+import { loadPostgresRoutingIndexManifest } from "./routing_index";
+import { loadPostgresSecondaryIndexManifest } from "./secondary_index";
+import { loadPostgresLexiconIndexManifest } from "./lexicon_index";
+import {
+  getPostgresSearchCompanionPlan,
+  getPostgresSearchSegmentCompanion,
+  listPostgresSearchSegmentCompanions,
+  loadPostgresSearchCompanionManifest,
+} from "./companions";
 
 const WAL_GC_CHUNK_OFFSETS = 100_000n;
 const SEGMENT_CLAIM_LEASE_MS = 5 * 60 * 1000;
@@ -86,15 +95,15 @@ export class PostgresSegmentManifestStore implements SegmentReadStore, SegmentSt
   }
 
   getSearchCompanionPlanForRead(_stream: string): Promise<SearchCompanionPlanReadRow | null> {
-    return Promise.resolve(null);
+    return getPostgresSearchCompanionPlan(this.pool, _stream);
   }
 
   listSearchSegmentCompanionsForRead(_stream: string): Promise<SearchSegmentCompanionReadRow[]> {
-    return Promise.resolve([]);
+    return listPostgresSearchSegmentCompanions(this.pool, _stream);
   }
 
   getSearchSegmentCompanionForRead(_stream: string, _segmentIndex: number): Promise<SearchSegmentCompanionReadRow | null> {
-    return Promise.resolve(null);
+    return getPostgresSearchSegmentCompanion(this.pool, _stream, _segmentIndex);
   }
 
   async candidates(minPendingBytes: bigint, minPendingRows: bigint, maxIntervalMs: bigint, limit: number): Promise<SegmentCandidateRow[]> {
@@ -329,6 +338,10 @@ export class PostgresSegmentManifestStore implements SegmentReadStore, SegmentSt
         streamRow.logical_size_bytes > unpublishedWalBytes ? streamRow.logical_size_bytes - unpublishedWalBytes : 0n;
       const manifestRow = await this.getManifestRow(publication.client, stream);
       const profileJson = await this.getProfileJson(publication.client, stream);
+      const routingIndex = await loadPostgresRoutingIndexManifest(publication.client, stream);
+      const secondaryIndex = await loadPostgresSecondaryIndexManifest(publication.client, stream);
+      const lexiconIndex = await loadPostgresLexiconIndexManifest(publication.client, stream);
+      const searchCompanions = await loadPostgresSearchCompanionManifest(publication.client, stream);
       await publication.client.query("COMMIT");
 
       keepLease = true;
@@ -342,17 +355,17 @@ export class PostgresSegmentManifestStore implements SegmentReadStore, SegmentSt
         generation: manifestRow.generation + 1,
         segmentMeta,
         profileJson,
-        indexState: null,
-        indexRuns: [],
-        retiredRuns: [],
-        secondaryIndexStates: [],
-        secondaryIndexRuns: [],
-        retiredSecondaryIndexRuns: [],
-        lexiconIndexStates: [],
-        lexiconIndexRuns: [],
-        retiredLexiconIndexRuns: [],
-        searchCompanionPlan: null,
-        searchSegmentCompanions: [],
+        indexState: routingIndex.indexState,
+        indexRuns: routingIndex.indexRuns,
+        retiredRuns: routingIndex.retiredRuns,
+        secondaryIndexStates: secondaryIndex.secondaryIndexStates,
+        secondaryIndexRuns: secondaryIndex.secondaryIndexRuns,
+        retiredSecondaryIndexRuns: secondaryIndex.retiredSecondaryIndexRuns,
+        lexiconIndexStates: lexiconIndex.lexiconIndexStates,
+        lexiconIndexRuns: lexiconIndex.lexiconIndexRuns,
+        retiredLexiconIndexRuns: lexiconIndex.retiredLexiconIndexRuns,
+        searchCompanionPlan: searchCompanions.searchCompanionPlan,
+        searchSegmentCompanions: searchCompanions.searchSegmentCompanions,
       };
     } finally {
       if (!keepLease) {
