@@ -2,25 +2,27 @@ import { describe, expect, test } from "bun:test";
 import { Pool } from "pg";
 import { Result } from "better-result";
 import { PostgresDurableStore } from "../src/postgres/store";
-import { migratePostgresStore } from "../src/postgres/schema";
+import { migratePostgresStore, readPostgresSchemaVersion } from "../src/postgres/schema";
 import { SchemaRegistryStore } from "../src/schema/registry";
 import { StreamProfileStore } from "../src/profiles";
 
 const POSTGRES_URL = process.env.DS_TEST_POSTGRES_URL;
 const maybeDescribe = POSTGRES_URL ? describe : describe.skip;
 
-async function withPostgresStore<T>(fn: (store: PostgresDurableStore, ctx: { schema: string }) => Promise<T>): Promise<T> {
+function schemaConnectionString(schema: string): string {
+  if (!POSTGRES_URL) throw new Error("DS_TEST_POSTGRES_URL is required");
+  return `${POSTGRES_URL}${POSTGRES_URL.includes("?") ? "&" : "?"}options=-c%20search_path%3D${schema}`;
+}
+
+async function withPostgresSchema<T>(fn: (ctx: { schema: string; connectionString: string }) => Promise<T>): Promise<T> {
   if (!POSTGRES_URL) throw new Error("DS_TEST_POSTGRES_URL is required");
   const schema = `ds_test_${Date.now()}_${Math.random().toString(16).slice(2)}`;
   const setupPool = new Pool({ connectionString: POSTGRES_URL });
   await setupPool.query(`CREATE SCHEMA ${schema};`);
   await setupPool.end();
-
-  const store = await PostgresDurableStore.connect(`${POSTGRES_URL}${POSTGRES_URL.includes("?") ? "&" : "?"}options=-c%20search_path%3D${schema}`);
   try {
-    return await fn(store, { schema });
+    return await fn({ schema, connectionString: schemaConnectionString(schema) });
   } finally {
-    await store.close();
     const cleanupPool = new Pool({ connectionString: POSTGRES_URL });
     try {
       await cleanupPool.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE;`);
@@ -30,6 +32,17 @@ async function withPostgresStore<T>(fn: (store: PostgresDurableStore, ctx: { sch
   }
 }
 
+async function withPostgresStore<T>(fn: (store: PostgresDurableStore, ctx: { schema: string; connectionString: string }) => Promise<T>): Promise<T> {
+  return withPostgresSchema(async ({ schema, connectionString }) => {
+    const store = await PostgresDurableStore.connect(connectionString);
+    try {
+      return await fn(store, { schema, connectionString });
+    } finally {
+      await store.close();
+    }
+  });
+}
+
 async function collect<T>(iterable: AsyncIterable<T>): Promise<T[]> {
   const rows: T[] = [];
   for await (const row of iterable) rows.push(row);
@@ -37,10 +50,77 @@ async function collect<T>(iterable: AsyncIterable<T>): Promise<T[]> {
 }
 
 maybeDescribe("postgres durable store", () => {
+  test("migration installs baseline version and remains idempotent", async () => {
+    await withPostgresSchema(async ({ schema, connectionString }) => {
+      const inspectPool = new Pool({ connectionString });
+      try {
+        await migratePostgresStore(inspectPool);
+        await migratePostgresStore(inspectPool);
+        expect(await readPostgresSchemaVersion(inspectPool)).toBe(1);
+        const tables = await inspectPool.query<{ table_name: string }>(
+          `SELECT table_name
+           FROM information_schema.tables
+           WHERE table_schema = $1
+           ORDER BY table_name ASC;`,
+          [schema]
+        );
+        expect(tables.rows.map((row) => row.table_name)).toEqual([
+          "producer_state",
+          "schema_version",
+          "schemas",
+          "stream_profiles",
+          "streams",
+          "wal",
+        ]);
+      } finally {
+        await inspectPool.end();
+      }
+    });
+  });
+
+  test("migration starts from existing version 1 database", async () => {
+    await withPostgresStore(async (store, { connectionString }) => {
+      const inspectPool = new Pool({ connectionString });
+      try {
+        await inspectPool.query(`UPDATE schema_version SET version = 1;`);
+        await store.migrate();
+        expect(await readPostgresSchemaVersion(inspectPool)).toBe(1);
+        const row = await inspectPool.query<{ count: string }>(`SELECT COUNT(*) AS count FROM schema_version;`);
+        expect(Number(row.rows[0]?.count ?? 0)).toBe(1);
+      } finally {
+        await inspectPool.end();
+      }
+    });
+  });
+
+  test("migration rejects newer schema versions", async () => {
+    await withPostgresStore(async (store, { connectionString }) => {
+      const inspectPool = new Pool({ connectionString });
+      try {
+        await inspectPool.query(`UPDATE schema_version SET version = 999;`);
+        await expect(store.migrate()).rejects.toThrow("postgres schema version 999 is not supported by version 1");
+      } finally {
+        await inspectPool.end();
+      }
+    });
+  });
+
+  test("migration rejects older unknown schema versions", async () => {
+    await withPostgresStore(async (store, { connectionString }) => {
+      const inspectPool = new Pool({ connectionString });
+      try {
+        await inspectPool.query(`UPDATE schema_version SET version = 0;`);
+        await expect(store.migrate()).rejects.toThrow("postgres schema version 0 is not supported by version 1");
+      } finally {
+        await inspectPool.end();
+      }
+    });
+  });
+
   test("migrations are idempotent and stream lifecycle works", async () => {
-    await withPostgresStore(async (store, { schema }) => {
+    await withPostgresStore(async (store, { schema, connectionString }) => {
       await store.migrate();
-      const inspectPool = new Pool({ connectionString: POSTGRES_URL });
+      const inspectPool = new Pool({ connectionString });
       try {
         const columns = await inspectPool.query<{ column_name: string }>(
           `SELECT column_name
