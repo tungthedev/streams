@@ -20,12 +20,32 @@ import { readSqliteRuntimeMemoryStats } from "./sqlite/runtime_stats";
 import { sumRuntimeMemoryValues } from "./runtime_memory";
 import { SqliteDurableStore } from "./db/db";
 import { PostgresDurableStore } from "./postgres/store";
+import { StreamSizeReconciler } from "./stream_size_reconciler";
 
 export type { App } from "./app_core";
 
 export type CreateAppOptions = {
   stats?: StatsCollector;
 };
+
+const INTERNAL_METRICS_STREAM = "__stream_metrics__";
+
+function clearInternalMetricsAccelerationState(db: SqliteDurableStore): void {
+  db.deleteAccelerationState(INTERNAL_METRICS_STREAM);
+}
+
+function reconcileDeletedStreamAccelerationState(db: SqliteDurableStore): void {
+  let offset = 0;
+  const pageSize = 1000;
+  for (;;) {
+    const streams = db.listDeletedStreams(pageSize, offset);
+    for (const stream of streams) {
+      db.deleteAccelerationState(stream);
+    }
+    if (streams.length < pageSize) break;
+    offset += streams.length;
+  }
+}
 
 class CombinedIndexController implements StreamIndexLookup {
   constructor(
@@ -104,13 +124,22 @@ class CombinedIndexController implements StreamIndexLookup {
   }
 }
 
-export function createApp(cfg: Config, os?: ObjectStore, opts: CreateAppOptions = {}): App {
+export function createApp(cfg: Config, os?: ObjectStore, opts: CreateAppOptions = {}): App<SqliteDurableStore> {
   const db = new SqliteDurableStore(cfg.dbPath, { cacheBytes: cfg.sqliteCacheBytes });
   return createAppCore(cfg, {
-    db,
+    debugStore: db,
     touchStore: db.touch,
     storageStatsStore: db,
     objectStoreAccountingStore: db,
+    detailsStore: db,
+    lifecycleHooks: {
+      beforeRuntimeCreate: () => {
+        db.resetSegmentInProgress();
+        reconcileDeletedStreamAccelerationState(db);
+      },
+      afterInternalMetricsProfileEnsured: () => clearInternalMetricsAccelerationState(db),
+      getInitialBackpressureBytes: () => db.sumPendingBytes() + db.sumPendingSegmentBytes(),
+    },
     store: db,
     stats: opts.stats,
     createRuntime: ({ config, ingest, registry, notifier, stats, backpressure, metrics, memorySampler, memory, asyncIndexGate, foregroundActivity }) => {
@@ -198,6 +227,12 @@ export function createApp(cfg: Config, os?: ObjectStore, opts: CreateAppOptions 
         config.segmenterWorkers > 0
           ? new SegmenterWorkerPool(config, config.segmenterWorkers, {}, segmenterHooks)
           : new Segmenter(config, db, {}, segmenterHooks, memorySampler);
+      const sizeReconciler = new StreamSizeReconciler(
+        db,
+        store,
+        diskCache,
+        (stream) => notifier.notifyDetailsChanged(stream)
+      );
 
       const schemaPublication = {
         uploadSchemaRegistry: async (stream: string, reg: SchemaRegistry): Promise<void> => {
@@ -230,6 +265,7 @@ export function createApp(cfg: Config, os?: ObjectStore, opts: CreateAppOptions 
           segmenter,
           uploader,
           segmentDiskCache: diskCache,
+          sizeReconciler,
           manifestPublication: {
             publishDeletedStreamManifest: (stream: string) => uploader.publishManifest(stream),
           },

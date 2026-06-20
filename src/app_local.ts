@@ -129,14 +129,18 @@ function localControlStore(db: SqliteDurableStore): WalControlPlaneStore {
   }) as WalControlPlaneStore;
 }
 
-export function createLocalApp(cfg: Config, os?: ObjectStore, opts: CreateLocalAppOptions = {}): App {
+export function createLocalApp(cfg: Config, os?: ObjectStore, opts: CreateLocalAppOptions = {}): App<SqliteDurableStore> {
   const db = new SqliteDurableStore(cfg.dbPath, { cacheBytes: cfg.sqliteCacheBytes });
   const controlStore = localControlStore(db);
   return createAppCore(cfg, {
-    db,
+    debugStore: db,
     touchStore: db.touch,
     storageStatsStore: db,
     objectStoreAccountingStore: db,
+    detailsStore: db,
+    lifecycleHooks: {
+      getInitialBackpressureBytes: () => db.sumPendingBytes() + db.sumPendingSegmentBytes(),
+    },
     store: controlStore,
     stats: opts.stats,
     createRuntime: ({ config, registry, memorySampler, memory }) => {

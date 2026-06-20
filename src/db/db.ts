@@ -31,6 +31,12 @@ import type {
 } from "../store/schema_profile_store";
 import type { WalControlPlaneStore, DurableStoreCapabilities } from "../store/capabilities";
 import type { ObjectStoreAccountingStore, StorageStatsStore } from "../store/stats_accounting_store";
+import type {
+  FullModeDetailsSnapshot,
+  FullModeDetailsSnapshotRequest,
+  FullModeDetailsStore,
+  FullModeLagSnapshotRequest,
+} from "../store/full_mode_details_store";
 import { SqliteWalStore } from "./sqlite_wal_store";
 import { loadSqliteManifestPublicationSnapshot } from "./sqlite_manifest_snapshot";
 import { SqliteTouchStore } from "./sqlite_touch_store";
@@ -86,7 +92,8 @@ export class SqliteDurableStore
     SchemaStore,
     ProfileStore,
     StorageStatsStore,
-    ObjectStoreAccountingStore
+    ObjectStoreAccountingStore,
+    FullModeDetailsStore
 {
   readonly kind = "sqlite" as const;
   readonly capabilities: DurableStoreCapabilities = {
@@ -2381,6 +2388,48 @@ export class SqliteDurableStore
     if (off + 8 > meta.segment_last_ts.byteLength) return null;
     const dv = new DataView(meta.segment_last_ts.buffer, meta.segment_last_ts.byteOffset, meta.segment_last_ts.byteLength);
     return dv.getBigUint64(off, true) / 1_000_000n;
+  }
+
+  getFullModeDetailsSnapshot(request: FullModeDetailsSnapshotRequest): FullModeDetailsSnapshot {
+    const stream = request.stream;
+    const segmentCount = this.countSegmentsForStream(stream);
+    const uploadedSegmentCount = this.countUploadedSegments(stream);
+    return {
+      segmentCount,
+      uploadedSegmentCount,
+      manifest: this.getManifestRow(stream),
+      schemaRow: this.getSchemaRegistry(stream),
+      uploadedSegmentBytes: this.getUploadedSegmentBytes(stream),
+      pendingSealedSegmentBytes: this.getPendingSealedSegmentBytes(stream),
+      routingIndexStorage: this.getRoutingIndexStorage(stream),
+      secondaryIndexStorage: this.getSecondaryIndexStorage(stream),
+      lexiconIndexStorage: this.getLexiconIndexStorage(stream),
+      bundledCompanionStorage: this.getBundledCompanionStorage(stream),
+      routingState: this.getIndexState(stream),
+      routingRuns: this.listIndexRuns(stream),
+      retiredRoutingRuns: this.listRetiredIndexRuns(stream),
+      exactIndexes: request.exactIndexNames.map((indexName) => ({
+        indexName,
+        state: this.getSecondaryIndexState(stream, indexName),
+        activeRuns: this.listSecondaryIndexRuns(stream, indexName),
+        retiredRuns: this.listRetiredSecondaryIndexRuns(stream, indexName),
+      })),
+      routingLexiconState: this.getLexiconIndexState(stream, "routing_key", ""),
+      routingLexiconRuns: this.listLexiconIndexRuns(stream, "routing_key", ""),
+      retiredRoutingLexiconRuns: this.listRetiredLexiconIndexRuns(stream, "routing_key", ""),
+      companionPlan: this.getSearchCompanionPlan(stream),
+      companionRows: this.listSearchSegmentCompanions(stream),
+    };
+  }
+
+  getFullModeLagSnapshot(request: FullModeLagSnapshotRequest): Map<number, bigint> {
+    const out = new Map<number, bigint>();
+    const sorted = Array.from(new Set(request.segmentIndexes.filter((index) => Number.isInteger(index) && index >= 0))).sort((a, b) => a - b);
+    for (const index of sorted) {
+      const lastAppendMs = this.getSegmentLastAppendMsFromMeta(request.stream, index);
+      if (lastAppendMs != null) out.set(index, lastAppendMs);
+    }
+    return out;
   }
 
   /** Find candidates by bytes/rows/interval. */

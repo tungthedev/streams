@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { createAppCore, type App } from "../src/app_core";
 import { loadConfig, type Config } from "../src/config";
 import { SqliteDurableStore } from "../src/db/db";
+import { MockR2Store } from "../src/objectstore/mock_r2";
 import { StreamReader } from "../src/reader";
 import type { WalControlPlaneStore } from "../src/store/capabilities";
 
@@ -106,7 +107,7 @@ describe("app core capability gates", () => {
     try {
       expect(() =>
         createAppCore(cfg, {
-          db,
+          debugStore: db,
           store: db,
           createRuntime: ({ config, registry, memorySampler, memory }) => ({
             reader: new StreamReader(config, db, registry, undefined, memorySampler, memory),
@@ -130,6 +131,36 @@ describe("app core capability gates", () => {
       const resp = await fetch(`${baseUrl}/v1/stream/__stream_metrics__?offset=0`);
       expect(resp.status).toBe(404);
     });
+  });
+
+  test("full-mode runtime startup does not require a sqlite debug store", async () => {
+    const root = mkdtempSync(join(tmpdir(), "ds-app-core-caps-full-no-sqlite-"));
+    const cfg = makeConfig(root);
+    const db = new SqliteDurableStore(cfg.dbPath, { cacheBytes: cfg.sqliteCacheBytes });
+    const controlStore = limitedControlStore(db);
+    const app = createAppCore(cfg, {
+      store: controlStore,
+      createRuntime: ({ config, registry, memorySampler, memory }) => ({
+        reader: new StreamReader(config, controlStore, registry, undefined, memorySampler, memory),
+        fullMode: {
+          store: new MockR2Store(),
+          segmenter: {
+            stop: async () => {},
+          } as any,
+          uploader: {
+            stop: () => {},
+          } as any,
+        },
+        start(): void {},
+      }),
+    });
+    try {
+      await app.ready;
+      expect(app.deps.db).toBeUndefined();
+    } finally {
+      await app.close();
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   test("startup rejects advertised stats/accounting capabilities without matching stores", () => {
@@ -172,6 +203,7 @@ describe("app core capability gates", () => {
     const app = createAppCore(cfg, {
       store: controlStore,
       storageStatsStore: db,
+      detailsStore: db,
       createRuntime: ({ config, registry, memorySampler, memory }) => ({
         reader: new StreamReader(config, controlStore, registry, undefined, memorySampler, memory),
         start(): void {},

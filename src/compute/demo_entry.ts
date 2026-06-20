@@ -1,6 +1,7 @@
 import { bootstrapFromR2 } from "../bootstrap";
 import { createApp, type App } from "../app";
 import { loadConfig } from "../config";
+import type { SqliteDurableStore } from "../db/db";
 import type { AppendRow } from "../ingest";
 import { MockR2Store } from "../objectstore/mock_r2";
 import { R2ObjectStore } from "../objectstore/r2";
@@ -161,7 +162,7 @@ function appendErrorMessage(kind: string): string {
   return "append failed";
 }
 
-function createColocatedStreamsTarget(streamsApp: App): StreamsFetchTarget {
+function createColocatedStreamsTarget(streamsApp: App<SqliteDurableStore>): StreamsFetchTarget {
   let activeGenerateJobs = 0;
   const generateStreamsToEnqueue = new Set<string>();
 

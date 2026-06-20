@@ -1,7 +1,9 @@
+import type { MaybePromise } from "./capabilities";
+
 export interface StorageStatsStore {
-  countStreams(): number;
-  getWalDbSizeBytes(): number;
-  getMetaDbSizeBytes(): number;
+  countStreams(): MaybePromise<number>;
+  getWalDbSizeBytes(): MaybePromise<number>;
+  getMetaDbSizeBytes(): MaybePromise<number>;
 }
 
 export type ObjectStoreRequestSummary = {
@@ -23,9 +25,9 @@ export type ObjectStoreRequestSummary = {
 };
 
 export interface ObjectStoreAccountingRecorder {
-  recordObjectStoreRequestByHash(streamHash: string, artifact: string, op: string, bytes?: number, count?: number): void;
+  recordObjectStoreRequestByHash(streamHash: string, artifact: string, op: string, bytes?: number, count?: number): MaybePromise<void>;
 }
 
 export interface ObjectStoreAccountingStore extends ObjectStoreAccountingRecorder {
-  getObjectStoreRequestSummaryByHash(streamHash: string): ObjectStoreRequestSummary;
+  getObjectStoreRequestSummaryByHash(streamHash: string): MaybePromise<ObjectStoreRequestSummary>;
 }

@@ -1,7 +1,6 @@
 import { mkdirSync } from "node:fs";
 import { createHash } from "node:crypto";
 import type { Config } from "./config";
-import type { SqliteDurableStore, StreamRow } from "./db/db";
 import { IngestQueue, type ProducerInfo, type AppendRow, type AppendResult } from "./ingest";
 import type { ObjectStore } from "./objectstore/interface";
 import type { StreamReader, ReadBatch, ReaderError, SearchHit, SearchResultBatch } from "./reader";
@@ -16,7 +15,6 @@ import {
   SchemaRegistryStore,
   parseSchemaUpdateResult,
   type SchemaRegistry,
-  type SearchConfig,
   type SchemaRegistryMutationError,
   type SchemaRegistryReadError,
 } from "./schema/registry";
@@ -26,12 +24,13 @@ import { ExpirySweeper } from "./expiry_sweeper";
 import type { StatsCollector } from "./stats";
 import type { TouchProcessorStore } from "./store/touch_store";
 import type { ObjectStoreAccountingStore, StorageStatsStore } from "./store/stats_accounting_store";
+import { FullModeDetailsBuilder, type LocalStorageUsage } from "./details/full_mode_details";
+import type { FullModeDetailsStore } from "./store/full_mode_details_store";
 import { BackpressureGate } from "./backpressure";
 import { MemoryPressureMonitor } from "./memory";
 import { RuntimeMemorySampler } from "./runtime_memory_sampler";
 import { TouchProcessorManager } from "./touch/manager";
 import type { SegmentDiskCache } from "./segment/cache";
-import { StreamSizeReconciler } from "./stream_size_reconciler";
 import { ConcurrencyGate } from "./concurrency_gate";
 import {
   buildProcessMemoryBreakdown,
@@ -46,8 +45,6 @@ import type { StreamIndexLookup } from "./index/indexer";
 import { ForegroundActivityTracker } from "./foreground_activity";
 import { Result } from "better-result";
 import { parseReadFilterResult } from "./read_filter";
-import { hashSecondaryIndexField } from "./index/secondary_schema";
-import { buildDesiredSearchCompanionPlan, hashSearchCompanionPlan } from "./search/companion_plan";
 import { parseSearchRequestBodyResult, parseSearchRequestQueryResult } from "./search/query";
 import { parseAggregateRequestBodyResult } from "./search/aggregate";
 import {
@@ -58,7 +55,6 @@ import {
   resolveJsonIngestCapability,
   resolveTouchCapability,
   type PreparedJsonRecord,
-  type StreamProfileSpec,
   type StreamTouchRoute,
 } from "./profiles";
 import { encodeOtlpTraceExportResponse } from "./profiles/otelTraces/otlp";
@@ -82,7 +78,11 @@ import { buildRequestObservabilityPairingDescriptor } from "./observe/pairing";
 import { dsError } from "./util/ds_error.ts";
 import type { SchemaPublicationStore } from "./store/schema_publication";
 import { requireWalControlPlaneStore, type WalControlPlaneStore } from "./store/capabilities";
-import { streamHash16Hex } from "./util/stream_paths";
+import type { StreamRow } from "./store/rows";
+
+export type AppDebugStore = {
+  close?: () => void | Promise<void>;
+};
 
 function withNosniff(headers: HeadersInit = {}): HeadersInit {
   return {
@@ -313,23 +313,6 @@ function encodeSseEvent(eventType: string, data: string): string {
 
 const INTERNAL_METRICS_STREAM = "__stream_metrics__";
 
-function clearInternalMetricsAccelerationState(db: SqliteDurableStore): void {
-  db.deleteAccelerationState(INTERNAL_METRICS_STREAM);
-}
-
-function reconcileDeletedStreamAccelerationState(db: SqliteDurableStore): void {
-  let offset = 0;
-  const pageSize = 1000;
-  for (;;) {
-    const streams = db.listDeletedStreams(pageSize, offset);
-    for (const stream of streams) {
-      db.deleteAccelerationState(stream);
-    }
-    if (streams.length < pageSize) break;
-    offset += streams.length;
-  }
-}
-
 function computeCursor(nowMs: number, provided: string | null): string {
   let cursor = Math.floor(nowMs / 1000);
   if (provided && /^[0-9]+$/.test(provided)) {
@@ -382,83 +365,14 @@ function weakEtag(namespace: string, body: string): string {
   return `W/"${namespace}:${hash}"`;
 }
 
-function configuredExactIndexes(search: SearchConfig | undefined): Array<{ name: string; kind: string; configHash: string }> {
-  if (!search) return [];
-  return Object.entries(search.fields)
-    .filter(([, field]) => field.exact === true && field.kind !== "text")
-    .map(([name, field]) => ({
-      name,
-      kind: field.kind,
-      configHash: hashSecondaryIndexField({ name, config: field }),
-    }))
-    .sort((a, b) => a.name.localeCompare(b.name));
-}
 
-function configuredSearchFamilies(search: SearchConfig | undefined): Array<{ family: "exact" | "col" | "fts" | "agg" | "mblk"; fields: string[] }> {
-  if (!search) return [];
-  const out: Array<{ family: "exact" | "col" | "fts" | "agg" | "mblk"; fields: string[] }> = [];
-  const exactFields = Object.entries(search.fields)
-    .filter(([, field]) => field.exact === true && field.kind !== "text")
-    .map(([name]) => name)
-    .sort((a, b) => a.localeCompare(b));
-  if (exactFields.length > 0) out.push({ family: "exact", fields: exactFields });
-  const colFields = Object.entries(search.fields)
-    .filter(([, field]) => field.column === true)
-    .map(([name]) => name)
-    .sort((a, b) => a.localeCompare(b));
-  if (colFields.length > 0) out.push({ family: "col", fields: colFields });
-  const ftsFields = Object.entries(search.fields)
-    .filter(([, field]) => field.kind === "text" || (field.kind === "keyword" && field.prefix === true))
-    .map(([name]) => name)
-    .sort((a, b) => a.localeCompare(b));
-  if (ftsFields.length > 0) out.push({ family: "fts", fields: ftsFields });
-  const aggRollups = Object.keys(search.rollups ?? {}).sort((a, b) => a.localeCompare(b));
-  if (aggRollups.length > 0) out.push({ family: "agg", fields: aggRollups });
-  if (search.profile === "metrics") out.push({ family: "mblk", fields: ["metrics"] });
-  return out;
-}
-
-function parseCompanionSections(value: string): Set<string> {
-  try {
-    const parsed = JSON.parse(value);
-    return new Set(Array.isArray(parsed) ? parsed.filter((entry) => typeof entry === "string") : []);
-  } catch {
-    return new Set();
-  }
-}
-
-function parseCompanionSectionSizes(value: string): Record<string, number> {
-  try {
-    const parsed = JSON.parse(value);
-    if (!parsed || typeof parsed !== "object") return {};
-    const out: Record<string, number> = {};
-    for (const [key, raw] of Object.entries(parsed)) {
-      if (typeof raw === "number" && Number.isFinite(raw) && raw >= 0) out[key] = raw;
-    }
-    return out;
-  } catch {
-    return {};
-  }
-}
-
-function contiguousCoveredSegmentCount(rows: Array<{ segment_index: number; sections_json: string }>, family: string): number {
-  let expected = 0;
-  for (const row of rows) {
-    if (row.segment_index < expected) continue;
-    if (row.segment_index > expected) break;
-    if (!parseCompanionSections(row.sections_json).has(family)) break;
-    expected += 1;
-  }
-  return expected;
-}
-
-export type App = {
+export type App<TDebugStore extends AppDebugStore = AppDebugStore> = {
   fetch: (req: Request) => Promise<Response>;
   close: () => Promise<void>;
   ready: Promise<void>;
   deps: {
     config: Config;
-    db?: SqliteDurableStore;
+    db?: TDebugStore;
     os?: ObjectStore;
     ingest: IngestQueue;
     notifier: StreamNotifier;
@@ -488,7 +402,6 @@ export type App = {
 export type CreateAppRuntimeArgs = {
   config: Config;
   controlStore: WalControlPlaneStore;
-  db?: SqliteDurableStore;
   ingest: IngestQueue;
   notifier: StreamNotifier;
   registry: SchemaRegistryStore;
@@ -508,6 +421,10 @@ type FullModeRuntimeDeps = {
   segmenter: SegmenterController;
   uploader: UploaderController;
   segmentDiskCache?: SegmentDiskCache;
+  sizeReconciler?: {
+    start(): void;
+    stop(): void;
+  };
   manifestPublication?: {
     publishDeletedStreamManifest(stream: string): Promise<void>;
   };
@@ -529,22 +446,28 @@ type AppRuntimeDeps = {
   start(): void;
 };
 
-export type CreateAppCoreOptions = {
+export type CreateAppCoreOptions<TDebugStore extends AppDebugStore = AppDebugStore> = {
   store: WalControlPlaneStore;
-  db?: SqliteDurableStore;
+  debugStore?: TDebugStore;
   touchStore?: TouchProcessorStore;
   storageStatsStore?: StorageStatsStore;
   objectStoreAccountingStore?: ObjectStoreAccountingStore;
+  detailsStore?: FullModeDetailsStore;
+  lifecycleHooks?: {
+    beforeRuntimeCreate?(): void;
+    afterInternalMetricsProfileEnsured?(): void;
+    getInitialBackpressureBytes?(): number;
+  };
   stats?: StatsCollector;
   createRuntime(args: CreateAppRuntimeArgs): AppRuntimeDeps;
 };
 
 function validateRuntimeCapabilityBundle(
   controlStore: WalControlPlaneStore,
-  db: SqliteDurableStore | undefined,
   touchStore: TouchProcessorStore | undefined,
   storageStatsStore: StorageStatsStore | undefined,
   objectStoreAccountingStore: ObjectStoreAccountingStore | undefined,
+  detailsStore: FullModeDetailsStore | undefined,
   runtime: AppRuntimeDeps
 ): void {
   const caps = controlStore.capabilities;
@@ -553,9 +476,11 @@ function validateRuntimeCapabilityBundle(
   if (caps.manifests && !runtime.fullMode?.manifestPublication) throw dsError("manifest capability requires a full-mode manifest runtime");
   if (caps.storageStats && !storageStatsStore) throw dsError("storage stats capability requires a storage stats store");
   if (caps.objectStoreAccounting && !objectStoreAccountingStore) throw dsError("object-store accounting capability requires an accounting store");
+  if ((caps.storageStats || caps.objectStoreAccounting || caps.indexes) && !detailsStore) {
+    throw dsError("details/index capabilities require a full-mode details store");
+  }
   if (caps.touch && !touchStore) throw dsError("touch capability requires a touch metadata store");
   if (caps.internalMetrics && !caps.builtinProfiles) throw dsError("internal metrics capability requires built-in profile support");
-  if (runtime.fullMode && !db) throw dsError("full-mode runtime requires a sqlite metadata store");
 }
 
 function reduceConcurrencyLimit(limit: number): number {
@@ -575,22 +500,25 @@ function unsupportedCapability(name: string): Response {
   return json(501, { error: { code: "unsupported_capability", message: `${name} capability is not available` } });
 }
 
-export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
+export function createAppCore<TDebugStore extends AppDebugStore = AppDebugStore>(
+  cfg: Config,
+  opts: CreateAppCoreOptions<TDebugStore>
+): App<TDebugStore> {
   mkdirSync(cfg.rootDir, { recursive: true });
   cleanupTempSegments(cfg.rootDir);
 
   const controlStore = requireWalControlPlaneStore(opts.store);
-  const db = opts.db;
+  const debugStore = opts.debugStore;
   const touchStore = opts.touchStore;
   const storageStatsStore = opts.storageStatsStore;
   const objectStoreAccountingStore = opts.objectStoreAccountingStore;
-  db?.resetSegmentInProgress();
-  if (db) reconcileDeletedStreamAccelerationState(db);
+  const detailsStore = opts.detailsStore;
+  opts.lifecycleHooks?.beforeRuntimeCreate?.();
   const stats = opts.stats;
   const metrics = new Metrics();
   const backpressure =
     cfg.localBacklogMaxBytes > 0
-      ? new BackpressureGate(cfg.localBacklogMaxBytes, db ? db.sumPendingBytes() + db.sumPendingSegmentBytes() : 0)
+      ? new BackpressureGate(cfg.localBacklogMaxBytes, opts.lifecycleHooks?.getInitialBackpressureBytes?.() ?? 0)
       : undefined;
   const memorySampler =
     cfg.memorySamplerPath != null
@@ -659,7 +587,6 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
   const touch = touchStore && controlStore.capabilities.touch ? new TouchProcessorManager(cfg, touchStore, ingest, notifier, profiles, backpressure) : undefined;
   const runtime = opts.createRuntime({
     config: cfg,
-    db,
     controlStore,
     ingest,
     notifier,
@@ -674,7 +601,7 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
     metrics,
     memorySampler,
   });
-  validateRuntimeCapabilityBundle(controlStore, db, touchStore, storageStatsStore, objectStoreAccountingStore, runtime);
+  validateRuntimeCapabilityBundle(controlStore, touchStore, storageStatsStore, objectStoreAccountingStore, detailsStore, runtime);
   const {
     reader,
     indexer,
@@ -683,6 +610,15 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
     getRuntimeMemorySnapshot,
   } = runtime;
   const getLocalStorageUsage = fullMode?.getLocalStorageUsage;
+  const detailsBuilder =
+    detailsStore
+      ? new FullModeDetailsBuilder({
+          detailsStore,
+          storageStatsStore,
+          objectStoreAccountingStore,
+          getLocalStorageUsage: getLocalStorageUsage as ((stream: string) => Partial<LocalStorageUsage>) | undefined,
+        })
+      : undefined;
   memorySampler?.start();
   memory.start();
   ingest.start();
@@ -1179,22 +1115,13 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
     collectRuntimeMetrics,
   });
   const expirySweeper = new ExpirySweeper(cfg, controlStore);
-  const streamSizeReconciler =
-    db && fullMode
-      ? new StreamSizeReconciler(
-          db,
-          fullMode.store,
-          fullMode.segmentDiskCache,
-          (stream) => notifier.notifyDetailsChanged(stream)
-        )
-      : undefined;
   let closing = false;
 
   const startupPromise = (async () => {
     let metricsProfileRes: Awaited<ReturnType<StreamProfileStore["updateProfileResult"]>> | null = null;
     if (controlStore.capabilities.internalMetrics) {
       await controlStore.ensureStream(INTERNAL_METRICS_STREAM, { contentType: "application/json", profile: "metrics" });
-      if (db) clearInternalMetricsAccelerationState(db);
+      opts.lifecycleHooks?.afterInternalMetricsProfileEnsured?.();
       metricsProfileRes = await profiles.updateProfileResult(INTERNAL_METRICS_STREAM, { kind: "metrics" });
       if (Result.isError(metricsProfileRes)) {
         throw dsError(`failed to initialize ${INTERNAL_METRICS_STREAM} profile: ${metricsProfileRes.error.message}`);
@@ -1205,7 +1132,7 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
     if (controlStore.capabilities.internalMetrics) metricsEmitter.start();
     expirySweeper.start();
     touch?.start();
-    streamSizeReconciler?.start();
+    fullMode?.sizeReconciler?.start();
     if (schemaPublication && metricsProfileRes && Result.isOk(metricsProfileRes) && metricsProfileRes.value.schemaRegistry) {
       void schemaPublication
         .publishProfileSchemaRegistry(INTERNAL_METRICS_STREAM, metricsProfileRes.value.schemaRegistry)
@@ -1232,11 +1159,6 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
     const srowRes = await getLiveStreamResult(stream);
     if (Result.isOk(srowRes)) return srowRes.value;
     return srowRes.error.message === "stream expired" ? notFound("stream expired") : notFound();
-  };
-
-  const requireSqliteFullModeStore = (): Result<SqliteDurableStore, { status: 500; message: string }> => {
-    if (!db) return Result.err({ status: 500, message: "sqlite full-mode store is not available" });
-    return Result.ok(db);
   };
 
   const buildJsonRows = async (
@@ -1432,301 +1354,6 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
     return Result.ok(Buffer.concat(parts));
   };
 
-  const buildStreamSummary = (
-    stream: string,
-    row: StreamRow,
-    profile: StreamProfileSpec
-  ) => {
-    const sqliteRes = requireSqliteFullModeStore();
-    if (Result.isError(sqliteRes)) throw dsError(sqliteRes.error.message);
-    const sqlite = sqliteRes.value;
-    const observability = buildRequestObservabilityPairingDescriptor(stream, profile);
-    return {
-      name: stream,
-      content_type: normalizeContentType(row.content_type) ?? row.content_type,
-      profile: profile.kind,
-      ...(observability ? { observability } : {}),
-      created_at: timestampToIsoString(row.created_at_ms),
-      updated_at: timestampToIsoString(row.updated_at_ms),
-      expires_at: timestampToIsoString(row.expires_at_ms),
-      ttl_seconds: row.ttl_seconds,
-      stream_seq: row.stream_seq,
-      closed: row.closed !== 0,
-      epoch: row.epoch,
-      next_offset: row.next_offset.toString(),
-      sealed_through: row.sealed_through.toString(),
-      uploaded_through: row.uploaded_through.toString(),
-      segment_count: sqlite.countSegmentsForStream(stream),
-      uploaded_segment_count: sqlite.countUploadedSegments(stream),
-      pending_rows: row.pending_rows.toString(),
-      pending_bytes: row.pending_bytes.toString(),
-      total_size_bytes: row.logical_size_bytes.toString(),
-      wal_rows: row.wal_rows.toString(),
-      wal_bytes: row.wal_bytes.toString(),
-      last_append_at: timestampToIsoString(row.last_append_ms),
-      last_segment_cut_at: timestampToIsoString(row.last_segment_cut_ms),
-    };
-  };
-
-  const buildIndexLagMs = (stream: string, headRow: StreamRow, coveredSegmentCount: number): string | null => {
-    if (coveredSegmentCount <= 0) return null;
-    const sqliteRes = requireSqliteFullModeStore();
-    if (Result.isError(sqliteRes)) throw dsError(sqliteRes.error.message);
-    const coveredLastAppendMs = sqliteRes.value.getSegmentLastAppendMsFromMeta(stream, coveredSegmentCount - 1);
-    if (coveredLastAppendMs == null) return null;
-    const lagMs = headRow.last_append_ms > coveredLastAppendMs ? headRow.last_append_ms - coveredLastAppendMs : 0n;
-    return lagMs.toString();
-  };
-
-  const buildStorageBreakdown = (
-    stream: string,
-    row: StreamRow,
-    currentCompanionRows: Array<{
-      sections_json: string;
-      section_sizes_json: string;
-      size_bytes: number;
-    }>,
-    indexStatus: any
-  ) => {
-    const sqliteRes = requireSqliteFullModeStore();
-    if (Result.isError(sqliteRes)) throw dsError(sqliteRes.error.message);
-    const sqlite = sqliteRes.value;
-    const manifest = sqlite.getManifestRow(stream);
-    const schemaRow = sqlite.getSchemaRegistry(stream);
-    const uploadedSegmentBytes = sqlite.getUploadedSegmentBytes(stream);
-    const pendingSealedSegmentBytes = sqlite.getPendingSealedSegmentBytes(stream);
-    const routingIndexStorage = sqlite.getRoutingIndexStorage(stream);
-    const routingLexiconStorage =
-      sqlite
-        .getLexiconIndexStorage(stream)
-        .find((entry) => entry.source_kind === "routing_key" && entry.source_name === "") ?? { object_count: 0, bytes: 0n };
-    const secondaryIndexStorage = new Map(sqlite.getSecondaryIndexStorage(stream).map((entry) => [entry.index_name, entry]));
-    const companionStorage = sqlite.getBundledCompanionStorage(stream);
-    const localStorageUsage = {
-      segment_cache_bytes: 0,
-      routing_index_cache_bytes: 0,
-      exact_index_cache_bytes: 0,
-      lexicon_index_cache_bytes: 0,
-      companion_cache_bytes: 0,
-      ...(getLocalStorageUsage?.(stream) ?? {}),
-    };
-    if (!storageStatsStore) throw dsError("storage stats capability requires a storage stats store");
-    const sqliteSharedBytes = BigInt(storageStatsStore.getWalDbSizeBytes() + storageStatsStore.getMetaDbSizeBytes());
-    const exactIndexBytes = indexStatus.exact_indexes.reduce((sum: bigint, entry: any) => sum + BigInt(entry.bytes_at_rest ?? 0), 0n);
-    const familyBytes = new Map<string, bigint>();
-    for (const row of currentCompanionRows) {
-      const sizes = parseCompanionSectionSizes(row.section_sizes_json);
-      for (const [kind, size] of Object.entries(sizes)) {
-        familyBytes.set(kind, (familyBytes.get(kind) ?? 0n) + BigInt(size));
-      }
-    }
-    return {
-      object_storage: {
-        total_bytes: (
-          uploadedSegmentBytes +
-          routingIndexStorage.bytes +
-          routingLexiconStorage.bytes +
-          exactIndexBytes +
-          companionStorage.bytes +
-          (manifest.last_uploaded_size_bytes ?? 0n) +
-          (schemaRow?.uploaded_size_bytes ?? 0n)
-        ).toString(),
-        segments_bytes: uploadedSegmentBytes.toString(),
-        indexes_bytes: (routingIndexStorage.bytes + routingLexiconStorage.bytes + exactIndexBytes + companionStorage.bytes).toString(),
-        manifest_and_meta_bytes: ((manifest.last_uploaded_size_bytes ?? 0n) + (schemaRow?.uploaded_size_bytes ?? 0n)).toString(),
-        manifest_bytes: (manifest.last_uploaded_size_bytes ?? 0n).toString(),
-        schema_registry_bytes: (schemaRow?.uploaded_size_bytes ?? 0n).toString(),
-        segment_object_count: indexStatus.segments.uploaded_count,
-        routing_index_object_count: routingIndexStorage.object_count,
-        routing_lexicon_object_count: routingLexiconStorage.object_count,
-        exact_index_object_count: indexStatus.exact_indexes.reduce((sum: number, entry: any) => sum + Number(entry.object_count ?? 0), 0),
-        bundled_companion_object_count: companionStorage.object_count,
-      },
-      local_storage: {
-        total_bytes: (
-          row.wal_bytes +
-          pendingSealedSegmentBytes +
-          BigInt(localStorageUsage.segment_cache_bytes) +
-          BigInt(localStorageUsage.routing_index_cache_bytes) +
-          BigInt(localStorageUsage.exact_index_cache_bytes) +
-          BigInt(localStorageUsage.lexicon_index_cache_bytes) +
-          BigInt(localStorageUsage.companion_cache_bytes)
-        ).toString(),
-        wal_retained_bytes: row.wal_bytes.toString(),
-        pending_tail_bytes: row.pending_bytes.toString(),
-        pending_sealed_segment_bytes: pendingSealedSegmentBytes.toString(),
-        segment_cache_bytes: String(localStorageUsage.segment_cache_bytes),
-        routing_index_cache_bytes: String(localStorageUsage.routing_index_cache_bytes),
-        exact_index_cache_bytes: String(localStorageUsage.exact_index_cache_bytes),
-        lexicon_index_cache_bytes: String(localStorageUsage.lexicon_index_cache_bytes),
-        companion_cache_bytes: String(localStorageUsage.companion_cache_bytes),
-        sqlite_shared_total_bytes: sqliteSharedBytes.toString(),
-      },
-      companion_families: {
-        exact_bytes: String(familyBytes.get("exact") ?? 0n),
-        col_bytes: String(familyBytes.get("col") ?? 0n),
-        fts_bytes: String(familyBytes.get("fts") ?? 0n),
-        agg_bytes: String(familyBytes.get("agg") ?? 0n),
-        mblk_bytes: String(familyBytes.get("mblk") ?? 0n),
-      },
-    };
-  };
-
-  const buildObjectStoreRequestSummary = (stream: string) => {
-    if (!objectStoreAccountingStore) throw dsError("object-store accounting capability requires an accounting store");
-    const summary = objectStoreAccountingStore.getObjectStoreRequestSummaryByHash(streamHash16Hex(stream));
-    return {
-      puts: summary.puts.toString(),
-      reads: summary.reads.toString(),
-      gets: summary.gets.toString(),
-      heads: summary.heads.toString(),
-      lists: summary.lists.toString(),
-      deletes: summary.deletes.toString(),
-      by_artifact: summary.by_artifact.map((entry) => ({
-        artifact: entry.artifact,
-        puts: entry.puts.toString(),
-        gets: entry.gets.toString(),
-        heads: entry.heads.toString(),
-        lists: entry.lists.toString(),
-        deletes: entry.deletes.toString(),
-        reads: entry.reads.toString(),
-      })),
-    };
-  };
-
-  const buildIndexStatus = (stream: string, row: StreamRow, reg: SchemaRegistry, profileKind: string) => {
-    const sqliteRes = requireSqliteFullModeStore();
-    if (Result.isError(sqliteRes)) throw dsError(sqliteRes.error.message);
-    const sqlite = sqliteRes.value;
-    const segmentCount = sqlite.countSegmentsForStream(stream);
-    const uploadedSegmentCount = sqlite.countUploadedSegments(stream);
-    const manifest = sqlite.getManifestRow(stream);
-
-    const routingState = sqlite.getIndexState(stream);
-    const routingRuns = sqlite.listIndexRuns(stream);
-    const retiredRoutingRuns = sqlite.listRetiredIndexRuns(stream);
-    const routingStorage = sqlite.getRoutingIndexStorage(stream);
-    const routingLexiconState = sqlite.getLexiconIndexState(stream, "routing_key", "");
-    const routingLexiconRuns = sqlite.listLexiconIndexRuns(stream, "routing_key", "");
-    const retiredRoutingLexiconRuns = sqlite.listRetiredLexiconIndexRuns(stream, "routing_key", "");
-    const routingLexiconStorage =
-      sqlite
-        .getLexiconIndexStorage(stream)
-        .find((entry) => entry.source_kind === "routing_key" && entry.source_name === "") ?? { object_count: 0, bytes: 0n };
-    const secondaryIndexStorage = new Map(sqlite.getSecondaryIndexStorage(stream).map((entry) => [entry.index_name, entry]));
-
-    const exactIndexes = configuredExactIndexes(reg.search).map(({ name, kind, configHash }) => {
-      const state = sqlite.getSecondaryIndexState(stream, name);
-      const configMatches = state?.config_hash === configHash;
-      const indexedSegmentCount = configMatches ? (state?.indexed_through ?? 0) : 0;
-      const storage = secondaryIndexStorage.get(name);
-      return {
-        name,
-        kind,
-        indexed_segment_count: indexedSegmentCount,
-        lag_segments: Math.max(0, uploadedSegmentCount - indexedSegmentCount),
-        lag_ms: buildIndexLagMs(stream, row, indexedSegmentCount),
-        bytes_at_rest: String(storage?.bytes ?? 0n),
-        object_count: storage?.object_count ?? 0,
-        active_run_count: sqlite.listSecondaryIndexRuns(stream, name).length,
-        retired_run_count: sqlite.listRetiredSecondaryIndexRuns(stream, name).length,
-        fully_indexed_uploaded_segments: configMatches && indexedSegmentCount >= uploadedSegmentCount,
-        stale_configuration: !configMatches,
-        updated_at: timestampToIsoString(state?.updated_at_ms ?? null),
-      };
-    });
-
-    const desiredCompanionPlan = buildDesiredSearchCompanionPlan(reg);
-    const desiredCompanionHash = hashSearchCompanionPlan(desiredCompanionPlan);
-    const companionPlanRow = sqlite.getSearchCompanionPlan(stream);
-    const desiredIndexPlanGeneration =
-      Object.values(desiredCompanionPlan.families).some(Boolean)
-        ? companionPlanRow
-          ? companionPlanRow.plan_hash === desiredCompanionHash
-            ? companionPlanRow.generation
-            : companionPlanRow.generation + 1
-          : 1
-        : 0;
-    const companionRows = sqlite.listSearchSegmentCompanions(stream);
-    const currentCompanionRows = companionRows.filter((row) => row.plan_generation === desiredIndexPlanGeneration);
-    const currentCompanionBytes = currentCompanionRows.reduce((sum, entry) => sum + BigInt(entry.size_bytes), 0n);
-    const searchFamilies = configuredSearchFamilies(reg.search).map(({ family, fields }) => {
-      const coveredSegmentCount = currentCompanionRows.filter((row) => parseCompanionSections(row.sections_json).has(family)).length;
-      const contiguousCoveredCount = contiguousCoveredSegmentCount(currentCompanionRows, family);
-      let familyBytes = 0n;
-      let familyObjectCount = 0;
-      for (const row of currentCompanionRows) {
-        const size = parseCompanionSectionSizes(row.section_sizes_json)[family];
-        if (size == null) continue;
-        familyBytes += BigInt(size);
-        familyObjectCount += 1;
-      }
-      return {
-        family,
-        fields,
-        plan_generation: desiredIndexPlanGeneration,
-        covered_segment_count: coveredSegmentCount,
-        contiguous_covered_segment_count: contiguousCoveredCount,
-        lag_segments: Math.max(0, uploadedSegmentCount - contiguousCoveredCount),
-        lag_ms: buildIndexLagMs(stream, row, contiguousCoveredCount),
-        bytes_at_rest: familyBytes.toString(),
-        object_count: familyObjectCount,
-        stale_segment_count: Math.max(0, uploadedSegmentCount - coveredSegmentCount),
-        fully_indexed_uploaded_segments: coveredSegmentCount >= uploadedSegmentCount,
-        updated_at: timestampToIsoString(companionPlanRow?.updated_at_ms ?? null),
-      };
-    });
-
-    return {
-      stream,
-      profile: profileKind,
-      desired_index_plan_generation: desiredIndexPlanGeneration,
-      segments: {
-        total_count: segmentCount,
-        uploaded_count: uploadedSegmentCount,
-      },
-      manifest: {
-        generation: manifest.generation,
-        uploaded_generation: manifest.uploaded_generation,
-        last_uploaded_at: timestampToIsoString(manifest.last_uploaded_at_ms),
-        last_uploaded_etag: manifest.last_uploaded_etag,
-        last_uploaded_size_bytes: manifest.last_uploaded_size_bytes?.toString() ?? null,
-      },
-      routing_key_index: {
-        configured: reg.routingKey != null,
-        indexed_segment_count: routingState?.indexed_through ?? 0,
-        lag_segments: Math.max(0, uploadedSegmentCount - (routingState?.indexed_through ?? 0)),
-        lag_ms: buildIndexLagMs(stream, row, routingState?.indexed_through ?? 0),
-        bytes_at_rest: routingStorage.bytes.toString(),
-        object_count: routingStorage.object_count,
-        active_run_count: routingRuns.length,
-        retired_run_count: retiredRoutingRuns.length,
-        fully_indexed_uploaded_segments: reg.routingKey == null ? true : (routingState?.indexed_through ?? 0) >= uploadedSegmentCount,
-        updated_at: timestampToIsoString(routingState?.updated_at_ms ?? null),
-      },
-      routing_key_lexicon: {
-        configured: reg.routingKey != null,
-        indexed_segment_count: routingLexiconState?.indexed_through ?? 0,
-        lag_segments: Math.max(0, uploadedSegmentCount - (routingLexiconState?.indexed_through ?? 0)),
-        lag_ms: buildIndexLagMs(stream, row, routingLexiconState?.indexed_through ?? 0),
-        bytes_at_rest: routingLexiconStorage.bytes.toString(),
-        object_count: routingLexiconStorage.object_count,
-        active_run_count: routingLexiconRuns.length,
-        retired_run_count: retiredRoutingLexiconRuns.length,
-        fully_indexed_uploaded_segments: reg.routingKey == null ? true : (routingLexiconState?.indexed_through ?? 0) >= uploadedSegmentCount,
-        updated_at: timestampToIsoString(routingLexiconState?.updated_at_ms ?? null),
-      },
-      exact_indexes: exactIndexes,
-      bundled_companions: {
-        object_count: currentCompanionRows.length,
-        bytes_at_rest: currentCompanionBytes.toString(),
-        fully_indexed_uploaded_segments: currentCompanionRows.length >= uploadedSegmentCount,
-      },
-      search_families: searchFamilies,
-      current_companion_rows: currentCompanionRows,
-    };
-  };
-
   type DetailsSnapshot = { etag: string; body: string; version: bigint };
 
   const buildDetailsSnapshotResult = async (
@@ -1744,22 +1371,14 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
       const profileRes = await profiles.getProfileResourceResult(stream, srow);
       if (Result.isError(profileRes)) return Result.err({ status: 500, message: profileRes.error.message });
 
-      const profileKind = profileRes.value.profile.kind;
-      const indexStatus = buildIndexStatus(stream, srow, regRes.value, profileKind);
-      const storage = buildStorageBreakdown(stream, srow, indexStatus.current_companion_rows, indexStatus);
-      const objectStoreRequests = buildObjectStoreRequestSummary(stream);
-      delete (indexStatus as any).current_companion_rows;
-      const payload =
-        mode === "index_status"
-          ? indexStatus
-          : {
-              stream: buildStreamSummary(stream, srow, profileRes.value.profile),
-              profile: profileRes.value,
-              schema: regRes.value,
-              index_status: indexStatus,
-              storage,
-              object_store_requests: objectStoreRequests,
-            };
+      if (!detailsBuilder) return Result.err({ status: 500, message: "full-mode details store is not available" });
+      const payload = await detailsBuilder.buildPayload({
+        stream,
+        row: srow,
+        registry: regRes.value,
+        profileResource: profileRes.value,
+        mode,
+      });
       const body = JSON.stringify(payload);
       const afterVersion = notifier.currentDetailsVersion(stream);
       if (beforeVersion === afterVersion) {
@@ -3476,12 +3095,12 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
     await indexer?.stop();
     await metricsEmitter.stop();
     await expirySweeper.stop();
-    streamSizeReconciler?.stop();
+    fullMode?.sizeReconciler?.stop();
     await ingest.stop();
     memorySampler?.stop();
     memory.stop();
     await controlStore.close();
-    if (db && db !== controlStore) db.close();
+    if (debugStore && debugStore !== (controlStore as unknown as AppDebugStore) && typeof debugStore.close === "function") await debugStore.close();
   };
 
   return {
@@ -3490,7 +3109,7 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
     ready,
     deps: {
       config: cfg,
-      db,
+      db: debugStore,
       os: fullMode?.store,
       ingest,
       notifier,

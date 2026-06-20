@@ -178,10 +178,10 @@ export class StatsReporter {
       const backpressurePct = Math.min(100, Math.max(queueWaitPct, rejectPct));
       this.rejectActiveMs = 0;
       const avgSegmentSize = snap.segmentsSealed > 0 ? formatBytes(snap.sealedBytes / snap.segmentsSealed) : "n/a";
-      const totalStreams = this.storageStats.countStreams();
+      const totalStreams = await this.storageStats.countStreams();
       const segmentsWaiting = this.uploader.countSegmentsWaiting();
-      const walDbBytes = this.storageStats.getWalDbSizeBytes();
-      const metaDbBytes = this.storageStats.getMetaDbSizeBytes();
+      const walDbBytes = await this.storageStats.getWalDbSizeBytes();
+      const metaDbBytes = await this.storageStats.getMetaDbSizeBytes();
       const maxRss = this.memory ? formatBytes(this.memory.snapshotMaxRssBytes(true)) : null;
       const line =
         `ingested=${formatBytes(snap.ingestedBytes)} ` +
