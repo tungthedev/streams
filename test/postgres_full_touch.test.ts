@@ -124,6 +124,31 @@ maybeDescribe("postgres full-mode state-protocol touch parity", () => {
         expect(metaBefore.status).toBe(200);
         expect(metaBefore.body.activeTemplates).toBe(1);
 
+        const tableWaitPromise = fetchJson(app, `/v1/stream/${encodeURIComponent(stream)}/touch/wait`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            cursor: metaBefore.body.cursor,
+            keys: [tableKey],
+            interestMode: "coarse",
+            timeoutMs: 2000,
+          }),
+        });
+        const fineWaitPromises = [beforeKey, afterKey].map((key) =>
+          fetchJson(app, `/v1/stream/${encodeURIComponent(stream)}/touch/wait`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              cursor: metaBefore.body.cursor,
+              keys: [key],
+              templateIdsUsed: [templateId],
+              timeoutMs: 2000,
+            }),
+          })
+        );
+
+        await new Promise((resolve) => setTimeout(resolve, 40));
+
         res = await fetchJson(app, `/v1/stream/${encodeURIComponent(stream)}`, {
           method: "POST",
           headers: { "content-type": "application/json" },
@@ -140,30 +165,11 @@ maybeDescribe("postgres full-mode state-protocol touch parity", () => {
         app.deps.touch.notify(stream);
         await app.deps.touch.tick();
 
-        const tableWait = await fetchJson(app, `/v1/stream/${encodeURIComponent(stream)}/touch/wait`, {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({
-            cursor: metaBefore.body.cursor,
-            keys: [tableKey],
-            interestMode: "coarse",
-            timeoutMs: 0,
-          }),
-        });
+        const tableWait = await tableWaitPromise;
         expect(tableWait.status).toBe(200);
         expect(tableWait.body.touched).toBe(true);
 
-        for (const key of [beforeKey, afterKey]) {
-          const fineWait = await fetchJson(app, `/v1/stream/${encodeURIComponent(stream)}/touch/wait`, {
-            method: "POST",
-            headers: { "content-type": "application/json" },
-            body: JSON.stringify({
-              cursor: metaBefore.body.cursor,
-              keys: [key],
-              templateIdsUsed: [templateId],
-              timeoutMs: 0,
-            }),
-          });
+        for (const fineWait of await Promise.all(fineWaitPromises)) {
           expect(fineWait.status).toBe(200);
           expect(fineWait.body.touched).toBe(true);
           expect(fineWait.body.effectiveWaitKind).toBe("fineKey");
@@ -233,8 +239,7 @@ maybeDescribe("postgres full-mode state-protocol touch parity", () => {
           expect([201, 204]).toContain(res.status);
         }
 
-        app.deps.segmenter.enqueue(stream);
-        await app.deps.segmenter.tick();
+        await (app.deps.segmenter as any).tick();
         await app.deps.uploader.tick();
 
         const published = await store.getStream(stream);

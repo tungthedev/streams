@@ -174,7 +174,7 @@ maybeDescribe("postgres full-mode index and search parity", () => {
         const indexStores = store.fullModeIndexStores();
         await waitFor(async () => {
           const stream = await store.getStream(STREAM);
-          if (!stream || stream.uploaded_segment_count < 1 || stream.uploaded_through < stream.sealed_through) return false;
+          if (!stream || stream.uploaded_segment_count < 2 || stream.uploaded_through < stream.sealed_through) return false;
           const plan = await indexStores.companions.getSearchCompanionPlan(STREAM);
           if (!plan) return false;
           for (let segmentIndex = 0; segmentIndex < stream.uploaded_segment_count; segmentIndex += 1) {
@@ -200,7 +200,7 @@ maybeDescribe("postgres full-mode index and search parity", () => {
           }),
         });
         expect(search.status).toBe(200);
-        expect(search.body.hits.map((hit: any) => hit.value.repo)).toEqual(["alpha/repo", "alpha/repo"]);
+        expect(search.body.hits.map((hit: any) => hit.fields.repo)).toEqual(["alpha/repo", "alpha/repo"]);
         expect(search.body.coverage.indexed_segments).toBeGreaterThan(0);
 
         const aggregate = await fetchJson(app, `/v1/stream/${encodeURIComponent(STREAM)}/_aggregate`, {
@@ -211,13 +211,17 @@ maybeDescribe("postgres full-mode index and search parity", () => {
             interval: "1m",
             from: "2026-03-25T10:00:00.000Z",
             to: "2026-03-25T10:02:00.000Z",
-            dimensions: ["repo"],
+            group_by: ["repo"],
             measures: ["requests"],
           }),
         });
         expect(aggregate.status).toBe(200);
         expect(aggregate.body.coverage.indexed_segments).toBeGreaterThan(0);
-        expect(aggregate.body.rows.some((row: any) => row.repo === "alpha/repo" && row.requests === 2)).toBe(true);
+        const alphaRequests = aggregate.body.buckets.reduce((sum: number, bucket: any) => {
+          const group = bucket.groups.find((row: any) => row.key.repo === "alpha/repo");
+          return sum + (group?.measures.requests.count ?? 0);
+        }, 0);
+        expect(alphaRequests).toBe(2);
 
         await waitFor(async () => {
           const bytes = await objectStore.get(manifestObjectKey(streamHash16Hex(STREAM)));

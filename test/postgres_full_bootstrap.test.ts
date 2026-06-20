@@ -62,6 +62,7 @@ maybeDescribe("postgres full-mode bootstrap", () => {
         const stream = "pg-bootstrap";
         const sourceCfg = makeConfig(sourceRoot, {
           segmentMaxBytes: 160,
+          segmentTargetRows: 2,
           segmentCheckIntervalMs: 25,
           uploadIntervalMs: 25,
           indexCheckIntervalMs: 25,
@@ -168,7 +169,10 @@ maybeDescribe("postgres full-mode bootstrap", () => {
                     service: i % 2 === 0 ? "api" : "worker",
                     duration: 100 + i,
                   },
-                  headers: { timestamp: `2026-03-25T10:0${i}:00.000Z` },
+                  headers: {
+                    operation: "insert",
+                    timestamp: `2026-03-25T10:0${i}:00.000Z`,
+                  },
                 }),
               })
             );
@@ -182,7 +186,13 @@ maybeDescribe("postgres full-mode bootstrap", () => {
             const segments = sourceApp.deps.db.listSegmentsForStream(stream);
             const companionPlan = sourceApp.deps.db.getSearchCompanionPlan(stream);
             const companions = sourceApp.deps.db.listSearchSegmentCompanions(stream);
-            if (row && row.uploaded_through >= row.sealed_through && segments.length > 0 && companionPlan && companions.length >= segments.length) {
+            if (
+              row &&
+              row.uploaded_through >= row.next_offset - 1n &&
+              segments.length > 0 &&
+              companionPlan &&
+              companions.length >= segments.length
+            ) {
               ready = true;
               break;
             }
@@ -204,7 +214,7 @@ maybeDescribe("postgres full-mode bootstrap", () => {
           expect(row?.profile).toBe("state-protocol");
           expect(row?.uploaded_segment_count).toBeGreaterThan(0);
 
-          const readRes = await app.fetch(new Request(`http://local/v1/stream/${encodeURIComponent(stream)}?offset=0`));
+          const readRes = await app.fetch(new Request(`http://local/v1/stream/${encodeURIComponent(stream)}`));
           expect(readRes.status).toBe(200);
           expect((await readRes.text()).length).toBeGreaterThan(0);
 

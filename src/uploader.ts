@@ -16,7 +16,8 @@ import { RuntimeMemorySampler } from "./runtime_memory_sampler";
 
 export type UploaderController = {
   start(): void;
-  stop(hard?: boolean): void;
+  stop(hard?: boolean): void | Promise<void>;
+  tick?: () => Promise<void>;
   countSegmentsWaiting(): number;
   getMemoryStats?: () => {
     inflight_segments: number;
@@ -77,16 +78,20 @@ export class Uploader {
   start(): void {
     this.stopping = false;
     if (this.timer) return;
+    if (this.config.uploadIntervalMs <= 0) return;
     this.timer = setInterval(() => {
       void this.tick();
     }, this.config.uploadIntervalMs);
   }
 
-  stop(hard = false): void {
+  async stop(hard = false): Promise<void> {
     if (hard) this.stopping = true;
     else this.stopping = false;
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
+    while (this.running) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
   }
 
   countSegmentsWaiting(): number {
@@ -101,7 +106,7 @@ export class Uploader {
     };
   }
 
-  private async tick(): Promise<void> {
+  async tick(): Promise<void> {
     if (this.stopping) return;
     if (this.running) return;
     this.running = true;

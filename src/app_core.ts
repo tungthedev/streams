@@ -3097,7 +3097,7 @@ export function createAppCore<TDebugStore extends AppDebugStore = AppDebugStore>
     // bookkeeping and can abort the process on Linux.
     await touch?.stop();
     await fullMode?.segmenter.stop(true);
-    fullMode?.uploader.stop(true);
+    await fullMode?.uploader.stop(true);
     await indexer?.stop();
     await metricsEmitter.stop();
     await expirySweeper.stop();

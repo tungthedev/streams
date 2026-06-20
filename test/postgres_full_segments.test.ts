@@ -269,7 +269,7 @@ maybeDescribe("postgres full-mode segment and manifest store", () => {
             headers: { "content-type": "text/plain" },
             body,
           });
-          expect(res.status).toBe(200);
+          expect(res.status).toBe(204);
         }
 
         await waitFor(async () => (await store.getStream(stream))?.sealed_through === 2n, "segment seal");
@@ -294,7 +294,7 @@ maybeDescribe("postgres full-mode segment and manifest store", () => {
         app = createPostgresFullApp(cfg, restartedStore, objectStore);
         server = Bun.serve({ port: 0, fetch: app.fetch });
         const restartedUrl = `http://localhost:${server.port}`;
-        const read = await fetch(`${restartedUrl}/v1/stream/${encodeURIComponent(stream)}?offset=0`);
+        const read = await fetch(`${restartedUrl}/v1/stream/${encodeURIComponent(stream)}`);
         expect(read.status).toBe(200);
         expect(await read.text()).toBe("abcde");
       } finally {

@@ -156,6 +156,7 @@ export class TouchProcessorManager {
   private restartWorkerPoolRequested = false;
   private lastWorkerPoolRestartAtMs = 0;
   private seedPromise: Promise<void> | null = null;
+  private liveMetricsStartPromise: Promise<void> | null = null;
   private seededTouchStateFromProfiles = false;
 
   constructor(
@@ -190,13 +191,16 @@ export class TouchProcessorManager {
     if (this.timer) return;
     this.stopping = false;
     void this.ensureTouchStateSeeded();
-    void this.liveMetrics.ensureStreamResult().then((liveMetricsRes) => {
+    this.liveMetricsStartPromise = this.liveMetrics.ensureStreamResult().then((liveMetricsRes) => {
+      if (this.stopping) return;
       if (Result.isError(liveMetricsRes)) {
         // eslint-disable-next-line no-console
         console.error("touch live metrics stream validation failed", liveMetricsRes.error.message);
       } else {
         this.liveMetrics.start();
       }
+    }).finally(() => {
+      this.liveMetricsStartPromise = null;
     });
     if (this.cfg.touchCheckIntervalMs > 0) {
       this.timer = setInterval(() => {
@@ -209,6 +213,10 @@ export class TouchProcessorManager {
     this.stopping = true;
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
+    const liveMetricsStartPromise = this.liveMetricsStartPromise;
+    if (liveMetricsStartPromise) await liveMetricsStartPromise.catch(() => {});
+    const seedPromise = this.seedPromise;
+    if (seedPromise) await seedPromise.catch(() => {});
     await this.pool.stop();
     this.liveMetrics.stop();
     for (const j of this.journals.values()) j.stop();

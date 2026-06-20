@@ -307,6 +307,18 @@ export class PostgresSegmentManifestStore implements SegmentReadStore, SegmentSt
   }
 
   async loadManifestPublicationSnapshot(stream: string, opts: { wait?: boolean } = {}): Promise<ManifestPublicationSnapshot | null> {
+    const maxAttempts = opts.wait ? 5 : 3;
+    for (let attempt = 1; ; attempt += 1) {
+      try {
+        return await this.loadManifestPublicationSnapshotOnce(stream, opts);
+      } catch (error) {
+        if (attempt >= maxAttempts || !isRetryablePostgresPublicationError(error)) throw error;
+        await sleep(Math.min(100, 10 * 2 ** (attempt - 1)));
+      }
+    }
+  }
+
+  private async loadManifestPublicationSnapshotOnce(stream: string, opts: { wait?: boolean } = {}): Promise<ManifestPublicationSnapshot | null> {
     const publication = await this.acquireManifestPublication(stream, { wait: opts.wait });
     if (!publication) return null;
     let keepLease = false;
@@ -803,6 +815,15 @@ function encodeU32Le(value: number): Buffer {
 
 function manifestLockKey(stream: string): bigint {
   return createHash("sha256").update(`manifest:${stream}`).digest().readBigInt64BE(0);
+}
+
+function isRetryablePostgresPublicationError(error: unknown): boolean {
+  const code = String((error as { code?: unknown })?.code ?? "");
+  return code === "40001" || code === "40P01" || code === "55P03";
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function coerceStreamRow(row: PgStreamRow): StreamReadRow {

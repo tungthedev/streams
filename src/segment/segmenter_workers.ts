@@ -6,7 +6,7 @@ import type { SegmenterHooks, SegmenterMemoryStats, SegmenterOptions } from "./s
 
 export type SegmenterController = {
   start: () => void;
-  stop: (hard?: boolean) => void;
+  stop: (hard?: boolean) => void | Promise<void>;
   getMemoryStats?: () => SegmenterMemoryStats;
 };
 
