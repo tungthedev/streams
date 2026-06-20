@@ -74,17 +74,17 @@ mode matrix and verification commands.
 
 ## Deploy To Prisma Compute
 
-Deploy Compute services from the published `@prisma/streams-server` npm package
-rather than from a checkout of this repository. Create a small Compute app with
-the package dependency and an entrypoint that selects the auth mode before
-loading the package Compute entrypoint:
+Deploy Compute services from the published `@tungthedev/streams-server` npm
+package rather than from a checkout of this repository. Create a small Compute
+app with the package dependency and an entrypoint that selects the auth mode
+before loading the package Compute entrypoint:
 
 ```json
 {
   "private": true,
   "type": "module",
   "dependencies": {
-    "@prisma/streams-server": "<pin-the-version>"
+    "@tungthedev/streams-server": "<pin-the-version>"
   }
 }
 ```
@@ -92,7 +92,7 @@ loading the package Compute entrypoint:
 ```ts
 // compute-entry.ts
 process.argv.push("--auth-strategy", "api-key");
-await import("@prisma/streams-server/compute");
+await import("@tungthedev/streams-server/compute");
 ```
 
 Deploy that app with the Compute CLI:

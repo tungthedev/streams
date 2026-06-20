@@ -102,5 +102,5 @@ jobs:
       - name: Publish @prisma/streams-local
         run: npm publish --provenance --access public ./dist/npm/streams-local
 
-      - name: Publish @prisma/streams-server
+      - name: Publish @tungthedev/streams-server
         run: npm publish --provenance --access public ./dist/npm/streams-server

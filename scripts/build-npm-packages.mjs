@@ -11,6 +11,7 @@ const distDir = join(repoRoot, "dist");
 const distNpmDir = join(distDir, "npm");
 const localPackageDir = join(distNpmDir, "streams-local");
 const serverPackageDir = join(distNpmDir, "streams-server");
+const serverPackageName = "@tungthedev/streams-server";
 const rootPackage = JSON.parse(readFileSync(join(repoRoot, "package.json"), "utf8"));
 const repository = rootPackage.repository;
 const bugs = rootPackage.bugs;
@@ -128,15 +129,15 @@ function buildLocalPackage() {
 }
 
 function buildServerPackage() {
-  const readme = `# @prisma/streams-server
+  const readme = `# ${serverPackageName}
 
 This package contains the Bun-only self-hosted Prisma Streams server.
 
 ## What It Is
 
-\`@prisma/streams-server\` is the full Prisma Streams runtime: SQLite WAL
-storage, segmenting, upload support, indexing, recovery, and the live / touch
-system.
+\`${serverPackageName}\` is the full Prisma Streams runtime: SQLite and
+Postgres WAL/control-plane storage, segmenting, upload support, indexing,
+recovery, metrics, and the live / touch system.
 
 It is intended for Bun-based self-hosted deployment. For trusted local
 development embedding, use \`@prisma/streams-local\` instead.
@@ -146,7 +147,7 @@ development embedding, use \`@prisma/streams-local\` instead.
 Recommended:
 
 \`\`\`bash
-bunx --package @prisma/streams-server prisma-streams-server --object-store local --no-auth
+bunx --package ${serverPackageName} prisma-streams-server --object-store local --no-auth
 \`\`\`
 
 After installation in a project:
@@ -162,7 +163,7 @@ Compute entrypoint instead of this repository:
 
 \`\`\`ts
 process.argv.push("--auth-strategy", "api-key");
-await import("@prisma/streams-server/compute");
+await import("${serverPackageName}/compute");
 \`\`\`
 
 The package Compute entrypoint injects \`--object-store r2\`, and injects
@@ -193,7 +194,7 @@ runtime documentation.
   writeServerBin(serverPackageDir);
 
   writeJson(join(serverPackageDir, "package.json"), {
-    name: "@prisma/streams-server",
+    name: serverPackageName,
     version: rootPackage.version,
     description: "Bun-only self-hosted Prisma Streams server.",
     repository,

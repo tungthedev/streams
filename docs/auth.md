@@ -9,7 +9,7 @@ Prisma Streams server. It does not apply to local streams.
 
 Authentication is a startup-selected behavior for the full server only:
 
-- `@prisma/streams-server`
+- `@tungthedev/streams-server`
 - `src/server.ts`
 - deployment entrypoints that start the full server, including Prisma Compute
 

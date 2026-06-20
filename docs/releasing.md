@@ -3,12 +3,12 @@
 This repository prepares two publishable npm packages under `dist/npm/`:
 
 - `@prisma/streams-local`
-- `@prisma/streams-server`
+- `@tungthedev/streams-server`
 
 `@prisma/streams-local` is the Node/Bun local runtime intended for `@prisma/dev`
 and other trusted local workflows.
 
-`@prisma/streams-server` is the Bun-only self-hosted server package and CLI.
+`@tungthedev/streams-server` is the Bun-only self-hosted server package and CLI.
 
 ## Release Checklist
 
@@ -23,11 +23,12 @@ Release branch policy:
 0. Ensure npm trusted publishing is configured for both packages:
 
 - `@prisma/streams-local`
-- `@prisma/streams-server`
+- `@tungthedev/streams-server`
 
-For each package on npmjs.com, add a GitHub Actions trusted publisher with:
+For each package on npmjs.com, add a GitHub Actions trusted publisher for the
+repository that runs this workflow:
 
-- Organization or user: `prisma`
+- Organization or user: repository owner
 - Repository: `streams`
 - Workflow filename: `release.yml`
 
@@ -58,8 +59,8 @@ into temporary consumers, and verify:
 - stateful local-runtime reopen flows that must read `/_schema` and skip
   duplicate first-schema installs when the registry already matches
 - local package exposure of `GET /v1/server/_details` and `GET /v1/stream/{name}/_routing_keys`
-- Bun CLI startup for `@prisma/streams-server`
-- package exposure of the `@prisma/streams-server/compute` Compute entrypoint
+- Bun CLI startup for `@tungthedev/streams-server`
+- package exposure of the `@tungthedev/streams-server/compute` Compute entrypoint
 
 3. Build the publishable package directories:
 
@@ -113,7 +114,7 @@ The release pipeline is intentionally split:
   directories in `dist/npm/`
 - `@prisma/streams-local` publishes only generated local runtime artifacts,
   local API declarations, runtime dependencies, and package docs
-- `@prisma/streams-server` publishes a Bun CLI wrapper plus the Bun-oriented
+- `@tungthedev/streams-server` publishes a Bun CLI wrapper plus the Bun-oriented
   source runtime needed by the full server
 
 For `@prisma/streams-local`, the build intentionally:
@@ -140,13 +141,13 @@ needs the local runtime.
 The split gives you:
 
 - `@prisma/streams-local` for Node and Bun local embedding
-- `@prisma/streams-server` for `bunx` and Bun-based self-hosting
+- `@tungthedev/streams-server` for `bunx` and Bun-based self-hosting
 
 ## Current Packaging Contract
 
 - `@prisma/streams-local` supports Bun `>=1.2.0` and Node `>=22`
 - `@prisma/streams-local/internal/daemon` is intentionally internal
-- `@prisma/streams-server` is Bun-only
-- `@prisma/streams-server/compute` starts the Compute server entrypoint from a
+- `@tungthedev/streams-server` is Bun-only
+- `@tungthedev/streams-server/compute` starts the Compute server entrypoint from a
   package consumer and injects the Compute object-store and auto-tune defaults
 - the root repository package is still private and is not the publish target

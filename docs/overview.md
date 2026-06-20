@@ -75,7 +75,7 @@ Not implemented today:
 - The publishable npm surfaces are intentionally split:
   - `@prisma/streams-local` exports `startLocalDurableStreamsServer` and its server types
   - `@prisma/streams-local/internal/daemon` exists for Prisma CLI integration and is intentionally internal
-  - `@prisma/streams-server` is the Bun-only full server package, CLI, and
+  - `@tungthedev/streams-server` is the Bun-only full server package, CLI, and
     package Compute entrypoint
 
 See [conformance.md](./conformance.md) for current compatibility status,
@@ -192,7 +192,7 @@ bun run src/server.ts --object-store local --no-auth
 Published CLI package:
 
 ```bash
-bunx --package @prisma/streams-server prisma-streams-server --object-store local --no-auth
+bunx --package @tungthedev/streams-server prisma-streams-server --object-store local --no-auth
 ```
 
 Bind control:
@@ -346,7 +346,7 @@ bun run test:conformance
 
 - [index.md](./index.md): full documentation index
 - [local-dev.md](./local-dev.md): local server behavior and Prisma CLI integration model
-- [releasing.md](./releasing.md): build and release process for `@prisma/streams-local` and `@prisma/streams-server`
+- [releasing.md](./releasing.md): build and release process for `@prisma/streams-local` and `@tungthedev/streams-server`
 - [prisma-dev-pglite-live.md](./prisma-dev-pglite-live.md): integrating local Prisma Postgres (`prisma dev`) with Prisma Streams live queries
 - [conformance.md](./conformance.md): test commands and current upstream suite status
 - [auth.md](./auth.md): current authentication and authorization constraints

@@ -72,8 +72,10 @@ try {
 
   const packDir = join(tmpRoot, "pack");
   const consumerDir = join(tmpRoot, "consumer");
+  const dataRoot = join(tmpRoot, "data");
   mkdirSync(packDir, { recursive: true });
   mkdirSync(consumerDir, { recursive: true });
+  mkdirSync(dataRoot, { recursive: true });
 
   const serverPackageDir = join(repoRoot, "dist", "npm", "streams-server");
   const tarballPath = run("bun", ["pm", "pack", "--destination", packDir, "--quiet"], serverPackageDir)
@@ -97,15 +99,15 @@ try {
 
   run("bun", ["add", tarballPath], consumerDir);
 
-  const installedPackageJsonPath = join(consumerDir, "node_modules", "@prisma", "streams-server", "package.json");
+  const installedPackageJsonPath = join(consumerDir, "node_modules", "@tungthedev", "streams-server", "package.json");
   const installedPackageJson = JSON.parse(readFileSync(installedPackageJsonPath, "utf8"));
   const computeExport = installedPackageJson.exports?.["./compute"];
   if (computeExport !== "./src/compute/package_entry.ts") {
-    throw new Error(`unexpected @prisma/streams-server/compute export: ${computeExport}`);
+    throw new Error(`unexpected @tungthedev/streams-server/compute export: ${computeExport}`);
   }
-  const computeExportPath = join(consumerDir, "node_modules", "@prisma", "streams-server", computeExport.slice(2));
+  const computeExportPath = join(consumerDir, "node_modules", "@tungthedev", "streams-server", computeExport.slice(2));
   if (!existsSync(computeExportPath)) {
-    throw new Error(`missing @prisma/streams-server/compute target: ${computeExportPath}`);
+    throw new Error(`missing @tungthedev/streams-server/compute target: ${computeExportPath}`);
   }
 
   const child = spawn("bun", ["x", "prisma-streams-server", "--object-store", "local", "--no-auth"], {
@@ -114,6 +116,7 @@ try {
       ...process.env,
       PORT: "0",
       DS_HOST: "127.0.0.1",
+      DS_ROOT: dataRoot,
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
