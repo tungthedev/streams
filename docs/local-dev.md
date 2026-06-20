@@ -19,11 +19,11 @@ It is different from the full self-hosted server:
 
 Supported:
 
-- `@prisma/streams-local` exporting `startLocalDurableStreamsServer` and its server types
+- `@tungthedev/streams-local` exporting `startLocalDurableStreamsServer` and its server types
 
 Internal:
 
-- `@prisma/streams-local/internal/daemon`
+- `@tungthedev/streams-local/internal/daemon`
 
 The daemon export exists for Prisma CLI integration and may change more freely than the public `local` entrypoint.
 
@@ -58,11 +58,11 @@ DS_LOCAL_DATA_ROOT=/tmp/my-ds-local bun run src/local/cli.ts start --name defaul
 
 ## Programmatic API
 
-The published `@prisma/streams-local` package surface is built for Bun
+The published `@tungthedev/streams-local` package surface is built for Bun
 `>=1.2.0` and Node `>=22` consumers.
 
 ```ts
-import { startLocalDurableStreamsServer } from "@prisma/streams-local";
+import { startLocalDurableStreamsServer } from "@tungthedev/streams-local";
 
 const server = await startLocalDurableStreamsServer({
   name: "default",
@@ -98,14 +98,14 @@ alphabetical routing-key listing via:
 
 The internal daemon entrypoint is:
 
-- `@prisma/streams-local/internal/daemon`
+- `@tungthedev/streams-local/internal/daemon`
 
 Example:
 
 ```ts
 import { fork } from "node:child_process";
 
-const child = fork(require.resolve("@prisma/streams-local/internal/daemon"), [
+const child = fork(require.resolve("@tungthedev/streams-local/internal/daemon"), [
   "--name",
   "default",
   "--port",

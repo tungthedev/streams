@@ -38,7 +38,7 @@ function writeDistReadme() {
   const readme = `# Prisma Streams Local Build
 
 This directory contains the generated Node/Bun-compatible package artifacts for
-the published \`@prisma/streams-local\` runtime.
+the published \`@tungthedev/streams-local\` runtime.
 
 ## What Local Streams Is
 
@@ -60,15 +60,15 @@ Published runtime floor:
 
 ## Supported Package Surface
 
-- \`@prisma/streams-local\`
-- \`@prisma/streams-local/internal/daemon\` (internal Prisma CLI plumbing)
+- \`@tungthedev/streams-local\`
+- \`@tungthedev/streams-local/internal/daemon\` (internal Prisma CLI plumbing)
 
 The full self-hosted server remains Bun-only and is not part of this local
 build surface.
 
 ## Integrating It
 
-1. Start a named local server from \`@prisma/streams-local\`.
+1. Start a named local server from \`@tungthedev/streams-local\`.
 2. Install your touch-enabled \`state-protocol\` profile via \`/_profile\`.
 3. Feed normalized State Protocol change events into the server.
 4. Use \`/touch/meta\` and \`/touch/wait\` to drive invalidation.
@@ -76,7 +76,7 @@ build surface.
 Programmatic example:
 
 \`\`\`ts
-import { startLocalDurableStreamsServer } from "@prisma/streams-local";
+import { startLocalDurableStreamsServer } from "@tungthedev/streams-local";
 
 const server = await startLocalDurableStreamsServer({
   name: "default",
@@ -95,7 +95,7 @@ Daemon example:
 \`\`\`ts
 import { fork } from "node:child_process";
 
-const child = fork(require.resolve("@prisma/streams-local/internal/daemon"), [
+const child = fork(require.resolve("@tungthedev/streams-local/internal/daemon"), [
   "--name",
   "default",
   "--port",

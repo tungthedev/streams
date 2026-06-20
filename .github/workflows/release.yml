@@ -99,7 +99,7 @@ jobs:
       - name: Build Publishable Packages
         run: bun run build:npm-packages
 
-      - name: Publish @prisma/streams-local
+      - name: Publish @tungthedev/streams-local
         run: npm publish --provenance --access public ./dist/npm/streams-local
 
       - name: Publish @tungthedev/streams-server

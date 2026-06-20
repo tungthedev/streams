@@ -37,10 +37,10 @@ try {
   const localPackageDir = join(repoRoot, "dist", "npm", "streams-local");
   const localPackageManifest = JSON.parse(readFileSync(join(localPackageDir, "package.json"), "utf8"));
   if ("@durable-streams/client" in (localPackageManifest.dependencies ?? {})) {
-    throw new Error("@prisma/streams-local should not publish @durable-streams/client");
+    throw new Error("@tungthedev/streams-local should not publish @durable-streams/client");
   }
   if (localPackageManifest.engines?.bun !== localPackageBunEngine) {
-    throw new Error(`@prisma/streams-local should publish bun ${localPackageBunEngine}, got ${localPackageManifest.engines?.bun}`);
+    throw new Error(`@tungthedev/streams-local should publish bun ${localPackageBunEngine}, got ${localPackageManifest.engines?.bun}`);
   }
   const tarballPath = run("bun", ["pm", "pack", "--destination", packDir, "--quiet"], localPackageDir)
     .split(/\r?\n/)
@@ -66,7 +66,7 @@ try {
   writeFileSync(
     join(consumerDir, "consumer.mjs"),
     `
-import { startLocalDurableStreamsServer } from "@prisma/streams-local";
+import { startLocalDurableStreamsServer } from "@tungthedev/streams-local";
 
 const server = await startLocalDurableStreamsServer({
   name: "${localServerName}",
@@ -271,7 +271,7 @@ try {
   writeFileSync(
     join(consumerDir, "consumer-reopen.mjs"),
     `
-import { startLocalDurableStreamsServer } from "@prisma/streams-local";
+import { startLocalDurableStreamsServer } from "@tungthedev/streams-local";
 
 const server = await startLocalDurableStreamsServer({
   name: "${localServerName}",

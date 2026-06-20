@@ -97,7 +97,7 @@ function buildLocalPackage() {
   copyLocalTypes(localPackageDir);
 
   writeJson(join(localPackageDir, "package.json"), {
-    name: "@prisma/streams-local",
+    name: "@tungthedev/streams-local",
     version: rootPackage.version,
     description: "Node and Bun local Prisma Streams runtime for trusted development workflows.",
     repository,
@@ -140,7 +140,7 @@ Postgres WAL/control-plane storage, segmenting, upload support, indexing,
 recovery, metrics, and the live / touch system.
 
 It is intended for Bun-based self-hosted deployment. For trusted local
-development embedding, use \`@prisma/streams-local\` instead.
+development embedding, use \`@tungthedev/streams-local\` instead.
 
 ## Running It
 

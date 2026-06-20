@@ -2,10 +2,10 @@
 
 This repository prepares two publishable npm packages under `dist/npm/`:
 
-- `@prisma/streams-local`
+- `@tungthedev/streams-local`
 - `@tungthedev/streams-server`
 
-`@prisma/streams-local` is the Node/Bun local runtime intended for `@prisma/dev`
+`@tungthedev/streams-local` is the Node/Bun local runtime intended for `@prisma/dev`
 and other trusted local workflows.
 
 `@tungthedev/streams-server` is the Bun-only self-hosted server package and CLI.
@@ -22,7 +22,7 @@ Release branch policy:
 
 0. Ensure npm trusted publishing is configured for both packages:
 
-- `@prisma/streams-local`
+- `@tungthedev/streams-local`
 - `@tungthedev/streams-server`
 
 For each package on npmjs.com, add a GitHub Actions trusted publisher for the
@@ -54,8 +54,8 @@ bun run test:bun-server-package
 These tests build the generated package directories, pack them, install them
 into temporary consumers, and verify:
 
-- Node end-to-end usage of `@prisma/streams-local`
-- Bun end-to-end usage of `@prisma/streams-local` on Bun `1.2.x` and newer, including the live `/touch/*` path
+- Node end-to-end usage of `@tungthedev/streams-local`
+- Bun end-to-end usage of `@tungthedev/streams-local` on Bun `1.2.x` and newer, including the live `/touch/*` path
 - stateful local-runtime reopen flows that must read `/_schema` and skip
   duplicate first-schema installs when the registry already matches
 - local package exposure of `GET /v1/server/_details` and `GET /v1/stream/{name}/_routing_keys`
@@ -112,12 +112,12 @@ The release pipeline is intentionally split:
 - `scripts/build-local-node.mjs` generates the local runtime artifacts in `dist/`
 - `scripts/build-npm-packages.mjs` assembles the publishable package
   directories in `dist/npm/`
-- `@prisma/streams-local` publishes only generated local runtime artifacts,
+- `@tungthedev/streams-local` publishes only generated local runtime artifacts,
   local API declarations, runtime dependencies, and package docs
 - `@tungthedev/streams-server` publishes a Bun CLI wrapper plus the Bun-oriented
   source runtime needed by the full server
 
-For `@prisma/streams-local`, the build intentionally:
+For `@tungthedev/streams-local`, the build intentionally:
 
 - emits shared chunks under `dist/local/` so `index.js` and `daemon.js` do not
   each embed their own copy of the runtime
@@ -131,7 +131,7 @@ For `@prisma/streams-local`, the build intentionally:
   package tarball
 - publishes only the runtime dependency subset the local package actually
   imports, rather than copying the repository-wide dependency list into
-  `@prisma/streams-local`
+  `@tungthedev/streams-local`
 
 ## Why The Split Exists
 
@@ -140,13 +140,13 @@ needs the local runtime.
 
 The split gives you:
 
-- `@prisma/streams-local` for Node and Bun local embedding
+- `@tungthedev/streams-local` for Node and Bun local embedding
 - `@tungthedev/streams-server` for `bunx` and Bun-based self-hosting
 
 ## Current Packaging Contract
 
-- `@prisma/streams-local` supports Bun `>=1.2.0` and Node `>=22`
-- `@prisma/streams-local/internal/daemon` is intentionally internal
+- `@tungthedev/streams-local` supports Bun `>=1.2.0` and Node `>=22`
+- `@tungthedev/streams-local/internal/daemon` is intentionally internal
 - `@tungthedev/streams-server` is Bun-only
 - `@tungthedev/streams-server/compute` starts the Compute server entrypoint from a
   package consumer and injects the Compute object-store and auto-tune defaults

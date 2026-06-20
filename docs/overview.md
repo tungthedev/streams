@@ -73,8 +73,8 @@ Not implemented today:
 ## Status
 
 - The publishable npm surfaces are intentionally split:
-  - `@prisma/streams-local` exports `startLocalDurableStreamsServer` and its server types
-  - `@prisma/streams-local/internal/daemon` exists for Prisma CLI integration and is intentionally internal
+  - `@tungthedev/streams-local` exports `startLocalDurableStreamsServer` and its server types
+  - `@tungthedev/streams-local/internal/daemon` exists for Prisma CLI integration and is intentionally internal
   - `@tungthedev/streams-server` is the Bun-only full server package, CLI, and
     package Compute entrypoint
 
@@ -96,7 +96,7 @@ See [security.md](./security.md) and [auth.md](./auth.md).
 ## Prerequisites
 
 - Bun `>=1.3.6` for the full self-hosted server and repository workflows
-- Bun `>=1.2.0` or Node.js `>=22` for the published `@prisma/streams-local` package
+- Bun `>=1.2.0` or Node.js `>=22` for the published `@tungthedev/streams-local` package
 
 ## Quick Start
 
@@ -150,7 +150,7 @@ Notes:
 The supported package import for local development integration is:
 
 ```ts
-import { startLocalDurableStreamsServer } from "@prisma/streams-local";
+import { startLocalDurableStreamsServer } from "@tungthedev/streams-local";
 
 const server = await startLocalDurableStreamsServer({
   name: "default",
@@ -164,7 +164,7 @@ console.log(server.exports.sqlite.path);
 await server.close();
 ```
 
-The published `@prisma/streams-local` surface is built to run on Bun `>=1.2.0`
+The published `@tungthedev/streams-local` surface is built to run on Bun `>=1.2.0`
 and Node `>=22`. The full self-hosted server remains Bun-only.
 
 The local embedded runtime always applies the built-in `1024 MB` auto-tune
@@ -177,7 +177,7 @@ The package smoke tests cover the local Live path under both host runtimes:
 - `bun run test:node-local-package`
 - `bun run test:bun-local-package`
 
-`@prisma/streams-local/internal/daemon` is exported for Prisma CLI integration, but it is intentionally internal and does not carry the same compatibility guarantee as `@prisma/streams-local`.
+`@tungthedev/streams-local/internal/daemon` is exported for Prisma CLI integration, but it is intentionally internal and does not carry the same compatibility guarantee as `@tungthedev/streams-local`.
 
 More detail is in [local-dev.md](./local-dev.md).
 
@@ -346,7 +346,7 @@ bun run test:conformance
 
 - [index.md](./index.md): full documentation index
 - [local-dev.md](./local-dev.md): local server behavior and Prisma CLI integration model
-- [releasing.md](./releasing.md): build and release process for `@prisma/streams-local` and `@tungthedev/streams-server`
+- [releasing.md](./releasing.md): build and release process for `@tungthedev/streams-local` and `@tungthedev/streams-server`
 - [prisma-dev-pglite-live.md](./prisma-dev-pglite-live.md): integrating local Prisma Postgres (`prisma dev`) with Prisma Streams live queries
 - [conformance.md](./conformance.md): test commands and current upstream suite status
 - [auth.md](./auth.md): current authentication and authorization constraints

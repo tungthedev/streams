@@ -5,12 +5,12 @@
   "description": "Prisma Streams is a Bun + TypeScript implementation of the Durable Streams HTTP protocol, with a local development server for Prisma CLI integration.",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/prisma/streams.git"
+    "url": "git+https://github.com/tungthedev/streams.git"
   },
   "bugs": {
-    "url": "https://github.com/prisma/streams/issues"
+    "url": "https://github.com/tungthedev/streams/issues"
   },
-  "homepage": "https://github.com/prisma/streams/tree/main/docs",
+  "homepage": "https://github.com/tungthedev/streams/tree/main/docs",
   "license": "Apache-2.0",
   "type": "module",
   "packageManager": "bun@1.3.6",

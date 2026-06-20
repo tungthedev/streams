@@ -51,7 +51,7 @@ Target behavior:
 - Live does not consume raw PostgreSQL WAL bytes directly.
   - Adapters must map database change events into Durable Streams State Protocol.
 - Prisma Streams still does not include a built-in `@prisma/dev` integration.
-  - The published `@prisma/streams-local` package is package-tested under Node and Bun, including the live `/touch/*` path.
+  - The published `@tungthedev/streams-local` package is package-tested under Node and Bun, including the live `/touch/*` path.
   - The Prisma-owned adapter and lifecycle wiring still need to be implemented.
 
 ## Important Constraint: Use An In-Process Adapter
@@ -212,7 +212,7 @@ This is the intended shape, not a copy-paste-ready Prisma implementation:
 
 ```ts
 import { startPrismaDevServer } from "@prisma/dev";
-import { startLocalDurableStreamsServer } from "@prisma/streams-local";
+import { startLocalDurableStreamsServer } from "@tungthedev/streams-local";
 
 async function startPrismaDevWithLive(name: string) {
   const prisma = await startPrismaDevServer({
@@ -315,7 +315,7 @@ Intended target:
 
 Current repo status:
 
-- the published `@prisma/streams-local` package surface is built for Node and Bun
+- the published `@tungthedev/streams-local` package surface is built for Node and Bun
 - the full self-hosted server remains Bun-only
 - the remaining work is the Prisma-owned adapter and lifecycle integration in
   `prisma dev` / `@prisma/dev`
