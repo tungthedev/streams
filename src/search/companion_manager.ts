@@ -1,12 +1,8 @@
 import { randomBytes } from "node:crypto";
 import { Result } from "better-result";
 import type { Config } from "../config";
-import type {
-  SearchCompanionPlanRow,
-  SearchSegmentCompanionRow,
-  SegmentRow,
-  SqliteDurableStore,
-} from "../db/db";
+import type { SearchCompanionPlanRow, SearchSegmentCompanionRow, SegmentRow } from "../store/rows";
+import type { SearchCompanionIndexStore } from "../store/index_store";
 import type { Metrics } from "../metrics";
 import type { ObjectStore } from "../objectstore/interface";
 import { SchemaRegistryStore, type SchemaRegistry, type SearchFieldConfig } from "../schema/registry";
@@ -227,7 +223,7 @@ export class SearchCompanionManager {
 
   constructor(
     private readonly cfg: Config,
-    private readonly db: SqliteDurableStore,
+    private readonly db: SearchCompanionIndexStore,
     private readonly os: ObjectStore,
     private readonly registry: SchemaRegistryStore,
     segmentCache?: SegmentDiskCache,

@@ -2,7 +2,8 @@ import { randomBytes } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { Result } from "better-result";
 import type { Config } from "../config";
-import type { SecondaryIndexRunRow, SegmentRow, SqliteDurableStore } from "../db/db";
+import type { SecondaryIndexRunRow, SegmentRow } from "../store/rows";
+import type { CompanionProgressStore, SecondaryIndexStore } from "../store/index_store";
 import type { ObjectStore } from "../objectstore/interface";
 import { SchemaRegistryStore } from "../schema/registry";
 import { SegmentDiskCache } from "../segment/cache";
@@ -61,7 +62,7 @@ const PAYLOAD_DECODER = new TextDecoder();
 const TERM_ENCODER = new TextEncoder();
 export class SecondaryIndexManager {
   private readonly cfg: Config;
-  private readonly db: SqliteDurableStore;
+  private readonly db: SecondaryIndexStore;
   private readonly os: ObjectStore;
   private readonly registry: SchemaRegistryStore;
   private readonly segmentCache?: SegmentDiskCache;
@@ -92,7 +93,8 @@ export class SecondaryIndexManager {
 
   constructor(
     cfg: Config,
-    db: SqliteDurableStore,
+    db: SecondaryIndexStore,
+    private readonly companionProgress: CompanionProgressStore,
     os: ObjectStore,
     registry: SchemaRegistryStore,
     segmentCache?: SegmentDiskCache,
@@ -771,11 +773,11 @@ export class SecondaryIndexManager {
   }
 
   private hasCompanionBacklog(stream: string): boolean {
-    const plan = this.db.getSearchCompanionPlan(stream);
+    const plan = this.companionProgress.getSearchCompanionPlan(stream);
     if (!plan) return false;
-    const uploadedCount = this.db.countUploadedSegments(stream);
+    const uploadedCount = this.companionProgress.countUploadedSegments(stream);
     for (let segmentIndex = 0; segmentIndex < uploadedCount; segmentIndex++) {
-      const row = this.db.getSearchSegmentCompanion(stream, segmentIndex);
+      const row = this.companionProgress.getSearchSegmentCompanion(stream, segmentIndex);
       if (!row || row.plan_generation !== plan.generation) return true;
     }
     return false;

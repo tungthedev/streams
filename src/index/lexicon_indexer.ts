@@ -1,7 +1,8 @@
 import { readFileSync } from "node:fs";
 import { Result } from "better-result";
 import type { Config } from "../config";
-import type { LexiconIndexRunRow, LexiconIndexStateRow, SegmentRow, SqliteDurableStore } from "../db/db";
+import type { LexiconIndexRunRow, LexiconIndexStateRow, SegmentRow } from "../store/rows";
+import type { LexiconIndexStore } from "../store/index_store";
 import type { Metrics } from "../metrics";
 import type { ObjectStore } from "../objectstore/interface";
 import type { SchemaRegistryStore } from "../schema/registry";
@@ -101,7 +102,7 @@ export class LexiconIndexManager {
 
   constructor(
     private readonly cfg: Config,
-    private readonly db: SqliteDurableStore,
+    private readonly db: LexiconIndexStore,
     private readonly os: ObjectStore,
     private readonly segmentCache: SegmentDiskCache | undefined,
     private readonly publishManifest: ((stream: string) => Promise<void>) | undefined,
@@ -755,9 +756,9 @@ export class LexiconIndexManager {
     const walEnd = streamRow.next_offset - 1n;
     if (walStart <= walEnd) {
       const walStartedAt = Date.now();
-      for (const row of this.db.iterWalRange(stream, walStart, walEnd)) {
+      for await (const row of this.db.readWalRange(stream, walStart, walEnd)) {
         scannedWalRows += 1;
-        const routingKey = row.routing_key == null ? null : row.routing_key instanceof Uint8Array ? row.routing_key : new Uint8Array(row.routing_key);
+        const routingKey = row.routingKey == null ? null : row.routingKey instanceof Uint8Array ? row.routingKey : new Uint8Array(row.routingKey);
         if (!routingKey || routingKey.byteLength === 0) continue;
         const key = TEXT_DECODER.decode(routingKey);
         if (after != null && compareKeys(key, after) <= 0) continue;

@@ -29,6 +29,22 @@ function waitForExactIdleGate(manager: SecondaryIndexManager, stream: string, at
   return false;
 }
 
+function createSecondaryIndexManager(cfg: Config, app: ReturnType<typeof createApp>, store: MockR2Store): SecondaryIndexManager {
+  return new SecondaryIndexManager(
+    cfg,
+    app.deps.db,
+    app.deps.db,
+    store,
+    app.deps.registry,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined
+  );
+}
+
 describe("secondary indexer", () => {
   test("pauses exact background work while a stream still has local backlog", async () => {
     const root = mkdtempSync(join(tmpdir(), "ds-secondary-index-pause-"));
@@ -90,7 +106,7 @@ describe("secondary indexer", () => {
       );
       expect(schemaRes.status).toBe(200);
 
-      const manager = new SecondaryIndexManager(cfg, app.deps.db, store, app.deps.registry);
+      const manager = createSecondaryIndexManager(cfg, app, store);
       app.deps.db.db.query(`UPDATE streams SET last_append_ms=? WHERE stream=?;`).run(app.deps.db.nowMs() - 600_000n, "evlog");
       expect(waitForExactIdleGate(manager, "evlog")).toBe(true);
 
@@ -219,7 +235,7 @@ describe("secondary indexer", () => {
         await sleep(50);
       }
 
-      const manager = new SecondaryIndexManager(cfg, app.deps.db, store, app.deps.registry);
+      const manager = createSecondaryIndexManager(cfg, app, store);
       app.deps.db.db.query(`UPDATE streams SET last_append_ms=? WHERE stream=?;`).run(app.deps.db.nowMs() - 600_000n, "evlog");
       expect(waitForExactIdleGate(manager, "evlog")).toBe(true);
       manager.enqueue("evlog");

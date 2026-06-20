@@ -2,7 +2,8 @@ import { randomBytes } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { Result } from "better-result";
 import type { Config } from "../config";
-import type { IndexRunRow, SegmentRow, SqliteDurableStore } from "../db/db";
+import type { IndexRunRow, SegmentRow } from "../store/rows";
+import type { RoutingIndexStore } from "../store/index_store";
 import type { ObjectStore } from "../objectstore/interface";
 import { SegmentDiskCache } from "../segment/cache";
 import { loadSegmentBytesCached } from "../segment/cached_segment";
@@ -69,7 +70,7 @@ function errorMessage(e: unknown): string {
 
 export class IndexManager {
   private readonly cfg: Config;
-  private readonly db: SqliteDurableStore;
+  private readonly db: RoutingIndexStore;
   private readonly os: ObjectStore;
   private readonly segmentCache?: SegmentDiskCache;
   private readonly runDiskCache?: SegmentDiskCache;
@@ -107,7 +108,7 @@ export class IndexManager {
 
   constructor(
     cfg: Config,
-    db: SqliteDurableStore,
+    db: RoutingIndexStore,
     os: ObjectStore,
     segmentCache: SegmentDiskCache | undefined,
     publishManifest?: (stream: string) => Promise<void>,

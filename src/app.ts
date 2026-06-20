@@ -138,6 +138,7 @@ export function createApp(cfg: Config, os?: ObjectStore, opts: CreateAppOptions 
       const secondaryIndexer = new SecondaryIndexManager(
         config,
         db,
+        db,
         store,
         registry,
         diskCache,
