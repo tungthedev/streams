@@ -1,7 +1,7 @@
 import { mkdirSync, rmSync } from "node:fs";
 import { dirname } from "node:path";
 import type { Config } from "./config";
-import { SqliteDurableStore } from "./db/db";
+import { createSqliteBootstrapRestoreStore } from "./db/bootstrap_store";
 import type { ObjectStore } from "./objectstore/interface";
 import { zstdDecompressSync } from "./util/zstd";
 import { localSegmentPath, schemaObjectKey, segmentObjectKey, streamHash16Hex } from "./util/stream_paths";
@@ -32,7 +32,7 @@ export async function bootstrapFromR2(cfg: Config, store: ObjectStore, opts: { c
 
   mkdirSync(cfg.rootDir, { recursive: true });
 
-  const db = new SqliteDurableStore(cfg.dbPath, { cacheBytes: cfg.sqliteCacheBytes });
+  const db = createSqliteBootstrapRestoreStore(cfg.dbPath, { cacheBytes: cfg.sqliteCacheBytes });
   try {
     const retryOpts = {
       retries: cfg.objectStoreRetries,

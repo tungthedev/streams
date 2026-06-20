@@ -4,6 +4,20 @@ import { Result } from "better-result";
 import type { StoreAppendBatch, StoreAppendTask } from "../store/append";
 import type { WalReadRow, WalStore } from "../store/wal_store";
 import type { SegmentReadStore, StreamReadStore } from "../store/segment_read_store";
+import type { ManifestPublicationSnapshot, ManifestStore, SegmentStore } from "../store/segment_manifest_store";
+import type {
+  IndexRunRow,
+  IndexStateRow,
+  LexiconIndexRunRow,
+  LexiconIndexStateRow,
+  SearchCompanionPlanRow,
+  SearchSegmentCompanionRow,
+  SecondaryIndexRunRow,
+  SecondaryIndexStateRow,
+  SegmentMetaRow,
+  SegmentRow,
+  StreamRow,
+} from "../store/rows";
 import type {
   ProfileMetadataCommit,
   ProfileMetadataMutationContext,
@@ -17,6 +31,7 @@ import type {
 import type { ProfileTouchStateStore } from "../store/profile_touch_store";
 import type { WalControlPlaneStore, DurableStoreCapabilities } from "../store/capabilities";
 import { SqliteWalStore } from "./sqlite_wal_store";
+import { loadSqliteManifestPublicationSnapshot } from "./sqlite_manifest_snapshot";
 
 export const STREAM_FLAG_DELETED = 1 << 0;
 // Internal companion touch stream. Hidden from listing and not eligible for segmentation.
@@ -30,147 +45,19 @@ const BASE_WAL_GC_CHUNK_OFFSETS = (() => {
   return Math.floor(n);
 })();
 
-export type StreamRow = {
-  stream: string;
-  created_at_ms: bigint;
-  updated_at_ms: bigint;
-  content_type: string;
-  profile: string | null;
-  stream_seq: string | null;
-  closed: number;
-  closed_producer_id: string | null;
-  closed_producer_epoch: number | null;
-  closed_producer_seq: number | null;
-  ttl_seconds: number | null;
-  epoch: number;
-  next_offset: bigint;
-  sealed_through: bigint;
-  uploaded_through: bigint;
-  uploaded_segment_count: number;
-  pending_rows: bigint;
-  pending_bytes: bigint;
-  logical_size_bytes: bigint;
-  wal_rows: bigint;
-  wal_bytes: bigint;
-  last_append_ms: bigint;
-  last_segment_cut_ms: bigint;
-  segment_in_progress: number;
-  expires_at_ms: bigint | null;
-  stream_flags: number;
-};
-
-export type SegmentRow = {
-  segment_id: string;
-  stream: string;
-  segment_index: number;
-  start_offset: bigint;
-  end_offset: bigint;
-  block_count: number;
-  last_append_ms: bigint;
-  payload_bytes: bigint;
-  size_bytes: number;
-  local_path: string;
-  created_at_ms: bigint;
-  uploaded_at_ms: bigint | null;
-  r2_etag: string | null;
-};
-
-export type SegmentMetaRow = {
-  stream: string;
-  segment_count: number;
-  segment_offsets: Uint8Array;
-  segment_blocks: Uint8Array;
-  segment_last_ts: Uint8Array;
-};
-
-export type IndexStateRow = {
-  stream: string;
-  index_secret: Uint8Array;
-  indexed_through: number;
-  updated_at_ms: bigint;
-};
-
-export type IndexRunRow = {
-  run_id: string;
-  stream: string;
-  level: number;
-  start_segment: number;
-  end_segment: number;
-  object_key: string;
-  size_bytes: number;
-  filter_len: number;
-  record_count: number;
-  retired_gen: number | null;
-  retired_at_ms: bigint | null;
-};
-
-export type SecondaryIndexStateRow = {
-  stream: string;
-  index_name: string;
-  index_secret: Uint8Array;
-  config_hash: string;
-  indexed_through: number;
-  updated_at_ms: bigint;
-};
-
-export type SecondaryIndexRunRow = {
-  run_id: string;
-  stream: string;
-  index_name: string;
-  level: number;
-  start_segment: number;
-  end_segment: number;
-  object_key: string;
-  size_bytes: number;
-  filter_len: number;
-  record_count: number;
-  retired_gen: number | null;
-  retired_at_ms: bigint | null;
-};
-
-export type LexiconIndexStateRow = {
-  stream: string;
-  source_kind: string;
-  source_name: string;
-  indexed_through: number;
-  updated_at_ms: bigint;
-};
-
-export type LexiconIndexRunRow = {
-  run_id: string;
-  stream: string;
-  source_kind: string;
-  source_name: string;
-  level: number;
-  start_segment: number;
-  end_segment: number;
-  object_key: string;
-  size_bytes: number;
-  record_count: number;
-  retired_gen: number | null;
-  retired_at_ms: bigint | null;
-};
-
-export type SearchCompanionPlanRow = {
-  stream: string;
-  generation: number;
-  plan_hash: string;
-  plan_json: string;
-  updated_at_ms: bigint;
-};
-
-export type SearchSegmentCompanionRow = {
-  stream: string;
-  segment_index: number;
-  object_key: string;
-  plan_generation: number;
-  sections_json: string;
-  section_sizes_json: string;
-  size_bytes: number;
-  primary_timestamp_min_ms: bigint | null;
-  primary_timestamp_max_ms: bigint | null;
-  updated_at_ms: bigint;
-};
+export type {
+  IndexRunRow,
+  IndexStateRow,
+  LexiconIndexRunRow,
+  LexiconIndexStateRow,
+  SearchCompanionPlanRow,
+  SearchSegmentCompanionRow,
+  SecondaryIndexRunRow,
+  SecondaryIndexStateRow,
+  SegmentMetaRow,
+  SegmentRow,
+  StreamRow,
+} from "../store/rows";
 
 function legacyWalReadRow(row: WalReadRow): {
   offset: bigint;
@@ -189,7 +76,16 @@ function legacyWalReadRow(row: WalReadRow): {
 }
 
 export class SqliteDurableStore
-  implements WalControlPlaneStore, WalStore, SegmentReadStore, StreamReadStore, SchemaStore, ProfileStore, ProfileTouchStateStore
+  implements
+    WalControlPlaneStore,
+    WalStore,
+    SegmentReadStore,
+    StreamReadStore,
+    SegmentStore,
+    ManifestStore,
+    SchemaStore,
+    ProfileStore,
+    ProfileTouchStateStore
 {
   readonly kind = "sqlite" as const;
   readonly capabilities: DurableStoreCapabilities = {
@@ -1563,6 +1459,10 @@ export class SqliteDurableStore
     return this.getStream(stream);
   }
 
+  getSegmentStreamState(stream: string): StreamRow | null {
+    return this.getStream(stream);
+  }
+
   async listSegmentsForRead(stream: string): Promise<SegmentRow[]> {
     return this.listSegmentsForStream(stream);
   }
@@ -1873,6 +1773,14 @@ export class SqliteDurableStore
     sizeBytes: number | null
   ): void {
     this.stmts.upsertManifest.run(stream, generation, uploadedGeneration, uploadedAtMs, etag, sizeBytes);
+  }
+
+  loadManifestPublicationSnapshot(stream: string): ManifestPublicationSnapshot | null {
+    return loadSqliteManifestPublicationSnapshot(this, stream);
+  }
+
+  getSegmentForManifestCleanup(stream: string, segmentIndex: number): SegmentRow | null {
+    return this.getSegmentByIndex(stream, segmentIndex);
   }
 
   getIndexState(stream: string): IndexStateRow | null {

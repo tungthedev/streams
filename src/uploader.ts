@@ -2,11 +2,10 @@ import { unlinkSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { Result } from "better-result";
 import type { Config } from "./config";
-import type { SqliteDurableStore, SegmentRow } from "./db/db";
+import type { ManifestStore, SegmentRow } from "./store/segment_manifest_store";
 import type { ObjectStore } from "./objectstore/interface";
 import { buildManifestResult } from "./manifest";
 import { manifestObjectKey, segmentObjectKey, streamHash16Hex } from "./util/stream_paths";
-import { readU64LE } from "./util/endian";
 import { SegmentDiskCache } from "./segment/cache";
 import { retry } from "./util/retry";
 import { LruCache } from "./util/lru";
@@ -35,7 +34,7 @@ export type UploaderHooks = {
 
 export class Uploader {
   private readonly config: Config;
-  private readonly db: SqliteDurableStore;
+  private readonly db: ManifestStore;
   private readonly os: ObjectStore;
   private readonly diskCache?: SegmentDiskCache;
   private readonly stats?: StatsCollector;
@@ -49,10 +48,11 @@ export class Uploader {
   private hooks?: UploaderHooks;
   private readonly manifestInflight = new Set<string>();
   private inflightSegmentBytes = 0;
+  private pendingSegmentsWaiting = 0;
 
   constructor(
     config: Config,
-    db: SqliteDurableStore,
+    db: ManifestStore,
     os: ObjectStore,
     diskCache?: SegmentDiskCache,
     stats?: StatsCollector,
@@ -90,7 +90,8 @@ export class Uploader {
   }
 
   countSegmentsWaiting(): number {
-    return this.db.countPendingSegments();
+    this.pendingSegmentsWaiting = this.db.countPendingSegments();
+    return this.pendingSegmentsWaiting;
   }
 
   getMemoryStats(): { inflight_segments: number; inflight_segment_bytes: number; manifest_inflight_streams: number } {
@@ -106,7 +107,8 @@ export class Uploader {
     if (this.running) return;
     this.running = true;
     try {
-      const pending = this.db.pendingUploadHeads(1000);
+      this.pendingSegmentsWaiting = await this.db.countPendingSegments();
+      const pending = await this.db.pendingUploadHeads(1000);
       if (pending.length === 0) return;
 
       // Upload with bounded concurrency.
@@ -209,7 +211,7 @@ export class Uploader {
           timeoutMs: this.config.objectStoreTimeoutMs,
         }
       );
-      this.db.markSegmentUploaded(seg.segment_id, res.etag, this.db.nowMs());
+      await this.db.markSegmentUploaded(seg.segment_id, res.etag, this.db.nowMs());
       this.hooks?.onMetadataChanged?.(seg.stream);
       if (this.stats) this.stats.recordUploadedBytes(seg.size_bytes);
       if (this.gate) this.gate.adjustOnUpload(seg.size_bytes);
@@ -226,84 +228,33 @@ export class Uploader {
     if (this.manifestInflight.has(stream)) return;
     this.manifestInflight.add(stream);
     try {
-      const srow = this.db.getStream(stream);
-      if (!srow) return;
-
-      const prevPrefix = srow.uploaded_segment_count ?? 0;
-      let uploadedPrefix = this.db.advanceUploadedSegmentCount(stream);
-
-      const segCount = this.db.countSegmentsForStream(stream);
-      let meta = this.db.getSegmentMeta(stream);
-      const needsRebuild =
-        !meta ||
-        meta.segment_count !== segCount ||
-        meta.segment_offsets.byteLength !== segCount * 8 ||
-        meta.segment_blocks.byteLength !== segCount * 4 ||
-        meta.segment_last_ts.byteLength !== segCount * 8;
-      if (needsRebuild) {
-        meta = this.db.rebuildSegmentMeta(stream);
+      let snapshot;
+      try {
+        snapshot = await this.db.loadManifestPublicationSnapshot(stream);
+      } catch (e) {
+        this.failures.recordFailure(stream);
+        throw e;
       }
-      if (!meta) return;
-      if (uploadedPrefix > meta.segment_count) {
-        uploadedPrefix = meta.segment_count;
-        this.db.setUploadedSegmentCount(stream, uploadedPrefix);
-      }
-
-      const uploadedThrough =
-        uploadedPrefix === 0 ? -1n : readU64LE(meta.segment_offsets, (uploadedPrefix - 1) * 8) - 1n;
-      const unpublishedWalBytes = this.db.getWalBytesAfterOffset(stream, uploadedThrough);
-      const publishedLogicalSizeBytes =
-        srow.logical_size_bytes > unpublishedWalBytes ? srow.logical_size_bytes - unpublishedWalBytes : 0n;
-
-      const manifestRow = this.db.getManifestRow(stream);
-      const generation = manifestRow.generation + 1;
-
-      const indexState = this.db.getIndexState(stream);
-      const indexRuns = this.db.listIndexRuns(stream);
-      const retiredRuns = this.db.listRetiredIndexRuns(stream);
-      const secondaryIndexStates = this.db.listSecondaryIndexStates(stream);
-      const secondaryIndexRuns = secondaryIndexStates.flatMap((state) => this.db.listSecondaryIndexRuns(stream, state.index_name));
-      const retiredSecondaryIndexRuns = secondaryIndexStates.flatMap((state) =>
-        this.db.listRetiredSecondaryIndexRuns(stream, state.index_name)
-      );
-      const lexiconIndexStates = this.db.listLexiconIndexStates(stream);
-      const lexiconIndexRuns = lexiconIndexStates.flatMap((state) =>
-        this.db.listLexiconIndexRuns(stream, state.source_kind, state.source_name)
-      );
-      const retiredLexiconIndexRuns = lexiconIndexStates.flatMap((state) =>
-        this.db.listRetiredLexiconIndexRuns(stream, state.source_kind, state.source_name)
-      );
-      const searchCompanionPlan = this.db.getSearchCompanionPlan(stream);
-      const searchSegmentCompanions = this.db.listSearchSegmentCompanions(stream);
-      let profileJson: Record<string, any> | null = null;
-      const profileRow = this.db.getStreamProfile(stream);
-      if (profileRow) {
-        try {
-          profileJson = JSON.parse(profileRow.profile_json);
-        } catch {
-          this.failures.recordFailure(stream);
-          throw dsError(`invalid profile_json for ${stream}`);
-        }
-      }
+      if (!snapshot) return;
       const manifestRes = buildManifestResult({
         streamName: stream,
-        streamRow: srow,
-        publishedLogicalSizeBytes,
-        profileJson,
-        segmentMeta: meta,
-        uploadedPrefixCount: uploadedPrefix,
-        generation,
-        indexState,
-        indexRuns,
-        retiredRuns,
-        secondaryIndexStates,
-        secondaryIndexRuns,
-        retiredSecondaryIndexRuns,
-        lexiconIndexStates,
-        lexiconIndexRuns,
-        retiredLexiconIndexRuns,
-        searchCompanionPlan,
-        searchSegmentCompanions,
+        streamRow: snapshot.streamRow,
+        publishedLogicalSizeBytes: snapshot.publishedLogicalSizeBytes,
+        profileJson: snapshot.profileJson,
+        segmentMeta: snapshot.segmentMeta,
+        uploadedPrefixCount: snapshot.uploadedPrefixCount,
+        generation: snapshot.generation,
+        indexState: snapshot.indexState,
+        indexRuns: snapshot.indexRuns,
+        retiredRuns: snapshot.retiredRuns,
+        secondaryIndexStates: snapshot.secondaryIndexStates,
+        secondaryIndexRuns: snapshot.secondaryIndexRuns,
+        retiredSecondaryIndexRuns: snapshot.retiredSecondaryIndexRuns,
+        lexiconIndexStates: snapshot.lexiconIndexStates,
+        lexiconIndexRuns: snapshot.lexiconIndexRuns,
+        retiredLexiconIndexRuns: snapshot.retiredLexiconIndexRuns,
+        searchCompanionPlan: snapshot.searchCompanionPlan,
+        searchSegmentCompanions: snapshot.searchSegmentCompanions,
       });
       if (Result.isError(manifestRes)) {
         this.failures.recordFailure(stream);
@@ -331,13 +282,13 @@ export class Uploader {
       }
 
       // Commit point: advance uploaded_through and delete WAL prefix.
-      this.db.commitManifest(stream, generation, putRes.etag, this.db.nowMs(), uploadedThrough, body.byteLength);
+      await this.db.commitManifest(stream, snapshot.generation, putRes.etag, this.db.nowMs(), snapshot.uploadedThrough, body.byteLength);
       this.hooks?.onMetadataChanged?.(stream);
 
       // Local disk cleanup: delete newly uploaded segment files.
-      if (uploadedPrefix > prevPrefix) {
-        for (let i = prevPrefix; i < uploadedPrefix; i++) {
-          const seg = this.db.getSegmentByIndex(stream, i);
+      if (snapshot.uploadedPrefixCount > snapshot.prevUploadedSegmentCount) {
+        for (let i = snapshot.prevUploadedSegmentCount; i < snapshot.uploadedPrefixCount; i++) {
+          const seg = await this.db.getSegmentForManifestCleanup(stream, i);
           if (!seg) continue;
           try {
             const objectKey = segmentObjectKey(shash, seg.segment_index);

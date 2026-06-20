@@ -1,7 +1,7 @@
 import { mkdirSync, openSync, closeSync, writeSync, fsyncSync, renameSync, existsSync, unlinkSync } from "node:fs";
 import { dirname } from "node:path";
 import type { Config } from "../config";
-import type { SqliteDurableStore } from "../db/db";
+import type { SegmentStore } from "../store/segment_manifest_store";
 import { encodeBlock, encodeFooter, type BlockIndexEntry, type SegmentRecord } from "./format";
 import { readU32BE } from "../util/endian";
 import { localSegmentPath, streamHash16Hex } from "../util/stream_paths";
@@ -35,7 +35,7 @@ const MAX_COMPRESSION_BOOST_MULTIPLIER = 5;
 
 export class Segmenter {
   private readonly config: Config;
-  private readonly db: SqliteDurableStore;
+  private readonly db: SegmentStore;
   private readonly opts: Required<SegmenterOptions>;
   private readonly hooks?: SegmenterHooks;
   private readonly memorySampler?: RuntimeMemorySampler;
@@ -50,7 +50,7 @@ export class Segmenter {
 
   constructor(
     config: Config,
-    db: SqliteDurableStore,
+    db: SegmentStore,
     opts: SegmenterOptions = {},
     hooks?: SegmenterHooks,
     memorySampler?: RuntimeMemorySampler
@@ -98,7 +98,7 @@ export class Segmenter {
     if (this.running) return;
     this.running = true;
     try {
-      const candidates = this.db.candidates(
+      const candidates = await this.db.candidates(
         BigInt(this.opts.minCandidateBytes),
         BigInt(this.opts.minCandidateRows),
         BigInt(this.opts.maxIntervalMs),
@@ -137,14 +137,14 @@ export class Segmenter {
     return code === "SQLITE_BUSY" || code === "SQLITE_BUSY_SNAPSHOT" || errno === 5 || errno === 517;
   }
 
-  private async runWithBusyRetry<T>(fn: () => T): Promise<T> {
+  private async runWithBusyRetry<T>(fn: () => T | Promise<T>): Promise<T> {
     const maxBusyMs = Math.max(0, this.config.ingestBusyTimeoutMs);
-    if (maxBusyMs <= 0) return fn();
+    if (maxBusyMs <= 0) return await fn();
     const startMs = Date.now();
     let attempt = 0;
     for (;;) {
       try {
-        return fn();
+        return await fn();
       } catch (e) {
         if (!this.isSqliteBusy(e)) throw e;
         const elapsed = Date.now() - startMs;
@@ -164,9 +164,9 @@ export class Segmenter {
     }
   }
 
-  private resolvePayloadSealTargetBytes(stream: string): bigint {
+  private async resolvePayloadSealTargetBytes(stream: string): Promise<bigint> {
     const baseTarget = BigInt(this.config.segmentMaxBytes);
-    const ratio = this.db.recentSegmentCompressionRatio(stream, SEGMENT_COMPRESSION_WINDOW);
+    const ratio = await this.db.recentSegmentCompressionRatio(stream, SEGMENT_COMPRESSION_WINDOW);
     if (ratio == null || !Number.isFinite(ratio) || ratio <= 0 || ratio >= MIN_COMPRESSED_FILL_RATIO) {
       return baseTarget;
     }
@@ -177,8 +177,8 @@ export class Segmenter {
     return boosted > baseTarget ? boosted : baseTarget;
   }
 
-  private shouldSealStream(row: { stream: string; pending_bytes: bigint; pending_rows: bigint; last_segment_cut_ms: bigint }): boolean {
-    const payloadSealTargetBytes = this.resolvePayloadSealTargetBytes(row.stream);
+  private async shouldSealStream(row: { stream: string; pending_bytes: bigint; pending_rows: bigint; last_segment_cut_ms: bigint }): Promise<boolean> {
+    const payloadSealTargetBytes = await this.resolvePayloadSealTargetBytes(row.stream);
     if (row.pending_bytes >= payloadSealTargetBytes) return true;
     if (row.pending_rows >= BigInt(this.opts.minCandidateRows)) return true;
     if (this.opts.maxIntervalMs > 0 && BigInt(Date.now()) - row.last_segment_cut_ms >= BigInt(this.opts.maxIntervalMs)) return true;
@@ -187,24 +187,24 @@ export class Segmenter {
 
   private async buildOne(stream: string): Promise<void> {
     if (this.stopping) return;
-    const row = this.db.getStream(stream);
+    const row = await this.db.getSegmentStreamState(stream);
     if (!row || this.db.isDeleted(row)) return;
     if (row.segment_in_progress) return;
-    if (!this.shouldSealStream(row)) return;
+    if (!(await this.shouldSealStream(row))) return;
 
     const startOffset = row.sealed_through + 1n;
     const maxOffset = row.next_offset - 1n;
     if (startOffset > maxOffset) return;
 
     // Claim.
-    if (!this.db.tryClaimSegment(stream)) return;
+    if (!(await this.db.tryClaimSegment(stream))) return;
 
     try {
       this.activeBuildStream = stream;
       this.activePayloadBytes = 0;
       this.activeSegmentBytesEstimate = 0;
       this.activeRows = 0;
-      const segmentIndex = this.db.nextSegmentIndexForStream(stream);
+      const segmentIndex = await this.db.nextSegmentIndexForStream(stream);
       const shash = streamHash16Hex(stream);
       const localPath = localSegmentPath(this.config.rootDir, shash, segmentIndex);
       const tmpPath = `${localPath}.tmp`;
@@ -226,7 +226,7 @@ export class Segmenter {
 
         // Decide endOffset by scanning WAL rows until threshold.
         // IMPORTANT: pending_bytes tracks WAL payload bytes only (not record/block overhead).
-        const payloadSealTargetBytes = this.resolvePayloadSealTargetBytes(stream);
+        const payloadSealTargetBytes = await this.resolvePayloadSealTargetBytes(stream);
         const rowSealTarget = BigInt(this.opts.minCandidateRows);
         let payloadBytes = 0n;
         let rowsSealed = 0n;
@@ -235,11 +235,11 @@ export class Segmenter {
 
         let lastYieldMs = Date.now();
         let recordsSinceYield = 0;
-        for (const rec of this.db.iterWalRange(stream, startOffset, maxOffset)) {
+        for await (const rec of this.db.readWalRange(stream, startOffset, maxOffset)) {
           const offset = BigInt(rec.offset);
           const payload: Uint8Array = rec.payload;
-          const routingKey: Uint8Array | null = rec.routing_key ?? null;
-          const appendMs = BigInt(rec.ts_ms);
+          const routingKey: Uint8Array | null = rec.routingKey ?? null;
+          const appendMs = BigInt(rec.tsMs);
           lastAppendMs = appendMs;
 
           const keyBytes = routingKey ?? new Uint8Array(0);
@@ -324,8 +324,8 @@ export class Segmenter {
 
         if (!this.stopping) {
           try {
-            await this.runWithBusyRetry(() => {
-              this.db.commitSealedSegment({
+            await this.runWithBusyRetry(async () => {
+              await this.db.commitSealedSegment({
                 segmentId,
                 stream,
                 segmentIndex,
@@ -362,7 +362,7 @@ export class Segmenter {
       // Release claim.
       if (!this.stopping) {
         try {
-          this.db.setSegmentInProgress(stream, 0);
+          await this.db.setSegmentInProgress(stream, 0);
         } catch {
           // ignore
         }

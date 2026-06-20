@@ -9,8 +9,8 @@ import type {
   SecondaryIndexRunRow,
   SecondaryIndexStateRow,
   SegmentMetaRow,
-  StreamRow,
-} from "./db/db";
+} from "./store/segment_manifest_store";
+import type { StreamReadRow } from "./store/segment_read_store";
 import { encodeOffsetResult } from "./offset";
 import { zstdCompressSync } from "./util/zstd";
 import { dsError } from "./util/ds_error.ts";
@@ -41,7 +41,7 @@ function invalidManifest<T = never>(message: string): Result<T, ManifestBuildErr
 
 type BuildManifestArgs = {
   streamName: string;
-  streamRow: StreamRow;
+  streamRow: StreamReadRow;
   publishedLogicalSizeBytes: bigint;
   profileJson?: Record<string, any> | null;
   segmentMeta: SegmentMetaRow;
