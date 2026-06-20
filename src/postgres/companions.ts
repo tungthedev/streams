@@ -30,16 +30,7 @@ export class PostgresCompanionIndexStore implements SearchCompanionIndexStore, C
   }
 
   async upsertSearchCompanionPlan(stream: string, generation: number, planHash: string, planJson: string): Promise<void> {
-    await this.pool.query(
-      `INSERT INTO search_companion_plans(stream, generation, plan_hash, plan_json, updated_at_ms)
-       VALUES($1, $2, $3, $4, $5)
-       ON CONFLICT(stream) DO UPDATE SET
-         generation = excluded.generation,
-         plan_hash = excluded.plan_hash,
-         plan_json = excluded.plan_json,
-         updated_at_ms = excluded.updated_at_ms;`,
-      [stream, generation, planHash, planJson, pgInt(this.currentTimeMs())]
-    );
+    await upsertPostgresSearchCompanionPlan(this.pool, this.currentTimeMs(), stream, generation, planHash, planJson);
   }
 
   async deleteSearchCompanionPlan(stream: string): Promise<void> {
@@ -65,39 +56,87 @@ export class PostgresCompanionIndexStore implements SearchCompanionIndexStore, C
     primaryTimestampMinMs: bigint | null,
     primaryTimestampMaxMs: bigint | null
   ): Promise<void> {
-    await this.pool.query(
-      `INSERT INTO search_segment_companions(
-         stream, segment_index, object_key, plan_generation, sections_json, section_sizes_json,
-         size_bytes, primary_timestamp_min_ms, primary_timestamp_max_ms, updated_at_ms
-       )
-       VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-       ON CONFLICT(stream, segment_index) DO UPDATE SET
-         object_key = excluded.object_key,
-         plan_generation = excluded.plan_generation,
-         sections_json = excluded.sections_json,
-         section_sizes_json = excluded.section_sizes_json,
-         size_bytes = excluded.size_bytes,
-         primary_timestamp_min_ms = excluded.primary_timestamp_min_ms,
-         primary_timestamp_max_ms = excluded.primary_timestamp_max_ms,
-         updated_at_ms = excluded.updated_at_ms;`,
-      [
-        stream,
-        segmentIndex,
-        objectKey,
-        planGeneration,
-        sectionsJson,
-        sectionSizesJson,
-        sizeBytes,
-        primaryTimestampMinMs == null ? null : pgInt(primaryTimestampMinMs),
-        primaryTimestampMaxMs == null ? null : pgInt(primaryTimestampMaxMs),
-        pgInt(this.currentTimeMs()),
-      ]
+    await upsertPostgresSearchSegmentCompanion(
+      this.pool,
+      this.currentTimeMs(),
+      stream,
+      segmentIndex,
+      objectKey,
+      planGeneration,
+      sectionsJson,
+      sectionSizesJson,
+      sizeBytes,
+      primaryTimestampMinMs,
+      primaryTimestampMaxMs
     );
   }
 
   async deleteSearchSegmentCompanions(stream: string): Promise<void> {
     await this.pool.query(`DELETE FROM search_segment_companions WHERE stream = $1;`, [stream]);
   }
+}
+
+export async function upsertPostgresSearchCompanionPlan(
+  executor: PgExecutor,
+  nowMs: bigint,
+  stream: string,
+  generation: number,
+  planHash: string,
+  planJson: string
+): Promise<void> {
+  await executor.query(
+    `INSERT INTO search_companion_plans(stream, generation, plan_hash, plan_json, updated_at_ms)
+     VALUES($1, $2, $3, $4, $5)
+     ON CONFLICT(stream) DO UPDATE SET
+       generation = excluded.generation,
+       plan_hash = excluded.plan_hash,
+       plan_json = excluded.plan_json,
+       updated_at_ms = excluded.updated_at_ms;`,
+    [stream, generation, planHash, planJson, pgInt(nowMs)]
+  );
+}
+
+export async function upsertPostgresSearchSegmentCompanion(
+  executor: PgExecutor,
+  nowMs: bigint,
+  stream: string,
+  segmentIndex: number,
+  objectKey: string,
+  planGeneration: number,
+  sectionsJson: string,
+  sectionSizesJson: string,
+  sizeBytes: number,
+  primaryTimestampMinMs: bigint | null,
+  primaryTimestampMaxMs: bigint | null
+): Promise<void> {
+  await executor.query(
+    `INSERT INTO search_segment_companions(
+       stream, segment_index, object_key, plan_generation, sections_json, section_sizes_json,
+       size_bytes, primary_timestamp_min_ms, primary_timestamp_max_ms, updated_at_ms
+     )
+     VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+     ON CONFLICT(stream, segment_index) DO UPDATE SET
+       object_key = excluded.object_key,
+       plan_generation = excluded.plan_generation,
+       sections_json = excluded.sections_json,
+       section_sizes_json = excluded.section_sizes_json,
+       size_bytes = excluded.size_bytes,
+       primary_timestamp_min_ms = excluded.primary_timestamp_min_ms,
+       primary_timestamp_max_ms = excluded.primary_timestamp_max_ms,
+       updated_at_ms = excluded.updated_at_ms;`,
+    [
+      stream,
+      segmentIndex,
+      objectKey,
+      planGeneration,
+      sectionsJson,
+      sectionSizesJson,
+      sizeBytes,
+      primaryTimestampMinMs == null ? null : pgInt(primaryTimestampMinMs),
+      primaryTimestampMaxMs == null ? null : pgInt(primaryTimestampMaxMs),
+      pgInt(nowMs),
+    ]
+  );
 }
 
 export async function loadPostgresSearchCompanionManifest(

@@ -20,16 +20,7 @@ export class PostgresSecondaryIndexStore extends PostgresIndexSharedStore implem
     configHash: string,
     indexedThrough: number
   ): Promise<void> {
-    await this.pool.query(
-      `INSERT INTO secondary_index_state(stream, index_name, index_secret, config_hash, indexed_through, updated_at_ms)
-       VALUES($1, $2, $3, $4, $5, $6)
-       ON CONFLICT(stream, index_name) DO UPDATE SET
-         index_secret = excluded.index_secret,
-         config_hash = excluded.config_hash,
-         indexed_through = excluded.indexed_through,
-         updated_at_ms = excluded.updated_at_ms;`,
-      [stream, indexName, Buffer.from(indexSecret), configHash, indexedThrough, pgInt(this.nowMs())]
-    );
+    await upsertPostgresSecondaryIndexState(this.pool, this.nowMs(), stream, indexName, indexSecret, configHash, indexedThrough);
   }
 
   async updateSecondaryIndexedThrough(stream: string, indexName: string, indexedThrough: number): Promise<void> {
@@ -50,33 +41,11 @@ export class PostgresSecondaryIndexStore extends PostgresIndexSharedStore implem
   }
 
   async insertSecondaryIndexRun(row: Omit<SecondaryIndexRunRow, "retired_gen" | "retired_at_ms">): Promise<void> {
-    await this.pool.query(
-      `INSERT INTO secondary_index_runs(
-         run_id, stream, index_name, level, start_segment, end_segment, object_key, size_bytes, filter_len, record_count
-       )
-       VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10);`,
-      [
-        row.run_id,
-        row.stream,
-        row.index_name,
-        row.level,
-        row.start_segment,
-        row.end_segment,
-        row.object_key,
-        row.size_bytes,
-        row.filter_len,
-        row.record_count,
-      ]
-    );
+    await insertPostgresSecondaryIndexRun(this.pool, row);
   }
 
   async retireSecondaryIndexRuns(runIds: string[], retiredGen: number, retiredAtMs: bigint): Promise<void> {
-    if (runIds.length === 0) return;
-    await this.pool.query(`UPDATE secondary_index_runs SET retired_gen = $1, retired_at_ms = $2 WHERE run_id = ANY($3::text[]);`, [
-      retiredGen,
-      pgInt(retiredAtMs),
-      runIds,
-    ]);
+    await retirePostgresSecondaryIndexRuns(this.pool, runIds, retiredGen, retiredAtMs);
   }
 
   async deleteSecondaryIndexRuns(runIds: string[]): Promise<void> {
@@ -98,6 +67,81 @@ export class PostgresSecondaryIndexStore extends PostgresIndexSharedStore implem
       client.release();
     }
   }
+}
+
+export async function insertPostgresSecondaryIndexRun(
+  executor: PgExecutor,
+  row: Omit<SecondaryIndexRunRow, "retired_gen" | "retired_at_ms">,
+  opts: { idempotent?: boolean } = {}
+): Promise<void> {
+  const conflictSql = opts.idempotent
+    ? `ON CONFLICT(run_id) DO UPDATE SET
+         stream = excluded.stream,
+         index_name = excluded.index_name,
+         level = excluded.level,
+         start_segment = excluded.start_segment,
+         end_segment = excluded.end_segment,
+         object_key = excluded.object_key,
+         size_bytes = excluded.size_bytes,
+         filter_len = excluded.filter_len,
+         record_count = excluded.record_count,
+         retired_gen = NULL,
+         retired_at_ms = NULL`
+    : "";
+  await executor.query(
+    `INSERT INTO secondary_index_runs(
+       run_id, stream, index_name, level, start_segment, end_segment, object_key, size_bytes, filter_len, record_count
+     )
+     VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+     ${conflictSql};`,
+    [
+      row.run_id,
+      row.stream,
+      row.index_name,
+      row.level,
+      row.start_segment,
+      row.end_segment,
+      row.object_key,
+      row.size_bytes,
+      row.filter_len,
+      row.record_count,
+    ]
+  );
+}
+
+export async function upsertPostgresSecondaryIndexState(
+  executor: PgExecutor,
+  nowMs: bigint,
+  stream: string,
+  indexName: string,
+  indexSecret: Uint8Array,
+  configHash: string,
+  indexedThrough: number
+): Promise<void> {
+  await executor.query(
+    `INSERT INTO secondary_index_state(stream, index_name, index_secret, config_hash, indexed_through, updated_at_ms)
+     VALUES($1, $2, $3, $4, $5, $6)
+     ON CONFLICT(stream, index_name) DO UPDATE SET
+       index_secret = excluded.index_secret,
+       config_hash = excluded.config_hash,
+       indexed_through = excluded.indexed_through,
+       updated_at_ms = excluded.updated_at_ms;`,
+    [stream, indexName, Buffer.from(indexSecret), configHash, indexedThrough, pgInt(nowMs)]
+  );
+}
+
+export async function retirePostgresSecondaryIndexRuns(
+  executor: PgExecutor,
+  runIds: string[],
+  retiredGen: number,
+  retiredAtMs: bigint
+): Promise<void> {
+  if (runIds.length === 0) return;
+  await executor.query(`UPDATE secondary_index_runs SET retired_gen = $1, retired_at_ms = $2 WHERE run_id = ANY($3::text[]);`, [
+    retiredGen,
+    pgInt(retiredAtMs),
+    runIds,
+  ]);
 }
 
 export async function loadPostgresSecondaryIndexManifest(

@@ -22,14 +22,7 @@ export class PostgresLexiconIndexStore extends PostgresIndexSharedStore implemen
   }
 
   async upsertLexiconIndexState(stream: string, sourceKind: string, sourceName: string, indexedThrough: number): Promise<void> {
-    await this.pool.query(
-      `INSERT INTO lexicon_index_state(stream, source_kind, source_name, indexed_through, updated_at_ms)
-       VALUES($1, $2, $3, $4, $5)
-       ON CONFLICT(stream, source_kind, source_name) DO UPDATE SET
-         indexed_through = excluded.indexed_through,
-         updated_at_ms = excluded.updated_at_ms;`,
-      [stream, sourceKind, sourceName, indexedThrough, pgInt(this.nowMs())]
-    );
+    await upsertPostgresLexiconIndexState(this.pool, this.nowMs(), stream, sourceKind, sourceName, indexedThrough);
   }
 
   async updateLexiconIndexedThrough(stream: string, sourceKind: string, sourceName: string, indexedThrough: number): Promise<void> {
@@ -54,33 +47,11 @@ export class PostgresLexiconIndexStore extends PostgresIndexSharedStore implemen
   }
 
   async insertLexiconIndexRun(row: Omit<LexiconIndexRunRow, "retired_gen" | "retired_at_ms">): Promise<void> {
-    await this.pool.query(
-      `INSERT INTO lexicon_index_runs(
-         run_id, stream, source_kind, source_name, level, start_segment, end_segment, object_key, size_bytes, record_count
-       )
-       VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10);`,
-      [
-        row.run_id,
-        row.stream,
-        row.source_kind,
-        row.source_name,
-        row.level,
-        row.start_segment,
-        row.end_segment,
-        row.object_key,
-        row.size_bytes,
-        row.record_count,
-      ]
-    );
+    await insertPostgresLexiconIndexRun(this.pool, row);
   }
 
   async retireLexiconIndexRuns(runIds: string[], retiredGen: number, retiredAtMs: bigint): Promise<void> {
-    if (runIds.length === 0) return;
-    await this.pool.query(`UPDATE lexicon_index_runs SET retired_gen = $1, retired_at_ms = $2 WHERE run_id = ANY($3::text[]);`, [
-      retiredGen,
-      pgInt(retiredAtMs),
-      runIds,
-    ]);
+    await retirePostgresLexiconIndexRuns(this.pool, runIds, retiredGen, retiredAtMs);
   }
 
   async deleteLexiconIndexRuns(runIds: string[]): Promise<void> {
@@ -110,6 +81,76 @@ export class PostgresLexiconIndexStore extends PostgresIndexSharedStore implemen
       client.release();
     }
   }
+}
+export async function insertPostgresLexiconIndexRun(
+  executor: PgExecutor,
+  row: Omit<LexiconIndexRunRow, "retired_gen" | "retired_at_ms">,
+  opts: { idempotent?: boolean } = {}
+): Promise<void> {
+  const conflictSql = opts.idempotent
+    ? `ON CONFLICT(run_id) DO UPDATE SET
+         stream = excluded.stream,
+         source_kind = excluded.source_kind,
+         source_name = excluded.source_name,
+         level = excluded.level,
+         start_segment = excluded.start_segment,
+         end_segment = excluded.end_segment,
+         object_key = excluded.object_key,
+         size_bytes = excluded.size_bytes,
+         record_count = excluded.record_count,
+         retired_gen = NULL,
+         retired_at_ms = NULL`
+    : "";
+  await executor.query(
+    `INSERT INTO lexicon_index_runs(
+       run_id, stream, source_kind, source_name, level, start_segment, end_segment, object_key, size_bytes, record_count
+     )
+     VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+     ${conflictSql};`,
+    [
+      row.run_id,
+      row.stream,
+      row.source_kind,
+      row.source_name,
+      row.level,
+      row.start_segment,
+      row.end_segment,
+      row.object_key,
+      row.size_bytes,
+      row.record_count,
+    ]
+  );
+}
+export async function upsertPostgresLexiconIndexState(
+  executor: PgExecutor,
+  nowMs: bigint,
+  stream: string,
+  sourceKind: string,
+  sourceName: string,
+  indexedThrough: number
+): Promise<void> {
+  await executor.query(
+    `INSERT INTO lexicon_index_state(stream, source_kind, source_name, indexed_through, updated_at_ms)
+     VALUES($1, $2, $3, $4, $5)
+     ON CONFLICT(stream, source_kind, source_name) DO UPDATE SET
+       indexed_through = excluded.indexed_through,
+       updated_at_ms = excluded.updated_at_ms;`,
+    [stream, sourceKind, sourceName, indexedThrough, pgInt(nowMs)]
+  );
+}
+
+export async function retirePostgresLexiconIndexRuns(
+  executor: PgExecutor,
+  runIds: string[],
+  retiredGen: number,
+  retiredAtMs: bigint
+): Promise<void> {
+  if (runIds.length === 0) return;
+  await executor.query(`UPDATE lexicon_index_runs SET retired_gen = $1, retired_at_ms = $2 WHERE run_id = ANY($3::text[]);`, [
+    retiredGen,
+    pgInt(retiredAtMs),
+    runIds,
+  ]);
 }
 
 export async function loadPostgresLexiconIndexManifest(

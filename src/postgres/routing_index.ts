@@ -10,15 +10,7 @@ export class PostgresRoutingIndexStore extends PostgresIndexSharedStore implemen
   }
 
   async upsertIndexState(stream: string, indexSecret: Uint8Array, indexedThrough: number): Promise<void> {
-    await this.pool.query(
-      `INSERT INTO index_state(stream, index_secret, indexed_through, updated_at_ms)
-       VALUES($1, $2, $3, $4)
-       ON CONFLICT(stream) DO UPDATE SET
-         index_secret = excluded.index_secret,
-         indexed_through = excluded.indexed_through,
-         updated_at_ms = excluded.updated_at_ms;`,
-      [stream, Buffer.from(indexSecret), indexedThrough, pgInt(this.nowMs())]
-    );
+    await upsertPostgresIndexState(this.pool, this.nowMs(), stream, indexSecret, indexedThrough);
   }
 
   async updateIndexedThrough(stream: string, indexedThrough: number): Promise<void> {
@@ -48,20 +40,11 @@ export class PostgresRoutingIndexStore extends PostgresIndexSharedStore implemen
   }
 
   async insertIndexRun(row: Omit<IndexRunRow, "retired_gen" | "retired_at_ms">): Promise<void> {
-    await this.pool.query(
-      `INSERT INTO index_runs(run_id, stream, level, start_segment, end_segment, object_key, size_bytes, filter_len, record_count)
-       VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9);`,
-      [row.run_id, row.stream, row.level, row.start_segment, row.end_segment, row.object_key, row.size_bytes, row.filter_len, row.record_count]
-    );
+    await insertPostgresIndexRun(this.pool, row);
   }
 
   async retireIndexRuns(runIds: string[], retiredGen: number, retiredAtMs: bigint): Promise<void> {
-    if (runIds.length === 0) return;
-    await this.pool.query(`UPDATE index_runs SET retired_gen = $1, retired_at_ms = $2 WHERE run_id = ANY($3::text[]);`, [
-      retiredGen,
-      pgInt(retiredAtMs),
-      runIds,
-    ]);
+    await retirePostgresIndexRuns(this.pool, runIds, retiredGen, retiredAtMs);
   }
 
   async deleteIndexRuns(runIds: string[]): Promise<void> {
@@ -83,6 +66,64 @@ export class PostgresRoutingIndexStore extends PostgresIndexSharedStore implemen
       client.release();
     }
   }
+}
+
+export async function insertPostgresIndexRun(
+  executor: PgExecutor,
+  row: Omit<IndexRunRow, "retired_gen" | "retired_at_ms">,
+  opts: { idempotent?: boolean } = {}
+): Promise<void> {
+  const conflictSql = opts.idempotent
+    ? `ON CONFLICT(run_id) DO UPDATE SET
+         stream = excluded.stream,
+         level = excluded.level,
+         start_segment = excluded.start_segment,
+         end_segment = excluded.end_segment,
+         object_key = excluded.object_key,
+         size_bytes = excluded.size_bytes,
+         filter_len = excluded.filter_len,
+         record_count = excluded.record_count,
+         retired_gen = NULL,
+         retired_at_ms = NULL`
+    : "";
+  await executor.query(
+    `INSERT INTO index_runs(run_id, stream, level, start_segment, end_segment, object_key, size_bytes, filter_len, record_count)
+     VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9)
+     ${conflictSql};`,
+    [row.run_id, row.stream, row.level, row.start_segment, row.end_segment, row.object_key, row.size_bytes, row.filter_len, row.record_count]
+  );
+}
+
+export async function upsertPostgresIndexState(
+  executor: PgExecutor,
+  nowMs: bigint,
+  stream: string,
+  indexSecret: Uint8Array,
+  indexedThrough: number
+): Promise<void> {
+  await executor.query(
+    `INSERT INTO index_state(stream, index_secret, indexed_through, updated_at_ms)
+     VALUES($1, $2, $3, $4)
+     ON CONFLICT(stream) DO UPDATE SET
+       index_secret = excluded.index_secret,
+       indexed_through = excluded.indexed_through,
+       updated_at_ms = excluded.updated_at_ms;`,
+    [stream, Buffer.from(indexSecret), indexedThrough, pgInt(nowMs)]
+  );
+}
+
+export async function retirePostgresIndexRuns(
+  executor: PgExecutor,
+  runIds: string[],
+  retiredGen: number,
+  retiredAtMs: bigint
+): Promise<void> {
+  if (runIds.length === 0) return;
+  await executor.query(`UPDATE index_runs SET retired_gen = $1, retired_at_ms = $2 WHERE run_id = ANY($3::text[]);`, [
+    retiredGen,
+    pgInt(retiredAtMs),
+    runIds,
+  ]);
 }
 
 export async function loadPostgresRoutingIndexManifest(

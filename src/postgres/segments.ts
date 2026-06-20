@@ -655,6 +655,121 @@ export class PostgresSegmentManifestStore implements SegmentReadStore, SegmentSt
   }
 }
 
+export type PostgresSegmentRestoreRow = {
+  segmentId: string;
+  stream: string;
+  segmentIndex: number;
+  startOffset: bigint;
+  endOffset: bigint;
+  blockCount: number;
+  lastAppendMs: bigint;
+  payloadBytes: bigint;
+  sizeBytes: number;
+  localPath: string;
+};
+
+export async function restorePostgresSegmentRow(
+  executor: PgExecutor,
+  nowMs: bigint,
+  row: PostgresSegmentRestoreRow
+): Promise<void> {
+  await executor.query(
+    `INSERT INTO segments(segment_id, stream, segment_index, start_offset, end_offset, block_count,
+                          last_append_ms, payload_bytes, size_bytes, local_path, created_at_ms, uploaded_at_ms, r2_etag)
+     VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NULL, NULL)
+     ON CONFLICT(stream, segment_index) DO UPDATE SET
+       segment_id = excluded.segment_id,
+       start_offset = excluded.start_offset,
+       end_offset = excluded.end_offset,
+       block_count = excluded.block_count,
+       last_append_ms = excluded.last_append_ms,
+       payload_bytes = excluded.payload_bytes,
+       size_bytes = excluded.size_bytes,
+       local_path = excluded.local_path;`,
+    [
+      row.segmentId,
+      row.stream,
+      row.segmentIndex,
+      pgInt(row.startOffset),
+      pgInt(row.endOffset),
+      row.blockCount,
+      pgInt(row.lastAppendMs),
+      pgInt(row.payloadBytes),
+      row.sizeBytes,
+      row.localPath,
+      pgInt(nowMs),
+    ]
+  );
+}
+
+export async function restorePostgresSegmentMeta(
+  executor: PgExecutor,
+  stream: string,
+  count: number,
+  offsets: Uint8Array,
+  blocks: Uint8Array,
+  lastTs: Uint8Array
+): Promise<void> {
+  await executor.query(
+    `INSERT INTO stream_segment_meta(stream, segment_count, segment_offsets, segment_blocks, segment_last_ts)
+     VALUES($1, $2, $3, $4, $5)
+     ON CONFLICT(stream) DO UPDATE SET
+       segment_count = excluded.segment_count,
+       segment_offsets = excluded.segment_offsets,
+       segment_blocks = excluded.segment_blocks,
+       segment_last_ts = excluded.segment_last_ts;`,
+    [stream, count, Buffer.from(offsets), Buffer.from(blocks), Buffer.from(lastTs)]
+  );
+}
+
+export async function restorePostgresManifestRow(
+  executor: PgExecutor,
+  stream: string,
+  generation: number,
+  uploadedGeneration: number,
+  uploadedAtMs: bigint | null,
+  etag: string | null,
+  sizeBytes: number | null
+): Promise<void> {
+  await executor.query(
+    `INSERT INTO manifests(stream, generation, uploaded_generation, last_uploaded_at_ms, last_uploaded_etag, last_uploaded_size_bytes)
+     VALUES($1, $2, $3, $4, $5, $6)
+     ON CONFLICT(stream) DO UPDATE SET
+       generation = excluded.generation,
+       uploaded_generation = excluded.uploaded_generation,
+       last_uploaded_at_ms = excluded.last_uploaded_at_ms,
+       last_uploaded_etag = excluded.last_uploaded_etag,
+       last_uploaded_size_bytes = excluded.last_uploaded_size_bytes;`,
+    [stream, generation, uploadedGeneration, uploadedAtMs == null ? null : pgInt(uploadedAtMs), etag, sizeBytes]
+  );
+}
+
+export async function markPostgresSegmentUploaded(
+  executor: PgExecutor,
+  segmentId: string,
+  etag: string,
+  uploadedAtMs: bigint
+): Promise<void> {
+  await executor.query(`UPDATE segments SET r2_etag = $1, uploaded_at_ms = $2 WHERE segment_id = $3;`, [
+    etag,
+    pgInt(uploadedAtMs),
+    segmentId,
+  ]);
+}
+
+export async function setPostgresSchemaUploadedSizeBytes(
+  executor: PgExecutor,
+  nowMs: bigint,
+  stream: string,
+  sizeBytes: number
+): Promise<void> {
+  await executor.query(`UPDATE schemas SET uploaded_size_bytes = $1, updated_at_ms = $2 WHERE stream = $3;`, [
+    sizeBytes,
+    pgInt(nowMs),
+    stream,
+  ]);
+}
+
 function segmentSelectSql(whereSql: string): string {
   return `SELECT segment_id, stream, segment_index, start_offset, end_offset, block_count, last_append_ms,
                  payload_bytes, size_bytes, local_path, created_at_ms, uploaded_at_ms, r2_etag

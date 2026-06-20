@@ -10,6 +10,7 @@ import type {
   TouchProcessorStore,
 } from "../store/touch_store";
 import type { WalReadRow } from "../store/wal_store";
+import type { PgExecutor } from "./types";
 
 type PostgresTouchStoreDelegates = {
   nowMs(): bigint;
@@ -232,22 +233,13 @@ export class PostgresTouchStore implements TouchProcessorStore {
   }
 
   async ensureStreamTouchState(stream: string): Promise<void> {
-    const existing = await this.getStreamTouchState(stream);
-    if (existing) return;
     const srow = await this.getStream(stream);
     const initialThrough = srow ? srow.next_offset - 1n : -1n;
-    await this.pool.query(
-      `INSERT INTO stream_touch_state(stream, processed_through, updated_at_ms)
-       VALUES($1, $2, $3)
-       ON CONFLICT(stream) DO UPDATE SET
-         processed_through = stream_touch_state.processed_through,
-         updated_at_ms = stream_touch_state.updated_at_ms;`,
-      [stream, pgInt(initialThrough), pgInt(this.nowMs())]
-    );
+    await ensurePostgresStreamTouchState(this.pool, this.nowMs(), stream, initialThrough);
   }
 
   async deleteStreamTouchState(stream: string): Promise<void> {
-    await this.pool.query(`DELETE FROM stream_touch_state WHERE stream = $1;`, [stream]);
+    await deletePostgresStreamTouchState(this.pool, stream);
   }
 
   async getStreamTouchState(stream: string): Promise<StreamTouchStateRow | null> {
@@ -550,6 +542,35 @@ export class PostgresTouchStore implements TouchProcessorStore {
     for (const row of streamRes.rows) evicted.push({ templateId: row.template_id, reason: "cap_exceeded", cap: args.maxActiveTemplatesPerStream });
     return evicted;
   }
+}
+
+export async function ensurePostgresStreamTouchState(
+  executor: PgExecutor,
+  nowMs: bigint,
+  stream: string,
+  initialThrough: bigint
+): Promise<void> {
+  await executor.query(
+    `INSERT INTO stream_touch_state(stream, processed_through, updated_at_ms)
+     VALUES($1, $2, $3)
+     ON CONFLICT(stream) DO UPDATE SET
+       processed_through = stream_touch_state.processed_through,
+       updated_at_ms = stream_touch_state.updated_at_ms;`,
+    [stream, pgInt(initialThrough), pgInt(nowMs)]
+  );
+}
+
+export async function ensurePostgresStreamTouchStateFromStream(executor: PgExecutor, nowMs: bigint, stream: string): Promise<void> {
+  const res = await executor.query<{ next_offset: string | number | bigint }>(
+    `SELECT next_offset FROM streams WHERE stream = $1 LIMIT 1;`,
+    [stream]
+  );
+  const nextOffset = toBigInt(res.rows[0]?.next_offset ?? 0);
+  await ensurePostgresStreamTouchState(executor, nowMs, stream, nextOffset - 1n);
+}
+
+export async function deletePostgresStreamTouchState(executor: PgExecutor, stream: string): Promise<void> {
+  await executor.query(`DELETE FROM stream_touch_state WHERE stream = $1;`, [stream]);
 }
 
 function coerceLiveTemplateRow(row: LiveTemplatePgRow): LiveTemplateStoreRow {
