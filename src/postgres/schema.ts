@@ -23,6 +23,7 @@ export async function migratePostgresStore(pool: Pool, opts: PostgresMigrationOp
       await installFullModeSegmentSchema(client);
       await installFullModeIndexSchema(client);
       await installFullModeTouchSchema(client);
+      await installFullModeStatsSchema(client);
     }
     await setPostgresSchemaVersion(client, POSTGRES_SCHEMA_VERSION);
     await client.query("COMMIT");
@@ -332,5 +333,23 @@ async function installFullModeTouchSchema(executor: PgSchemaExecutor): Promise<v
   await executor.query(`
     CREATE INDEX IF NOT EXISTS live_templates_stream_state_last_seen_idx
       ON live_templates(stream, state, last_seen_at_ms);
+  `);
+}
+
+async function installFullModeStatsSchema(executor: PgSchemaExecutor): Promise<void> {
+  await executor.query(`
+    CREATE TABLE IF NOT EXISTS objectstore_request_counts (
+      stream_hash text NOT NULL,
+      artifact text NOT NULL,
+      op text NOT NULL,
+      count bigint NOT NULL DEFAULT 0,
+      bytes bigint NOT NULL DEFAULT 0,
+      updated_at_ms bigint NOT NULL,
+      PRIMARY KEY(stream_hash, artifact, op)
+    );
+  `);
+  await executor.query(`
+    CREATE INDEX IF NOT EXISTS objectstore_request_counts_stream_hash_idx
+      ON objectstore_request_counts(stream_hash, updated_at_ms);
   `);
 }

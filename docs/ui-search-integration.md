@@ -345,7 +345,7 @@ supported source of truth:
   metadata.
 - `storage.local_storage`
   Current retained bytes for WAL, pending sealed segments, caches, and the
-  shared SQLite footprint. This includes:
+  shared database footprint. This includes:
   - the local segment read-through cache under `${DS_ROOT}/cache/`
   - the local routing/exact run caches
   - the local lexicon cache under `${DS_ROOT}/cache/lexicon`
@@ -361,8 +361,10 @@ supported source of truth:
   breakdown.
 
 The current contract reports lag in `lag_ms`, so a UI can render seconds or
-minutes directly. `sqlite_shared_total_bytes` is shared process-local state, so
-it should be labeled as shared rather than attributed as fully stream-owned.
+minutes directly. `shared_db_total_bytes` is shared process-local state, so it
+should be labeled as shared rather than attributed as fully stream-owned. Use
+`sqlite_shared_total_bytes` or `postgres_shared_total_bytes` only when the UI
+needs to name the active storage backend.
 
 ## When To Show The Filter UI
 

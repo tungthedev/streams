@@ -454,6 +454,7 @@ export type CreateAppCoreOptions<TDebugStore extends AppDebugStore = AppDebugSto
   storageStatsStore?: StorageStatsStore;
   objectStoreAccountingStore?: ObjectStoreAccountingStore;
   detailsStore?: FullModeDetailsStore;
+  detailsStorageBackend?: "sqlite" | "postgres";
   lifecycleHooks?: {
     beforeRuntimeCreate?(): void;
     afterInternalMetricsProfileEnsured?(): void;
@@ -618,6 +619,7 @@ export function createAppCore<TDebugStore extends AppDebugStore = AppDebugStore>
     detailsStore
       ? new FullModeDetailsBuilder({
           detailsStore,
+          storageBackend: opts.detailsStorageBackend,
           storageStatsStore,
           objectStoreAccountingStore,
           getLocalStorageUsage: getLocalStorageUsage as ((stream: string) => Partial<LocalStorageUsage>) | undefined,

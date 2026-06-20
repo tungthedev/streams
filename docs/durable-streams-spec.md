@@ -680,7 +680,11 @@ Rules:
 - `storage.object_storage` reports current uploaded bytes and object counts for:
   segments, indexes, and manifest/schema metadata
 - `storage.local_storage` reports current local retained bytes for:
-  WAL, pending sealed segments, caches, and the shared SQLite footprint
+  WAL, pending sealed segments, caches, and the shared database footprint
+  - `shared_db_total_bytes` is the storage-backend-neutral shared database
+    footprint for this node
+  - SQLite full mode also reports `sqlite_shared_total_bytes`; Postgres full
+    mode also reports `postgres_shared_total_bytes`
   - `segment_cache_bytes`, `routing_index_cache_bytes`,
     `exact_index_cache_bytes`, `lexicon_index_cache_bytes`, and
     `companion_cache_bytes` are local on-disk cache occupancy, not process heap

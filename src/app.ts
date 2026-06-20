@@ -132,6 +132,7 @@ export function createApp(cfg: Config, os?: ObjectStore, opts: CreateAppOptions 
     storageStatsStore: db,
     objectStoreAccountingStore: db,
     detailsStore: db,
+    detailsStorageBackend: "sqlite",
     lifecycleHooks: {
       beforeRuntimeCreate: () => {
         db.resetSegmentInProgress();
@@ -429,15 +430,20 @@ export function createPostgresApp(cfg: Config, store: PostgresDurableStore, opts
 }
 
 export function createPostgresFullApp(cfg: Config, store: PostgresDurableStore, os: ObjectStore, opts: CreateAppOptions = {}): App {
+  const statsAccounting = store.fullModeStatsAccounting();
   return createAppCore(cfg, {
     store,
     touchStore: store.fullModeTouch(),
     touchUseWorkers: false,
+    storageStatsStore: statsAccounting,
+    objectStoreAccountingStore: statsAccounting,
     detailsStore: store.fullModeDetails(),
+    detailsStorageBackend: "postgres",
     stats: opts.stats,
     createRuntime: ({ config, registry, notifier, stats, backpressure, metrics, memorySampler, memory, asyncIndexGate, foregroundActivity }) => {
       const segmentStore = store.fullModeSegments();
       const indexStores = store.fullModeIndexStores();
+      const objectStore = new AccountingObjectStore(os, statsAccounting, metrics);
       const diskCache = new SegmentDiskCache(`${config.rootDir}/cache`, config.segmentCacheMaxBytes);
       const segmenterHooks: SegmenterHooks = {
         onSegmentSealed: (stream, payloadBytes, segmentBytes) => {
@@ -446,11 +452,11 @@ export function createPostgresFullApp(cfg: Config, store: PostgresDurableStore, 
           notifier.notifyDetailsChanged(stream);
         },
       };
-      const uploader = new Uploader(config, segmentStore, os, diskCache, stats, backpressure, undefined, memorySampler);
+      const uploader = new Uploader(config, segmentStore, objectStore, diskCache, stats, backpressure, undefined, memorySampler);
       const routingIndexer = new IndexManager(
         config,
         indexStores.routing,
-        os,
+        objectStore,
         diskCache,
         (stream) => uploader.publishManifest(stream),
         metrics,
@@ -464,7 +470,7 @@ export function createPostgresFullApp(cfg: Config, store: PostgresDurableStore, 
         config,
         indexStores.secondary,
         indexStores.companions,
-        os,
+        objectStore,
         registry,
         diskCache,
         (stream) => uploader.publishManifest(stream),
@@ -476,7 +482,7 @@ export function createPostgresFullApp(cfg: Config, store: PostgresDurableStore, 
       const companionIndexer = new SearchCompanionManager(
         config,
         indexStores.companions,
-        os,
+        objectStore,
         registry,
         diskCache,
         (stream) => uploader.publishManifest(stream),
@@ -489,7 +495,7 @@ export function createPostgresFullApp(cfg: Config, store: PostgresDurableStore, 
       const lexiconIndexer = new LexiconIndexManager(
         config,
         indexStores.lexicon,
-        os,
+        objectStore,
         diskCache,
         (stream) => uploader.publishManifest(stream),
         (stream) => notifier.notifyDetailsChanged(stream),
@@ -508,7 +514,7 @@ export function createPostgresFullApp(cfg: Config, store: PostgresDurableStore, 
         config,
         store,
         registry,
-        { segmentReads: segmentStore, objectStore: os, diskCache, index: indexer },
+        { segmentReads: segmentStore, objectStore, diskCache, index: indexer },
         memorySampler,
         memory
       );
@@ -518,7 +524,7 @@ export function createPostgresFullApp(cfg: Config, store: PostgresDurableStore, 
           const key = schemaObjectKey(shash);
           const body = new TextEncoder().encode(JSON.stringify(reg));
           await retry(
-            () => os.put(key, body, { contentType: "application/json", contentLength: body.byteLength }),
+            () => objectStore.put(key, body, { contentType: "application/json", contentLength: body.byteLength }),
             {
               retries: config.objectStoreRetries,
               baseDelayMs: config.objectStoreBaseDelayMs,
@@ -538,7 +544,7 @@ export function createPostgresFullApp(cfg: Config, store: PostgresDurableStore, 
         indexer,
         schemaPublication,
         fullMode: {
-          store: os,
+          store: objectStore,
           segmenter,
           uploader,
           segmentDiskCache: diskCache,

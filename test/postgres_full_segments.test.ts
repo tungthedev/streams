@@ -48,6 +48,43 @@ async function waitFor(predicate: () => Promise<boolean>, label: string, timeout
 }
 
 maybeDescribe("postgres full-mode segment and manifest store", () => {
+  test("details reports postgres shared storage fields", async () => {
+    await withPostgresSchema(async ({ connectionString }) => {
+      const root = mkdtempSync(join(tmpdir(), "ds-pg-full-details-"));
+      const store = await PostgresDurableStore.connectFull(connectionString);
+      const app = createPostgresFullApp(
+        {
+          ...loadConfig(),
+          rootDir: root,
+          dbPath: `${root}/unused.sqlite`,
+          port: 0,
+        },
+        store,
+        new MockR2Store()
+      );
+      try {
+        const stream = "pg_full_details";
+        const createRes = await app.fetch(
+          new Request(`http://local/v1/stream/${encodeURIComponent(stream)}`, {
+            method: "PUT",
+            headers: { "content-type": "text/plain" },
+          })
+        );
+        expect([200, 201]).toContain(createRes.status);
+
+        const detailsRes = await app.fetch(new Request(`http://local/v1/stream/${encodeURIComponent(stream)}/_details`));
+        expect(detailsRes.status).toBe(200);
+        const body: any = await detailsRes.json();
+        expect(Number(body.storage.local_storage.shared_db_total_bytes)).toBeGreaterThan(0);
+        expect(Number(body.storage.local_storage.postgres_shared_total_bytes)).toBeGreaterThan(0);
+        expect(body.storage.local_storage.sqlite_shared_total_bytes).toBeUndefined();
+      } finally {
+        await app.close();
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+  });
+
   test("segment candidates exclude touch-flagged streams", async () => {
     await withPostgresSchema(async ({ connectionString }) => {
       const store = await PostgresDurableStore.connectFull(connectionString);

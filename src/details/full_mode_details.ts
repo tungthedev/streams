@@ -19,6 +19,7 @@ export type LocalStorageUsage = {
 
 export type FullModeDetailsBuilderOptions = {
   detailsStore: FullModeDetailsStore;
+  storageBackend?: "sqlite" | "postgres";
   storageStatsStore?: StorageStatsStore;
   objectStoreAccountingStore?: ObjectStoreAccountingStore;
   getLocalStorageUsage?: (stream: string) => Partial<LocalStorageUsage>;
@@ -303,6 +304,12 @@ export class FullModeDetailsBuilder {
     };
     if (!this.opts.storageStatsStore) throw dsError("storage stats store is not available");
     const sharedBytes = BigInt((await this.opts.storageStatsStore.getWalDbSizeBytes()) + (await this.opts.storageStatsStore.getMetaDbSizeBytes()));
+    const sharedDbStorage = {
+      shared_db_total_bytes: sharedBytes.toString(),
+      ...(this.opts.storageBackend === "postgres"
+        ? { postgres_shared_total_bytes: sharedBytes.toString() }
+        : { sqlite_shared_total_bytes: sharedBytes.toString() }),
+    };
     const exactIndexBytes = indexStatus.exact_indexes.reduce((sum: bigint, entry) => sum + BigInt(entry.bytes_at_rest), 0n);
     const familyBytes = new Map<string, bigint>();
     for (const row of currentCompanionRows) {
@@ -351,7 +358,7 @@ export class FullModeDetailsBuilder {
         exact_index_cache_bytes: String(localStorageUsage.exact_index_cache_bytes),
         lexicon_index_cache_bytes: String(localStorageUsage.lexicon_index_cache_bytes),
         companion_cache_bytes: String(localStorageUsage.companion_cache_bytes),
-        sqlite_shared_total_bytes: sharedBytes.toString(),
+        ...sharedDbStorage,
       },
       companion_families: {
         exact_bytes: String(familyBytes.get("exact") ?? 0n),

@@ -185,7 +185,8 @@ maybeDescribe("postgres durable store", () => {
         expect(store.capabilities.builtinProfiles).toBe(true);
         expect(store.capabilities.internalMetrics).toBe(true);
         expect(store.capabilities.touch).toBe(true);
-        expect(store.capabilities.storageStats).toBe(false);
+        expect(store.capabilities.storageStats).toBe(true);
+        expect(store.capabilities.objectStoreAccounting).toBe(true);
 
         const inspectPool = new Pool({ connectionString });
         try {
@@ -203,6 +204,7 @@ maybeDescribe("postgres durable store", () => {
             "lexicon_index_state",
             "live_templates",
             "manifests",
+            "objectstore_request_counts",
             "producer_state",
             "schema_version",
             "schemas",
@@ -241,6 +243,34 @@ maybeDescribe("postgres durable store", () => {
         } finally {
           await inspectPool.end();
         }
+      } finally {
+        await store.close();
+      }
+    });
+  });
+
+  test("full-mode stats and object-store accounting store reports counts", async () => {
+    await withPostgresSchema(async ({ connectionString }) => {
+      const store = await PostgresDurableStore.connectFull(connectionString);
+      try {
+        const stats = store.fullModeStatsAccounting();
+        await store.ensureStream("stats-user", { contentType: "text/plain" });
+        await store.ensureStream("stats-touch", { contentType: "application/json", streamFlags: 1 << 1 });
+
+        expect(await stats.countStreams()).toBe(1);
+        expect(await stats.getWalDbSizeBytes()).toBeGreaterThanOrEqual(0);
+        expect(await stats.getMetaDbSizeBytes()).toBeGreaterThan(0);
+
+        await stats.recordObjectStoreRequestByHash("0123456789abcdef0123456789abcdef", "segment", "put", 123, 2);
+        await stats.recordObjectStoreRequestByHash("0123456789abcdef0123456789abcdef", "segment", "get", 123, 3);
+        await stats.recordObjectStoreRequestByHash("0123456789abcdef0123456789abcdef", "manifest", "head", 0, 1);
+
+        const summary = await stats.getObjectStoreRequestSummaryByHash("0123456789abcdef0123456789abcdef");
+        expect(summary.puts).toBe(2n);
+        expect(summary.gets).toBe(3n);
+        expect(summary.heads).toBe(1n);
+        expect(summary.reads).toBe(4n);
+        expect(summary.by_artifact.map((row) => row.artifact)).toEqual(["manifest", "segment"]);
       } finally {
         await store.close();
       }

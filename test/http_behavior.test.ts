@@ -627,6 +627,7 @@ describe("http behavior", () => {
         expect(body.storage.object_storage.bundled_companion_object_count).toBeGreaterThan(0);
 
         expect(Number(body.storage.local_storage.wal_retained_bytes)).toBeGreaterThanOrEqual(0);
+        expect(Number(body.storage.local_storage.shared_db_total_bytes)).toBeGreaterThan(0);
         expect(Number(body.storage.local_storage.sqlite_shared_total_bytes)).toBeGreaterThan(0);
 
         expect(Number(body.object_store_requests.puts)).toBeGreaterThan(0);

@@ -31,6 +31,7 @@ import { PostgresSecondaryIndexStore } from "./secondary_index";
 import { PostgresLexiconIndexStore } from "./lexicon_index";
 import { PostgresCompanionIndexStore } from "./companions";
 import { PostgresFullModeDetailsStore } from "./details";
+import { PostgresStatsAccountingStore } from "./stats";
 import { PostgresTouchStore } from "./touch";
 import type { PgExecutor, PgStreamRow } from "./types";
 
@@ -66,6 +67,7 @@ export class PostgresDurableStore implements WalControlPlaneStore {
   private readonly segments?: PostgresSegmentManifestStore;
   private readonly indexStores?: PostgresFullModeIndexStores;
   private readonly details?: PostgresFullModeDetailsStore;
+  private readonly statsAccounting?: PostgresStatsAccountingStore;
   private readonly touch?: PostgresTouchStore;
 
   constructor(private readonly pool: Pool, private readonly opts: PostgresStoreOptions = {}) {
@@ -77,8 +79,8 @@ export class PostgresDurableStore implements WalControlPlaneStore {
       segmentReads: opts.fullMode === true,
       indexes: opts.fullMode === true,
       manifests: opts.fullMode === true,
-      objectStoreAccounting: false,
-      storageStats: false,
+      objectStoreAccounting: opts.fullMode === true,
+      storageStats: opts.fullMode === true,
       schemaPublication: opts.fullMode === true,
       builtinProfiles: opts.fullMode === true,
       internalMetrics: opts.fullMode === true,
@@ -99,6 +101,7 @@ export class PostgresDurableStore implements WalControlPlaneStore {
         companions: new PostgresCompanionIndexStore(this.pool, () => this.nowMs()),
       };
       this.details = new PostgresFullModeDetailsStore(this.pool);
+      this.statsAccounting = new PostgresStatsAccountingStore(this.pool, () => this.nowMs());
       this.touch = new PostgresTouchStore(this.pool, {
         nowMs: () => this.nowMs(),
         getStream: (stream) => this.getStream(stream),
@@ -307,6 +310,11 @@ export class PostgresDurableStore implements WalControlPlaneStore {
   fullModeDetails(): PostgresFullModeDetailsStore {
     if (!this.details) throw dsError("postgres full-mode details store is not enabled", { code: "unsupported_capability" });
     return this.details;
+  }
+
+  fullModeStatsAccounting(): PostgresStatsAccountingStore {
+    if (!this.statsAccounting) throw dsError("postgres full-mode stats/accounting store is not enabled", { code: "unsupported_capability" });
+    return this.statsAccounting;
   }
 
   fullModeTouch(): PostgresTouchStore {
