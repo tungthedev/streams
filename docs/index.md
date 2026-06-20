@@ -15,7 +15,7 @@ and tooling.
 - [live-query-invalidation.md](./live-query-invalidation.md) — SQL query-family matrix for
   exact vs coarse live invalidation
 - [local-dev.md](./local-dev.md) — local development server behavior and Prisma CLI integration
-- [postgres-store.md](./postgres-store.md) — Postgres WAL/control-plane storage mode
+- [postgres-store.md](./postgres-store.md) — Postgres WAL/control-plane storage mode and current unsupported full-mode capabilities
 - [auth.md](./auth.md) — authentication and authorization constraints
 - [security.md](./security.md) — security reporting policy and deployment posture
 
@@ -36,7 +36,7 @@ and tooling.
   lookup that correlates `evlog` events and `otel-traces` spans
 - [schemas.md](./schemas.md) — schema registry and lens behavior
 - [durable-lens-v1-schema.md](./durable-lens-v1-schema.md) — reference schema for `durable.lens/v1`
-- [sqlite-schema.md](./sqlite-schema.md) — SQLite schema, invariants, and migration expectations
+- [sqlite-schema.md](./sqlite-schema.md) — SQLite full/local schema, invariants, and migration expectations
 - [architecture.md](./architecture.md) — system architecture and data flow
 - [tiered-index.md](./tiered-index.md) — tiered routing-key index design
 - [indexing-architecture.md](./indexing-architecture.md) — current exact + `.col` + `.fts` + `.agg` + `.mblk` search indexing model

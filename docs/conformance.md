@@ -36,12 +36,15 @@ Last verified on `2026-03-14`:
 - Upstream full-server suite: `239/239` passing
 - Upstream local-mode suite: `239/239` passing
 
-Prisma Streams currently passes the upstream black-box suite for both server modes.
+Prisma Streams currently passes the upstream black-box suite for the full and
+local modes.
 
 Postgres mode has focused store and HTTP smoke coverage for its supported
-WAL/control-plane subset. It does not claim full upstream conformance because
-the first Postgres mode intentionally excludes full-mode search, aggregate,
-touch/live, object-store publication, and built-in profile side effects.
+WAL/control-plane capability bundle. It does not claim full upstream
+conformance because the first Postgres mode intentionally excludes full-mode
+segmenting, manifest publication, search, aggregate, routing-key lexicon
+listing, `_details` storage/accounting, touch/live, object-store recovery, and
+built-in profile side effects.
 
 ## Notes
 

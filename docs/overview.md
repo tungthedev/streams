@@ -38,6 +38,13 @@ This repository currently contains three server modes:
 - `local` mode: an embedded single-SQLite server intended for trusted local development workflows, especially `npx prisma dev`
 - `postgres` mode: a self-hosted WAL/control-plane server backed by Postgres, without segmenting, object-store upload, search, touch/live, or built-in profile side effects
 
+All modes share the same HTTP route stack where the storage capability is
+available. SQLite full mode provides the segment, manifest, index,
+schema-publication, storage-stat, and object-store accounting capabilities.
+SQLite local mode uses the SQLite WAL/control-plane and local touch/live
+capabilities without segmenting or object-store upload. Postgres currently
+provides only the WAL/control-plane capability bundle.
+
 ## Current Durability Model
 
 Full mode today has two different durability points:
@@ -113,8 +120,8 @@ Notes:
 
 - Full server startup requires `--object-store local|r2` and exactly one auth mode: `--no-auth` or `--auth-strategy api-key`.
 - Postgres mode requires `DS_STORAGE=postgres` and `DS_POSTGRES_URL`, rejects
-  `--object-store` and `--bootstrap-from-r2`, and supports only WAL/control-plane
-  endpoints. See [postgres-store.md](./postgres-store.md).
+  `--object-store` and `--bootstrap-from-r2`, and supports only endpoints backed
+  by the WAL/control-plane capability bundle. See [postgres-store.md](./postgres-store.md).
 - Prisma Compute deployments from npm should follow the package-based flow in
   the top-level [README.md](../README.md#deploy-to-prisma-compute).
 - Repository Compute bundle deployments can use `src/compute/entry.ts`, which
@@ -217,11 +224,13 @@ DS_POSTGRES_URL=postgres://user:pass@host:5432/database \
 bun run src/server.ts --no-auth
 ```
 
-It supports basic stream lifecycle, append, read, long-poll, schema metadata,
-routing-key derivation, and `generic` profile metadata. It does not support
-object-store upload, R2 bootstrap, search, aggregate queries, routing-key
-lexicon listing, touch/live invalidation, OTLP ingestion, internal metrics
-profile streams, or non-generic built-in profile side effects.
+It supports stream lifecycle, append, read, long-poll, schema metadata,
+routing-key derivation, producer state, and `generic` profile metadata through
+the shared WAL/control-plane runtime. It does not support object-store upload,
+R2 bootstrap, segment manifest publication, search, aggregate queries,
+routing-key lexicon listing, `_details` storage/accounting fields, touch/live
+invalidation, OTLP ingestion, internal metrics profile streams, or non-generic
+built-in profile side effects.
 
 See [postgres-store.md](./postgres-store.md).
 

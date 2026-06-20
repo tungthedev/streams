@@ -2,7 +2,8 @@
 
 This document describes the architecture of the Prisma Streams Bun + TypeScript
 implementation using:
-- SQLite (bun:sqlite) as the durable WAL and metadata store
+- SQLite (bun:sqlite) as the full/local WAL/control-plane implementation and
+  the only current full segment/object-store/index implementation
 - Postgres as an optional WAL/control-plane store
 - TieredStore-style segments and manifests
 - An R2-compatible object store (MockR2 for tests)
@@ -12,8 +13,9 @@ The design prioritizes correctness, bounded memory, and crash safety.
 ## Stream Model
 
 Every persisted object in the system is still a **stream**: an append-only log
-stored in SQLite WAL, materialized into segments, and read back through Durable
-Streams semantics.
+stored in the active WAL/control-plane store, materialized into segments where
+full-mode capabilities are available, and read back through Durable Streams
+semantics.
 
 Streams also carry two pieces of control-plane metadata:
 
@@ -51,7 +53,7 @@ See [stream-profiles.md](./stream-profiles.md) for the normative model.
 
 1) HTTP layer (Bun server)
 - Parses requests, enforces protocol semantics, and enqueues work.
-- Performs only small indexed SQLite reads in the request path.
+- Performs only small indexed storage-capability reads in the request path.
 - Implements long-poll reads without busy loops.
 - Resolves the stream profile definition before handling profile-owned
   metadata or routes.
@@ -62,7 +64,8 @@ See [stream-profiles.md](./stream-profiles.md) for the normative model.
 
 2) WAL writer (single-writer loop)
 - Batches append requests from a bounded queue (group commit).
-- Uses a single SQLite transaction per flush to reserve offsets and insert WAL rows.
+- Uses the active WAL store transaction per flush to reserve offsets and insert
+  WAL rows.
 - Acknowledges appends only after the transaction commits.
 
 3) Segmenter (materializer)
@@ -102,7 +105,8 @@ See [stream-profiles.md](./stream-profiles.md) for the normative model.
   one exact-family compaction job.
 
 6) Reader
-- Merges historical data from segments (local cache or R2) with tail data in SQLite.
+- Merges historical data from segments (local cache or R2) with tail data in
+  the active WAL store.
 - Supports key-filtered reads and long-poll semantics.
 - On a remote segment cache miss, it fetches the whole segment object directly
   from R2 and treats a missing-object GET as `null`, rather than probing object
@@ -173,12 +177,16 @@ does not create a separate mutable observability store.
 
 ## Control-Plane Metadata
 
-Per stream, SQLite stores:
+Per stream, the active WAL/control-plane store owns common durable metadata:
 
 - stream lifecycle and offsets
-- logical payload-byte size for management lookups such as `/_details`
 - profile metadata
 - schema registry
+- producer state
+
+SQLite full mode additionally owns full-mode metadata:
+
+- logical payload-byte size for management lookups such as `/_details`
 - desired bundled companion plan state and current per-segment companion object
   catalog
 - plan-relative bundled companion ordinals resolved through the current desired
@@ -194,20 +202,30 @@ and if it is missing a background reconciliation pass can rebuild it from
 published segments plus retained WAL. Profiles and schemas only shape how a
 stream is interpreted.
 
+The runtime is split by storage capabilities. The shared HTTP core is backed by
+the `WalControlPlaneStore` bundle for stream lifecycle, WAL reads/writes,
+schema metadata, profile metadata, and producer state. Full-mode helpers receive
+narrow capability stores for segment reads, manifests, indexes, touch/live,
+storage stats, schema publication, and object-store accounting instead of
+reaching through SQLite directly.
+
 In Postgres mode, Postgres is the durable source for stream lifecycle metadata,
-schema/profile metadata, producer state, and WAL rows. Postgres mode does not
-publish segment, manifest, schema, or index objects to object storage, so it does
-not run the segmenter, uploader, index managers, touch runtime, or internal
-metrics profile stream. It supports the shared WAL/control-plane HTTP routes and
-rejects full-mode capabilities explicitly.
+schema/profile metadata, producer state, and WAL rows. The current Postgres mode
+does not publish segment, manifest, schema, or index objects to object storage,
+so it does not run the segmenter, uploader, index managers, touch runtime,
+storage accounting, or internal metrics profile stream. It supports the shared
+WAL/control-plane HTTP routes and rejects full-mode capabilities explicitly.
 
 ## Stream Deletion Enforcement
 
-`DELETE /v1/stream/{name}` is enforced as a tombstone plus local acceleration
-scrub:
+`DELETE /v1/stream/{name}` is enforced through the active WAL/control-plane
+store as a tombstone:
 
-- the stream row stays in SQLite with the deleted flag set
-- the same local delete transaction removes all stream-owned acceleration state:
+- the stream row stays in the active store with the deleted flag set
+- Postgres and SQLite both expose the shared delete route through the
+  WAL/control-plane store
+- SQLite full mode additionally removes all stream-owned local acceleration
+  state in the same delete transaction:
   - routing index state and runs
   - exact secondary index state and runs
   - routing-key lexicon state and runs
@@ -215,16 +233,16 @@ scrub:
 - the request path does not synchronously delete already-published remote
   segment, manifest, schema, or index objects
 
-Startup re-enforces the same invariant before background loops start. On boot,
-the server scans tombstoned streams and re-runs the acceleration scrub so older
-builds, crashes, or manual SQLite edits cannot leave orphaned async-index state
-behind for deleted streams.
+SQLite full-mode startup re-enforces the acceleration-scrub invariant before
+background loops start. On boot, the full-mode server scans tombstoned streams
+and re-runs the acceleration scrub so older builds, crashes, or manual SQLite
+edits cannot leave orphaned async-index state behind for deleted streams.
 
 ## Data flow
 
 ### Append
 1. HTTP handler validates request and enqueues into the append queue.
-2. Writer loop drains a batch and starts a SQLite transaction.
+2. Writer loop drains a batch and starts an active-store transaction.
 3. For each stream in the batch:
    - ensure stream row exists
    - reserve offsets (advance next_offset)
@@ -265,7 +283,7 @@ behind for deleted streams.
   - unkeyed offset reads use the segment footer's block index to jump directly to the first relevant block instead of decoding forward from block 0
   - when the routing index has a candidate set, keyed reads plan the sealed segment scan up front and visit only candidate indexed segments plus the uncovered uploaded tail
   - `since + key` cursor seeking uses the same routing-candidate plan, so it does not walk the full indexed sealed prefix segment-by-segment
-- For offsets >= uploaded_through: read from SQLite WAL tail.
+- For offsets >= uploaded_through: read from the active WAL tail.
 - Merge results in order, honor limit, key filter, and format.
 - For unversioned JSON streams, `format=json` responses reuse stored payload
   bytes directly and concatenate them into the response array body. The handler
@@ -274,7 +292,8 @@ behind for deleted streams.
 
 ## SQLite usage and invariants
 
-SQLite is the immediate source of truth for local operation:
+SQLite is the immediate source of truth for common full/local SQLite
+WAL/control-plane operation:
 - WAL rows (append-only)
 - Stream progress (next_offset, sealed_through, uploaded_through)
 - Repeated literal SQL is prepared once per connection and then reused through
@@ -300,8 +319,20 @@ SQLite is the immediate source of truth for local operation:
   - materially higher counts must be deliberate, bounded, and justified by one
     documented cache rather than accidental dynamic-SQL churn or unfinalized
     iterator statements
+
+SQLite full mode additionally owns full-mode-only state:
 - Segment metadata (local files and upload state)
 - Manifest generation state
+
+These capabilities split by mode:
+- SQLite full mode implements WAL/control-plane, segment reads, segment and
+  manifest metadata, index metadata, schema publication, storage stats, and
+  object-store accounting.
+- SQLite local mode implements WAL/control-plane plus local touch/live
+  behavior, but does not segment, upload objects, publish manifests, or run
+  full-mode indexes.
+- Postgres v1 implements only the WAL/control-plane capability bundle and must
+  not be treated as a full-mode segment/object-store/index implementation.
 
 In full mode, bootstrap from object storage reconstructs the published durable
 state from:
@@ -336,7 +367,7 @@ Local disk layout (default):
 
 ## Crash safety and recovery
 
-- Appends are durable after SQLite commit.
+- Appends are durable after the active WAL/control-plane transaction commits.
 - Segment builds are atomic: temp files are renamed only after footer/index is
   fully written. Temp files are cleaned on startup.
 - Upload is idempotent: segment bytes can be uploaded multiple times, but data
