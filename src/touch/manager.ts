@@ -1,9 +1,9 @@
 import type { Config } from "../config";
-import type { SqliteDurableStore } from "../db/db";
 import type { IngestQueue } from "../ingest";
 import type { StreamNotifier } from "../notifier";
 import type { StreamProfileStore } from "../profiles";
 import { listTouchCapableProfileKinds, resolveEnabledTouchCapability, resolveTouchCapability } from "../profiles";
+import type { TouchProcessorStore } from "../store/touch_store";
 import { TouchProcessorWorkerPool } from "./worker_pool";
 import { LruCache } from "../util/lru";
 import type { BackpressureGate } from "../backpressure";
@@ -128,7 +128,7 @@ export type TouchTopStreamEntry = {
 
 export class TouchProcessorManager {
   private readonly cfg: Config;
-  private readonly db: SqliteDurableStore;
+  private readonly db: TouchProcessorStore;
   private readonly profiles: StreamProfileStore;
   private readonly pool: TouchProcessorWorkerPool;
   private timer: any | null = null;
@@ -158,7 +158,7 @@ export class TouchProcessorManager {
 
   constructor(
     cfg: Config,
-    db: SqliteDurableStore,
+    db: TouchProcessorStore,
     ingest: IngestQueue,
     notifier: StreamNotifier,
     profiles: StreamProfileStore,
@@ -475,7 +475,7 @@ export class TouchProcessorManager {
       return;
     }
     const res = processRes.value;
-    if (res.stats.rowsRead === 0 && toOffset >= fromOffset && this.rangeLikelyHasRows(stream, fromOffset, toOffset)) {
+    if (res.stats.rowsRead === 0 && toOffset >= fromOffset && (await this.rangeLikelyHasRows(stream, fromOffset, toOffset))) {
       const nextStreak = (this.zeroRowBacklogStreakByStream.get(stream) ?? 0) + 1;
       this.zeroRowBacklogStreakByStream.set(stream, nextStreak);
       if (nextStreak >= 5) {
@@ -883,24 +883,7 @@ export class TouchProcessorManager {
       new Set(args.templateIdsUsed.map((x) => String(x).trim()).filter((x) => /^[0-9a-f]{16}$/.test(x)))
     );
     if (ids.length === 0) return [];
-    const entities = new Set<string>();
-    const chunkSize = 200;
-    for (let i = 0; i < ids.length; i += chunkSize) {
-      const chunk = ids.slice(i, i + chunkSize);
-      const placeholders = chunk.map(() => "?").join(",");
-      const rows = this.db.db
-        .query(
-          `SELECT DISTINCT entity
-           FROM live_templates
-           WHERE stream=? AND state='active' AND template_id IN (${placeholders});`
-        )
-        .all(args.stream, ...chunk) as any[];
-      for (const row of rows) {
-        const entity = String(row?.entity ?? "").trim();
-        if (entity !== "") entities.add(entity);
-      }
-    }
-    return Array.from(entities);
+    return this.db.listActiveLiveTemplateEntitiesByIds(args.stream, ids);
   }
 
   getOrCreateJournal(stream: string, touchCfg: TouchConfig): TouchJournal {
@@ -1249,11 +1232,12 @@ export class TouchProcessorManager {
     return created;
   }
 
-  private rangeLikelyHasRows(stream: string, fromOffset: bigint, toOffset: bigint): boolean {
+  private async rangeLikelyHasRows(stream: string, fromOffset: bigint, toOffset: bigint): Promise<boolean> {
     try {
-      const it = this.db.iterWalRange(stream, fromOffset, toOffset);
-      const first = it.next();
-      return !first.done;
+      for await (const _row of this.db.readWalRange(stream, fromOffset, toOffset)) {
+        return true;
+      }
+      return false;
     } catch {
       return false;
     }

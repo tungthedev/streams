@@ -4,15 +4,15 @@ import type {
   SecondaryIndexRunRow,
 } from "./rows";
 import type { StreamReadRow } from "./segment_read_store";
+import type { ProfileTouchControlStore } from "./touch_store";
 
 export interface BootstrapRestoreStore {
+  readonly touch: ProfileTouchControlStore;
   close(): void;
   nowMs(): bigint;
   restoreStreamRow(row: StreamReadRow): void;
   upsertStreamProfile(stream: string, profileJson: string): void;
-  ensureStreamTouchState(stream: string): void;
   deleteStreamProfile(stream: string): void;
-  deleteStreamTouchState(stream: string): void;
   upsertSegmentMeta(stream: string, count: number, offsets: Uint8Array, blocks: Uint8Array, lastTs: Uint8Array): void;
   upsertManifestRow(
     stream: string,

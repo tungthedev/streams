@@ -123,11 +123,11 @@ export async function bootstrapFromR2(cfg: Config, store: ObjectStore, opts: { c
         db.upsertStreamProfile(stream, JSON.stringify(profileJson));
         const profile = profileJson as StreamProfileSpec;
         const touchCapability = resolveTouchCapability(profile);
-        if (touchCapability) touchCapability.syncState({ db, stream, profile });
-        else db.deleteStreamTouchState(stream);
+        if (touchCapability) touchCapability.syncState({ db: db.touch, stream, profile });
+        else db.touch.deleteStreamTouchState(stream);
       } else {
         db.deleteStreamProfile(stream);
-        db.deleteStreamTouchState(stream);
+        db.touch.deleteStreamTouchState(stream);
       }
 
       db.upsertSegmentMeta(stream, segmentCount, segmentOffsetsBytes, segmentBlocksBytes, segmentLastTsBytes);

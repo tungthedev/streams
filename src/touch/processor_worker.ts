@@ -30,6 +30,7 @@ setSqliteRuntimeOverride(data.hostRuntime ?? null);
 // The main server process initializes/migrates schema; workers should avoid
 // concurrent migrations on the same sqlite file.
 const db = new SqliteDurableStore(cfg.dbPath, { cacheBytes: cfg.workerSqliteCacheBytes, skipMigrations: true });
+const touchStore = db.touch;
 
 const decoder = new TextDecoder();
 
@@ -135,13 +136,7 @@ async function handleProcess(msg: ProcessRequest): Promise<void> {
   const coldTemplateCountByEntity = new Map<string, number>();
   if (emitFineTouches) {
     try {
-      const rows = db.db
-        .query(
-          `SELECT template_id, entity, fields_json, encodings_json, active_from_source_offset
-           FROM live_templates
-           WHERE stream=? AND state='active';`
-        )
-        .all(stream) as any[];
+      const rows = touchStore.listActiveLiveTemplates(stream);
       for (const row of rows) {
         const templateId = String(row.template_id ?? "");
         if (!/^[0-9a-f]{16}$/.test(templateId)) continue;
@@ -269,7 +264,7 @@ async function handleProcess(msg: ProcessRequest): Promise<void> {
     });
   };
 
-  for (const row of db.iterWalRange(stream, fromOffset, toOffset)) {
+  for await (const row of touchStore.readWalRange(stream, fromOffset, toOffset)) {
     const payload = row.payload as Uint8Array;
     const payloadLen = payload.byteLength;
     if (rowsRead > 0 && (rowsRead >= maxRows || bytesRead + payloadLen > maxBytes)) break;
@@ -278,7 +273,7 @@ async function handleProcess(msg: ProcessRequest): Promise<void> {
     bytesRead += payloadLen;
     const offset = typeof row.offset === "bigint" ? (row.offset as bigint) : BigInt(row.offset);
     processedThrough = offset;
-    const tsMsRaw = row.ts_ms;
+    const tsMsRaw = row.tsMs;
     const tsMs = typeof tsMsRaw === "bigint" ? Number(tsMsRaw) : Number(tsMsRaw);
     if (!Number.isFinite(tsMs)) continue;
     if (tsMs > maxSourceTsMs) maxSourceTsMs = tsMs;

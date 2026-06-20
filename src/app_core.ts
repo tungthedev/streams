@@ -24,6 +24,7 @@ import { decodeJsonPayloadWithRegistryResult } from "./schema/read_json";
 import { resolvePointerResult } from "./util/json_pointer";
 import { ExpirySweeper } from "./expiry_sweeper";
 import type { StatsCollector } from "./stats";
+import type { TouchProcessorStore } from "./store/touch_store";
 import { BackpressureGate } from "./backpressure";
 import { MemoryPressureMonitor } from "./memory";
 import { RuntimeMemorySampler } from "./runtime_memory_sampler";
@@ -528,18 +529,24 @@ type AppRuntimeDeps = {
 export type CreateAppCoreOptions = {
   store: WalControlPlaneStore;
   db?: SqliteDurableStore;
+  touchStore?: TouchProcessorStore;
   stats?: StatsCollector;
   createRuntime(args: CreateAppRuntimeArgs): AppRuntimeDeps;
 };
 
-function validateRuntimeCapabilityBundle(controlStore: WalControlPlaneStore, db: SqliteDurableStore | undefined, runtime: AppRuntimeDeps): void {
+function validateRuntimeCapabilityBundle(
+  controlStore: WalControlPlaneStore,
+  db: SqliteDurableStore | undefined,
+  touchStore: TouchProcessorStore | undefined,
+  runtime: AppRuntimeDeps
+): void {
   const caps = controlStore.capabilities;
   if (caps.indexes && !runtime.indexer) throw dsError("index capability requires an index runtime");
   if (caps.schemaPublication && !runtime.schemaPublication) throw dsError("schema publication capability requires a schema publication runtime");
   if (caps.manifests && !runtime.fullMode?.manifestPublication) throw dsError("manifest capability requires a full-mode manifest runtime");
   if (caps.storageStats && !db) throw dsError("storage stats capability requires a sqlite metadata store");
   if (caps.objectStoreAccounting && !db) throw dsError("object-store accounting capability requires a sqlite metadata store");
-  if (caps.touch && !db) throw dsError("touch capability requires a sqlite metadata store");
+  if (caps.touch && !touchStore) throw dsError("touch capability requires a touch metadata store");
   if (caps.internalMetrics && !caps.builtinProfiles) throw dsError("internal metrics capability requires built-in profile support");
   if (runtime.fullMode && !db) throw dsError("full-mode runtime requires a sqlite metadata store");
 }
@@ -567,6 +574,7 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
 
   const controlStore = requireWalControlPlaneStore(opts.store);
   const db = opts.db;
+  const touchStore = opts.touchStore;
   db?.resetSegmentInProgress();
   if (db) reconcileDeletedStreamAccelerationState(db);
   const stats = opts.stats;
@@ -638,8 +646,8 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
   const ingest = new IngestQueue(cfg, controlStore, stats, backpressure, metrics);
   const notifier = new StreamNotifier();
   const registry = new SchemaRegistryStore(controlStore);
-  const profiles = new StreamProfileStore(controlStore, { touchStore: db });
-  const touch = db && controlStore.capabilities.touch ? new TouchProcessorManager(cfg, db, ingest, notifier, profiles, backpressure) : undefined;
+  const profiles = new StreamProfileStore(controlStore, { touchStore });
+  const touch = touchStore && controlStore.capabilities.touch ? new TouchProcessorManager(cfg, touchStore, ingest, notifier, profiles, backpressure) : undefined;
   const runtime = opts.createRuntime({
     config: cfg,
     db,
@@ -657,7 +665,7 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
     metrics,
     memorySampler,
   });
-  validateRuntimeCapabilityBundle(controlStore, db, runtime);
+  validateRuntimeCapabilityBundle(controlStore, db, touchStore, runtime);
   const {
     reader,
     indexer,
@@ -2668,7 +2676,7 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
         }
 
         if (touchMode) {
-          if (!controlStore.capabilities.touch || !touch || !db) return unsupportedCapability("touch");
+          if (!controlStore.capabilities.touch || !touch || !touchStore) return unsupportedCapability("touch");
           const srowOrResponse = await liveStreamOrResponse(stream);
           if (srowOrResponse instanceof Response) return srowOrResponse;
           const srow = srowOrResponse;
@@ -2683,7 +2691,7 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
             stream,
             streamRow: srow,
             profile: profileRes.value,
-            db,
+            db: touchStore,
             touchManager: touch,
             respond: { json, badRequest, internalError, notFound },
           });

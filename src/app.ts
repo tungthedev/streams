@@ -108,6 +108,7 @@ export function createApp(cfg: Config, os?: ObjectStore, opts: CreateAppOptions 
   const db = new SqliteDurableStore(cfg.dbPath, { cacheBytes: cfg.sqliteCacheBytes });
   return createAppCore(cfg, {
     db,
+    touchStore: db.touch,
     store: db,
     stats: opts.stats,
     createRuntime: ({ config, ingest, registry, notifier, stats, backpressure, metrics, memorySampler, memory, asyncIndexGate, foregroundActivity }) => {

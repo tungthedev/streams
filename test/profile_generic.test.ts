@@ -32,7 +32,7 @@ describe("generic profile", () => {
       const row = app.deps.db.getStream("generic-default");
       expect(row?.profile).toBe("generic");
       expect(app.deps.db.getStreamProfile("generic-default")).toBeNull();
-      expect(app.deps.db.getStreamTouchState("generic-default")).toBeNull();
+      expect(app.deps.db.touch.getStreamTouchState("generic-default")).toBeNull();
     } finally {
       await app.close();
       rmSync(root, { recursive: true, force: true });
@@ -93,7 +93,7 @@ describe("generic profile", () => {
       });
       expect(res.status).toBe(200);
       expect(app.deps.db.getStreamProfile("generic-switch")).not.toBeNull();
-      expect(app.deps.db.getStreamTouchState("generic-switch")).not.toBeNull();
+      expect(app.deps.db.touch.getStreamTouchState("generic-switch")).not.toBeNull();
 
       const touchMetaBefore = await app.fetch(new Request("http://local/v1/stream/generic-switch/touch/meta", { method: "GET" }));
       expect(touchMetaBefore.status).toBe(200);
@@ -116,7 +116,7 @@ describe("generic profile", () => {
       expect(touchMetaAfter.status).toBe(404);
       expect(app.deps.db.getStream("generic-switch")?.profile).toBe("generic");
       expect(app.deps.db.getStreamProfile("generic-switch")).toBeNull();
-      expect(app.deps.db.getStreamTouchState("generic-switch")).toBeNull();
+      expect(app.deps.db.touch.getStreamTouchState("generic-switch")).toBeNull();
     } finally {
       await app.close();
       rmSync(root, { recursive: true, force: true });

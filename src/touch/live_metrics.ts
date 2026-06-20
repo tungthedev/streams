@@ -1,9 +1,9 @@
 import type { IngestQueue } from "../ingest";
-import type { SqliteDurableStore } from "../db/db";
 import type { StreamProfileStore } from "../profiles";
 import { resolveEnabledTouchCapability } from "../profiles";
-import { STREAM_FLAG_TOUCH } from "../db/db";
 import { encodeOffset } from "../offset";
+import { STREAM_FLAG_TOUCH } from "../store/rows";
+import type { TouchProcessorStore } from "../store/touch_store";
 import type { TouchConfig } from "./spec";
 import type { TemplateLifecycleEvent } from "./live_templates";
 import type { TouchJournalIntervalStats, TouchJournalMeta } from "./touch_journal";
@@ -203,7 +203,7 @@ function defaultCounters(touchCfg: TouchConfig): StreamCounters {
 }
 
 export class LiveMetricsV2 {
-  private readonly db: SqliteDurableStore;
+  private readonly db: TouchProcessorStore;
   private readonly ingest: IngestQueue;
   private readonly profiles: StreamProfileStore;
   private readonly metricsStream: string;
@@ -233,7 +233,7 @@ export class LiveMetricsV2 {
   private lagSamples = 0;
 
   constructor(
-    db: SqliteDurableStore,
+    db: TouchProcessorStore,
     ingest: IngestQueue,
     profiles: StreamProfileStore,
     opts?: {
@@ -546,8 +546,7 @@ export class LiveMetricsV2 {
       }
       const activeTemplates = (() => {
         try {
-          const row = this.db.db.query(`SELECT COUNT(*) as cnt FROM live_templates WHERE stream=? AND state='active';`).get(stream) as any;
-          return Number(row?.cnt ?? 0);
+          return this.db.countActiveLiveTemplates(stream);
         } catch {
           return 0;
         }
@@ -746,16 +745,9 @@ export class LiveMetricsV2 {
     const rows: Array<{ routingKey: Uint8Array | null; contentType: string; payload: Uint8Array }> = [];
 
     for (const stream of streams) {
-      let templates: any[] = [];
+      let templates: ReturnType<TouchProcessorStore["listActiveLiveTemplates"]> = [];
       try {
-        templates = this.db.db
-          .query(
-            `SELECT template_id, entity, fields_json, last_seen_at_ms, state
-             FROM live_templates
-             WHERE stream=? AND state='active'
-             ORDER BY entity ASC, template_id ASC;`
-          )
-          .all(stream) as any[];
+        templates = this.db.listActiveLiveTemplates(stream);
       } catch {
         continue;
       }

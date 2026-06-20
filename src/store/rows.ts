@@ -1,3 +1,6 @@
+export const STREAM_FLAG_DELETED = 1 << 0;
+export const STREAM_FLAG_TOUCH = 1 << 1;
+
 export type StreamRow = {
   stream: string;
   created_at_ms: bigint;

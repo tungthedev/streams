@@ -2,6 +2,7 @@ import { Result } from "better-result";
 import type { SchemaRegistry } from "../schema/registry";
 import type { StreamReadRow as StreamRow } from "../store/segment_read_store";
 import type { ProfileTouchStatePlan } from "../store/profile_touch_store";
+import type { ProfileTouchControlStore, TouchRouteStore } from "../store/touch_store";
 import type { TouchProcessorManager } from "../touch/manager";
 import type { CanonicalChange } from "../touch/canonical_change";
 import type { TouchConfig } from "../touch/spec";
@@ -144,10 +145,7 @@ export type StreamProfileTouchResponder = {
   notFound(message?: string): Response;
 };
 
-export type StreamTouchRouteStore = {
-  countActiveLiveTemplates(stream: string): number;
-  getStreamTouchState(stream: string): { stream: string; processed_through: bigint; updated_at_ms: bigint } | null;
-};
+export type StreamTouchRouteStore = TouchRouteStore;
 
 export type StreamTouchRouteArgs = {
   route: StreamTouchRoute;
@@ -162,7 +160,7 @@ export type StreamTouchRouteArgs = {
 
 export interface StreamTouchCapability {
   getTouchConfig(profile: StreamProfileSpec): TouchConfig | null;
-  syncState(args: { db: { ensureStreamTouchState(stream: string): void; deleteStreamTouchState(stream: string): void }; stream: string; profile: StreamProfileSpec }): void;
+  syncState(args: { db: ProfileTouchControlStore; stream: string; profile: StreamProfileSpec }): void;
   deriveCanonicalChanges(record: unknown, profile: StreamProfileSpec): CanonicalChange[];
   handleRoute?(args: StreamTouchRouteArgs): Promise<Response>;
 }

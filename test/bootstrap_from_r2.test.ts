@@ -235,7 +235,7 @@ describe("bootstrap from R2", () => {
         expect(profileJson.kind).toBe("state-protocol");
         expect(profileJson.touch?.enabled).toBe(true);
 
-        const touchStateRow = app2.deps.db.getStreamTouchState(stream);
+        const touchStateRow = app2.deps.db.touch.getStreamTouchState(stream);
         expect(touchStateRow).not.toBeNull();
 
         const schemaRow = app2.deps.db.getSchemaRegistry(stream);

@@ -18,6 +18,7 @@ import type {
   SegmentRow,
   StreamRow,
 } from "../store/rows";
+import { STREAM_FLAG_DELETED, STREAM_FLAG_TOUCH } from "../store/rows";
 import type {
   ProfileMetadataCommit,
   ProfileMetadataMutationContext,
@@ -28,14 +29,12 @@ import type {
   SchemaMetadataMutationPlan,
   SchemaStore,
 } from "../store/schema_profile_store";
-import type { ProfileTouchStateStore } from "../store/profile_touch_store";
 import type { WalControlPlaneStore, DurableStoreCapabilities } from "../store/capabilities";
 import { SqliteWalStore } from "./sqlite_wal_store";
 import { loadSqliteManifestPublicationSnapshot } from "./sqlite_manifest_snapshot";
+import { SqliteTouchStore } from "./sqlite_touch_store";
 
-export const STREAM_FLAG_DELETED = 1 << 0;
-// Internal companion touch stream. Hidden from listing and not eligible for segmentation.
-export const STREAM_FLAG_TOUCH = 1 << 1;
+export { STREAM_FLAG_DELETED, STREAM_FLAG_TOUCH } from "../store/rows";
 
 const BASE_WAL_GC_CHUNK_OFFSETS = (() => {
   const raw = process.env.DS_BASE_WAL_GC_CHUNK_OFFSETS;
@@ -84,8 +83,7 @@ export class SqliteDurableStore
     SegmentStore,
     ManifestStore,
     SchemaStore,
-    ProfileStore,
-    ProfileTouchStateStore
+    ProfileStore
 {
   readonly kind = "sqlite" as const;
   readonly capabilities: DurableStoreCapabilities = {
@@ -105,6 +103,7 @@ export class SqliteDurableStore
   };
 
   public readonly db: SqliteDatabase;
+  public readonly touch: SqliteTouchStore;
   private readonly walStore: SqliteWalStore;
   private dbstatReady: boolean | null = null;
 
@@ -206,11 +205,6 @@ export class SqliteDurableStore
     getStreamProfile: SqliteStatement;
     upsertStreamProfile: SqliteStatement;
     deleteStreamProfile: SqliteStatement;
-    getStreamTouchState: SqliteStatement;
-    upsertStreamTouchState: SqliteStatement;
-    deleteStreamTouchState: SqliteStatement;
-    listStreamTouchStates: SqliteStatement;
-    listStreamsByProfile: SqliteStatement;
     countStreams: SqliteStatement;
     sumPendingBytes: SqliteStatement;
     sumPendingSegmentBytes: SqliteStatement;
@@ -224,6 +218,17 @@ export class SqliteDurableStore
       this.db.exec(`PRAGMA cache_size = -${kb};`);
     }
     this.walStore = new SqliteWalStore(this.db, () => this.nowMs(), STREAM_FLAG_DELETED);
+    this.touch = new SqliteTouchStore(this.db, {
+      nowMs: () => this.nowMs(),
+      getStream: (stream) => this.getStream(stream),
+      ensureStream: (stream, ensureOpts) => this.ensureStream(stream, ensureOpts),
+      addStreamFlags: (stream, flags) => this.addStreamFlags(stream, flags),
+      isDeleted: (row) => this.isDeleted(row),
+      readWalRange: (stream, startOffset, endOffset, routingKey) => this.readWalRange(stream, startOffset, endOffset, routingKey),
+      deleteWalThrough: (stream, uploadedThrough) => this.deleteWalThrough(stream, uploadedThrough),
+      getWalOldestOffset: (stream) => this.getWalOldestOffset(stream),
+      trimWalByAge: (stream, maxAgeMs) => this.trimWalByAge(stream, maxAgeMs),
+    });
 
     this.stmts = {
       getStream: this.db.query(
@@ -655,24 +660,6 @@ export class SqliteDurableStore
          ON CONFLICT(stream) DO UPDATE SET profile_json=excluded.profile_json, updated_at_ms=excluded.updated_at_ms;`
       ),
       deleteStreamProfile: this.db.query(`DELETE FROM stream_profiles WHERE stream=?;`),
-      getStreamTouchState: this.db.query(
-        `SELECT stream, processed_through, updated_at_ms
-         FROM stream_touch_state WHERE stream=? LIMIT 1;`
-      ),
-      upsertStreamTouchState: this.db.query(
-        `INSERT INTO stream_touch_state(stream, processed_through, updated_at_ms)
-         VALUES(?, ?, ?)
-         ON CONFLICT(stream) DO UPDATE SET
-           processed_through=excluded.processed_through,
-           updated_at_ms=excluded.updated_at_ms;`
-      ),
-      deleteStreamTouchState: this.db.query(`DELETE FROM stream_touch_state WHERE stream=?;`),
-      listStreamTouchStates: this.db.query(
-        `SELECT stream, processed_through, updated_at_ms
-         FROM stream_touch_state
-         ORDER BY stream ASC;`
-      ),
-      listStreamsByProfile: this.db.query(`SELECT stream FROM streams WHERE profile=? ORDER BY stream ASC;`),
       countStreams: this.db.query(`SELECT COUNT(*) as cnt FROM streams WHERE (stream_flags & ?) = 0;`),
       sumPendingBytes: this.db.query(`SELECT COALESCE(SUM(pending_bytes), 0) as total FROM streams;`),
       sumPendingSegmentBytes: this.db.query(`SELECT COALESCE(SUM(size_bytes), 0) as total FROM segments WHERE uploaded_at_ms IS NULL;`),
@@ -1129,62 +1116,12 @@ export class SqliteDurableStore
     return tx();
   }
 
-  async updateProfileTouchState(stream: string, plan: "ensure" | "delete"): Promise<void> {
-    if (plan === "ensure") this.ensureStreamTouchState(stream);
-    else this.deleteStreamTouchState(stream);
-  }
-
   upsertStreamProfile(stream: string, profileJson: string): void {
     this.stmts.upsertStreamProfile.run(stream, profileJson, this.nowMs());
   }
 
   deleteStreamProfile(stream: string): void {
     this.stmts.deleteStreamProfile.run(stream);
-  }
-
-  getStreamTouchState(stream: string): { stream: string; processed_through: bigint; updated_at_ms: bigint } | null {
-    const row = this.stmts.getStreamTouchState.get(stream) as any;
-    if (!row) return null;
-    return {
-      stream: String(row.stream),
-      processed_through: this.toBigInt(row.processed_through),
-      updated_at_ms: this.toBigInt(row.updated_at_ms),
-    };
-  }
-
-  countActiveLiveTemplates(stream: string): number {
-    const row = this.db.query(`SELECT COUNT(*) as cnt FROM live_templates WHERE stream=? AND state='active';`).get(stream) as any;
-    return Number(row?.cnt ?? 0);
-  }
-
-  listStreamTouchStates(): Array<{ stream: string; processed_through: bigint; updated_at_ms: bigint }> {
-    const rows = this.stmts.listStreamTouchStates.all() as any[];
-    return rows.map((row) => ({
-      stream: String(row.stream),
-      processed_through: this.toBigInt(row.processed_through),
-      updated_at_ms: this.toBigInt(row.updated_at_ms),
-    }));
-  }
-
-  listStreamsByProfile(kind: string): string[] {
-    const rows = this.stmts.listStreamsByProfile.all(kind) as any[];
-    return rows.map((row) => String(row.stream));
-  }
-
-  ensureStreamTouchState(stream: string): void {
-    const existing = this.getStreamTouchState(stream);
-    if (existing) return;
-    const srow = this.getStream(stream);
-    const initialThrough = srow ? srow.next_offset - 1n : -1n;
-    this.stmts.upsertStreamTouchState.run(stream, this.bindInt(initialThrough), this.nowMs());
-  }
-
-  updateStreamTouchStateThrough(stream: string, processedThrough: bigint): void {
-    this.stmts.upsertStreamTouchState.run(stream, this.bindInt(processedThrough), this.nowMs());
-  }
-
-  deleteStreamTouchState(stream: string): void {
-    this.stmts.deleteStreamTouchState.run(stream);
   }
 
   addStreamFlags(stream: string, flags: number): void {
@@ -2272,9 +2209,9 @@ export class SqliteDurableStore
       this.stmts.upsertManifest.run(stream, generation, generation, uploadedAtMs, etag, sizeBytes);
       this.stmts.advanceUploadedThrough.run(uploadedThrough, this.nowMs(), stream);
       let gcThrough = uploadedThrough;
-      const touchState = this.stmts.getStreamTouchState.get(stream) as any;
+      const touchState = this.touch.getStreamTouchState(stream);
       if (touchState) {
-        const processedThrough = this.toBigInt(touchState.processed_through);
+        const processedThrough = touchState.processed_through;
         gcThrough = processedThrough < gcThrough ? processedThrough : gcThrough;
       }
       if (gcThrough < 0n) return;

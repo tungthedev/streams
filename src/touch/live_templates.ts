@@ -1,4 +1,4 @@
-import type { SqliteDurableStore } from "../db/db";
+import type { LiveTemplateStore, LiveTemplateStoreRow } from "../store/touch_store";
 import { canonicalizeTemplateFields, templateIdFor, type TemplateEncoding } from "./live_keys";
 
 export type TemplateFieldSpec = { name: string; encoding: TemplateEncoding };
@@ -76,7 +76,7 @@ function nowIso(ms: number): string {
   return new Date(ms).toISOString();
 }
 
-function parseTemplateRow(row: any): LiveTemplateRow {
+function parseTemplateRow(row: LiveTemplateStoreRow): LiveTemplateRow {
   return {
     stream: String(row.stream),
     template_id: String(row.template_id),
@@ -84,18 +84,17 @@ function parseTemplateRow(row: any): LiveTemplateRow {
     fields_json: String(row.fields_json),
     encodings_json: String(row.encodings_json),
     state: String(row.state),
-    created_at_ms: typeof row.created_at_ms === "bigint" ? row.created_at_ms : BigInt(row.created_at_ms),
-    last_seen_at_ms: typeof row.last_seen_at_ms === "bigint" ? row.last_seen_at_ms : BigInt(row.last_seen_at_ms),
-    inactivity_ttl_ms: typeof row.inactivity_ttl_ms === "bigint" ? row.inactivity_ttl_ms : BigInt(row.inactivity_ttl_ms),
-    active_from_source_offset:
-      typeof row.active_from_source_offset === "bigint" ? row.active_from_source_offset : BigInt(row.active_from_source_offset),
-    retired_at_ms: row.retired_at_ms == null ? null : typeof row.retired_at_ms === "bigint" ? row.retired_at_ms : BigInt(row.retired_at_ms),
+    created_at_ms: row.created_at_ms,
+    last_seen_at_ms: row.last_seen_at_ms,
+    inactivity_ttl_ms: row.inactivity_ttl_ms,
+    active_from_source_offset: row.active_from_source_offset,
+    retired_at_ms: row.retired_at_ms,
     retired_reason: row.retired_reason == null ? null : String(row.retired_reason),
   };
 }
 
 export class LiveTemplateRegistry {
-  private readonly db: SqliteDurableStore;
+  private readonly db: LiveTemplateStore;
 
   // In-memory last-seen tracking to avoid sqlite writes on every wait call.
   private readonly lastSeenMem = new Map<string, { lastSeenMs: number; lastPersistMs: number }>();
@@ -103,7 +102,7 @@ export class LiveTemplateRegistry {
 
   private readonly rate = new Map<string, RateState>();
 
-  constructor(db: SqliteDurableStore) {
+  constructor(db: LiveTemplateStore) {
     this.db = db;
   }
 
@@ -137,10 +136,7 @@ export class LiveTemplateRegistry {
 
   getActiveTemplateCount(stream: string): number {
     try {
-      const row = this.db.db
-        .query(`SELECT COUNT(*) as cnt FROM live_templates WHERE stream=? AND state='active';`)
-        .get(stream) as any;
-      return Number(row?.cnt ?? 0);
+      return this.db.countActiveLiveTemplates(stream);
     } catch {
       return 0;
     }
@@ -148,20 +144,13 @@ export class LiveTemplateRegistry {
 
   listActiveTemplates(stream: string): Array<{ templateId: string; entity: string; fields: string[]; encodings: TemplateEncoding[]; lastSeenAtMs: number }> {
     try {
-      const rows = this.db.db
-        .query(
-          `SELECT template_id, entity, fields_json, encodings_json, last_seen_at_ms
-           FROM live_templates
-           WHERE stream=? AND state='active'
-           ORDER BY entity ASC, template_id ASC;`
-        )
-        .all(stream) as any[];
+      const rows = this.db.listActiveLiveTemplates(stream);
       const out: Array<{ templateId: string; entity: string; fields: string[]; encodings: TemplateEncoding[]; lastSeenAtMs: number }> = [];
       for (const row of rows) {
-        const templateId = String(row.template_id);
-        const entity = String(row.entity);
-        const fields = JSON.parse(String(row.fields_json));
-        const encodings = JSON.parse(String(row.encodings_json));
+        const templateId = row.template_id;
+        const entity = row.entity;
+        const fields = JSON.parse(row.fields_json);
+        const encodings = JSON.parse(row.encodings_json);
         if (!Array.isArray(fields) || !Array.isArray(encodings) || fields.length !== encodings.length) continue;
         const lastSeenAtMs = Number(row.last_seen_at_ms);
         out.push({ templateId, entity, fields: fields.map(String), encodings: encodings.map(String) as any, lastSeenAtMs });
@@ -243,14 +232,7 @@ export class LiveTemplateRegistry {
 
       const templateId = templateIdFor(entity, fieldNames);
 
-      const existing = this.db.db
-        .query(
-          `SELECT stream, template_id, entity, fields_json, encodings_json, state, created_at_ms, last_seen_at_ms,
-                  inactivity_ttl_ms, active_from_source_offset, retired_at_ms, retired_reason
-           FROM live_templates
-           WHERE stream=? AND template_id=? LIMIT 1;`
-        )
-        .get(stream, templateId) as any;
+      const existing = this.db.getLiveTemplate(stream, templateId);
 
       const alreadyActive = existing && String(existing.state) === "active";
       const needsToken = !alreadyActive;
@@ -291,37 +273,21 @@ export class LiveTemplateRegistry {
         }
 
         if (row.state === "active") {
-          this.db.db
-            .query(
-              `UPDATE live_templates
-               SET last_seen_at_ms=?, inactivity_ttl_ms=?
-               WHERE stream=? AND template_id=?;`
-            )
-            .run(nowMs, inactivityTtlMs, stream, templateId);
+          this.db.updateLiveTemplateHeartbeat(stream, templateId, nowMs, inactivityTtlMs);
         } else {
-          this.db.db
-            .query(
-              `UPDATE live_templates
-               SET state='active',
-                   last_seen_at_ms=?,
-                   inactivity_ttl_ms=?,
-                   active_from_source_offset=?,
-                   retired_at_ms=NULL,
-                   retired_reason=NULL
-               WHERE stream=? AND template_id=?;`
-            )
-            .run(nowMs, inactivityTtlMs, args.baseStreamNextOffset, stream, templateId);
+          this.db.reactivateLiveTemplate(stream, templateId, nowMs, inactivityTtlMs, args.baseStreamNextOffset);
         }
       } else {
-        this.db.db
-          .query(
-            `INSERT INTO live_templates(
-               stream, template_id, entity, fields_json, encodings_json,
-               state, created_at_ms, last_seen_at_ms, inactivity_ttl_ms, active_from_source_offset,
-               retired_at_ms, retired_reason
-             ) VALUES(?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, NULL, NULL);`
-          )
-          .run(stream, templateId, entity, JSON.stringify(fieldNames), JSON.stringify(encodings), nowMs, nowMs, inactivityTtlMs, args.baseStreamNextOffset);
+        this.db.insertLiveTemplate({
+          stream,
+          templateId,
+          entity,
+          fieldsJson: JSON.stringify(fieldNames),
+          encodingsJson: JSON.stringify(encodings),
+          nowMs,
+          inactivityTtlMs,
+          activeFromSourceOffset: args.baseStreamNextOffset,
+        });
       }
 
       protectedIds.add(templateId);
@@ -359,45 +325,36 @@ export class LiveTemplateRegistry {
   flushLastSeen(nowMs: number, persistIntervalMs: number): void {
     if (this.dirtyLastSeen.size === 0) return;
 
-    const stmt = this.db.db.query(
-      `UPDATE live_templates
-       SET last_seen_at_ms=?
-       WHERE stream=? AND template_id=? AND state='active';`
-    );
-    try {
-      for (const k of this.dirtyLastSeen) {
-        const item = this.lastSeenMem.get(k);
-        if (!item) {
-          this.dirtyLastSeen.delete(k);
-          continue;
-        }
-        if (nowMs - item.lastPersistMs < persistIntervalMs) continue;
-        const [stream, templateId] = k.split("\n");
-        stmt.run(item.lastSeenMs, stream, templateId);
-        item.lastPersistMs = nowMs;
+    const updates: Array<{ key: string; item: { lastSeenMs: number; lastPersistMs: number }; stream: string; templateId: string }> = [];
+    for (const k of this.dirtyLastSeen) {
+      const item = this.lastSeenMem.get(k);
+      if (!item) {
         this.dirtyLastSeen.delete(k);
+        continue;
       }
-    } finally {
-      try {
-        stmt.finalize?.();
-      } catch {
-        // ignore
-      }
+      if (nowMs - item.lastPersistMs < persistIntervalMs) continue;
+      const [stream, templateId] = k.split("\n");
+      updates.push({ key: k, item, stream, templateId });
+    }
+    if (updates.length === 0) return;
+
+    this.db.updateLiveTemplateLastSeenBatch(
+      updates.map((update) => ({
+        stream: update.stream,
+        templateId: update.templateId,
+        lastSeenAtMs: update.item.lastSeenMs,
+      }))
+    );
+    for (const update of updates) {
+      update.item.lastPersistMs = nowMs;
+      this.dirtyLastSeen.delete(update.key);
     }
   }
 
   gcRetireExpired(stream: string, nowMs: number): { retired: TemplateLifecycleEvent[] } {
     const expired: any[] = [];
     try {
-      const rows = this.db.db
-        .query(
-          `SELECT template_id, entity, fields_json, encodings_json, last_seen_at_ms, inactivity_ttl_ms
-           FROM live_templates
-           WHERE stream=? AND state='active' AND (last_seen_at_ms + inactivity_ttl_ms) < ?
-           ORDER BY last_seen_at_ms ASC
-           LIMIT 1000;`
-        )
-        .all(stream, nowMs) as any[];
+      const rows = this.db.listExpiredLiveTemplates(stream, nowMs, 1000);
       expired.push(...rows);
     } catch {
       return { retired: [] };
@@ -409,88 +366,80 @@ export class LiveTemplateRegistry {
     // look expired even though in-memory last-seen is fresh. Prefer in-memory
     // last-seen and opportunistically refresh DB to avoid incorrect retirement.
     const effectiveExpired: any[] = [];
-    const refreshLastSeen = this.db.db.query(
-      `UPDATE live_templates
-       SET last_seen_at_ms=?
-       WHERE stream=? AND template_id=? AND state='active';`
-    );
-    try {
-      for (const row of expired) {
-        const templateId = String(row.template_id);
-        const dbLastSeenAtMs = Number(row.last_seen_at_ms);
-        const ttlMs = Number(row.inactivity_ttl_ms);
-        const mem = this.lastSeenMem.get(this.key(stream, templateId));
-        const memLastSeen = mem ? mem.lastSeenMs : 0;
-        const lastSeenAtMs = Math.max(dbLastSeenAtMs, memLastSeen);
-        if (lastSeenAtMs + ttlMs >= nowMs) {
-          // Not expired when considering in-memory last-seen. Refresh DB so it
-          // doesn't get re-selected on the next GC tick.
-          if (mem && memLastSeen > dbLastSeenAtMs) {
-            refreshLastSeen.run(memLastSeen, stream, templateId);
-            mem.lastPersistMs = nowMs;
-            this.dirtyLastSeen.delete(this.key(stream, templateId));
-          }
-          continue;
+    const refreshes: Array<{ key: string; item: { lastSeenMs: number; lastPersistMs: number }; stream: string; templateId: string }> = [];
+    for (const row of expired) {
+      const templateId = String(row.template_id);
+      const dbLastSeenAtMs = Number(row.last_seen_at_ms);
+      const ttlMs = Number(row.inactivity_ttl_ms);
+      const mem = this.lastSeenMem.get(this.key(stream, templateId));
+      const memLastSeen = mem ? mem.lastSeenMs : 0;
+      const lastSeenAtMs = Math.max(dbLastSeenAtMs, memLastSeen);
+      if (lastSeenAtMs + ttlMs >= nowMs) {
+        // Not expired when considering in-memory last-seen. Refresh DB so it
+        // doesn't get re-selected on the next GC tick.
+        if (mem && memLastSeen > dbLastSeenAtMs) {
+          refreshes.push({ key: this.key(stream, templateId), item: mem, stream, templateId });
         }
-        effectiveExpired.push(row);
+        continue;
       }
-    } finally {
-      try {
-        refreshLastSeen.finalize?.();
-      } catch {
-        // ignore
+      effectiveExpired.push(row);
+    }
+
+    if (refreshes.length > 0) {
+      this.db.updateLiveTemplateLastSeenBatch(
+        refreshes.map((refresh) => ({
+          stream: refresh.stream,
+          templateId: refresh.templateId,
+          lastSeenAtMs: refresh.item.lastSeenMs,
+        }))
+      );
+      for (const refresh of refreshes) {
+        refresh.item.lastPersistMs = nowMs;
+        this.dirtyLastSeen.delete(refresh.key);
       }
     }
 
     if (effectiveExpired.length === 0) return { retired: [] };
 
     const retired: TemplateLifecycleEvent[] = [];
-    const update = this.db.db.query(
-      `UPDATE live_templates
-       SET state='retired', retired_reason='inactivity', retired_at_ms=?
-       WHERE stream=? AND template_id=? AND state='active';`
-    );
-    try {
-      for (const row of effectiveExpired) {
-        const templateId = String(row.template_id);
-        const entity = String(row.entity);
-        let fields: string[] = [];
-        let encodings: TemplateEncoding[] = [];
-        try {
-          const f = JSON.parse(String(row.fields_json));
-          const e = JSON.parse(String(row.encodings_json));
-          if (Array.isArray(f)) fields = f.map(String);
-          if (Array.isArray(e)) encodings = e.map(String) as any;
-        } catch {
-          // ignore
-        }
-        const dbLastSeenAtMs = Number(row.last_seen_at_ms);
-        const mem = this.lastSeenMem.get(this.key(stream, templateId));
-        const memLastSeen = mem ? mem.lastSeenMs : 0;
-        const lastSeenAtMs = Math.max(dbLastSeenAtMs, memLastSeen);
-        const inactiveForMs = Math.max(0, nowMs - lastSeenAtMs);
-        update.run(nowMs, stream, templateId);
-        retired.push({
-          type: "live.template_retired",
-          ts: nowIso(nowMs),
-          stream,
-          templateId,
-          entity,
-          fields,
-          encodings,
-          lastSeenAt: nowIso(lastSeenAtMs),
-          inactiveForMs,
-          reason: "inactivity",
-        });
-        this.lastSeenMem.delete(this.key(stream, templateId));
-        this.dirtyLastSeen.delete(this.key(stream, templateId));
-      }
-    } finally {
+    const retiredIds: string[] = [];
+    for (const row of effectiveExpired) {
+      const templateId = String(row.template_id);
+      const entity = String(row.entity);
+      let fields: string[] = [];
+      let encodings: TemplateEncoding[] = [];
       try {
-        update.finalize?.();
+        const f = JSON.parse(String(row.fields_json));
+        const e = JSON.parse(String(row.encodings_json));
+        if (Array.isArray(f)) fields = f.map(String);
+        if (Array.isArray(e)) encodings = e.map(String) as any;
       } catch {
         // ignore
       }
+      const dbLastSeenAtMs = Number(row.last_seen_at_ms);
+      const mem = this.lastSeenMem.get(this.key(stream, templateId));
+      const memLastSeen = mem ? mem.lastSeenMs : 0;
+      const lastSeenAtMs = Math.max(dbLastSeenAtMs, memLastSeen);
+      const inactiveForMs = Math.max(0, nowMs - lastSeenAtMs);
+      retiredIds.push(templateId);
+      retired.push({
+        type: "live.template_retired",
+        ts: nowIso(nowMs),
+        stream,
+        templateId,
+        entity,
+        fields,
+        encodings,
+        lastSeenAt: nowIso(lastSeenAtMs),
+        inactiveForMs,
+        reason: "inactivity",
+      });
+    }
+
+    this.db.retireLiveTemplatesForInactivity(stream, retiredIds, nowMs);
+    for (const templateId of retiredIds) {
+      this.lastSeenMem.delete(this.key(stream, templateId));
+      this.dirtyLastSeen.delete(this.key(stream, templateId));
     }
 
     return { retired };
@@ -516,15 +465,7 @@ export class LiveTemplateRegistry {
     // Per-entity cap.
     let entities: Array<{ entity: string; cnt: number }> = [];
     try {
-      const rows = this.db.db
-        .query(
-          `SELECT entity, COUNT(*) as cnt
-           FROM live_templates
-           WHERE stream=? AND state='active'
-           GROUP BY entity;`
-        )
-        .all(stream) as any[];
-      entities = rows.map((r) => ({ entity: String(r.entity), cnt: Number(r.cnt) }));
+      entities = this.db.listActiveLiveTemplateEntityCounts(stream).map((row) => ({ entity: row.entity, cnt: row.count }));
     } catch {
       // ignore
     }
@@ -539,8 +480,7 @@ export class LiveTemplateRegistry {
     // Per-stream cap.
     let activeCount = 0;
     try {
-      const row = this.db.db.query(`SELECT COUNT(*) as cnt FROM live_templates WHERE stream=? AND state='active';`).get(stream) as any;
-      activeCount = Number(row?.cnt ?? 0);
+      activeCount = this.db.countActiveLiveTemplates(stream);
     } catch {
       activeCount = 0;
     }
@@ -564,22 +504,13 @@ export class LiveTemplateRegistry {
     const out: TemplateLifecycleEvent[] = [];
 
     const pick = (excludeProtected: boolean): string[] => {
-      const params: any[] = [stream];
-      let where = `stream=? AND state='active'`;
-      if (scope.entity) {
-        where += ` AND entity=?`;
-        params.push(scope.entity);
-      }
-      if (excludeProtected && protectedIds.size > 0) {
-        const placeholders = Array.from(protectedIds).map(() => "?").join(", ");
-        where += ` AND template_id NOT IN (${placeholders})`;
-        params.push(...Array.from(protectedIds));
-      }
-      const q = `SELECT template_id FROM live_templates WHERE ${where} ORDER BY last_seen_at_ms ASC, template_id ASC LIMIT ?;`;
-      params.push(count);
       try {
-        const rows = this.db.db.query(q).all(...params) as any[];
-        return rows.map((r) => String(r.template_id));
+        return this.db.listLiveTemplateLruIds({
+          stream,
+          entity: scope.entity,
+          excludeTemplateIds: excludeProtected ? Array.from(protectedIds) : [],
+          limit: count,
+        });
       } catch {
         return [];
       }
@@ -601,31 +532,18 @@ export class LiveTemplateRegistry {
     }
     if (ids.length === 0) return [];
 
-    const update = this.db.db.query(
-      `UPDATE live_templates
-       SET state='retired', retired_reason='cap_exceeded', retired_at_ms=?
-       WHERE stream=? AND template_id=? AND state='active';`
-    );
-    try {
-      for (const id of ids) {
-        update.run(nowMs, stream, id);
-        out.push({
-          type: "live.template_evicted",
-          ts: nowIso(nowMs),
-          stream,
-          templateId: id,
-          reason: "cap_exceeded",
-          cap: scope.cap,
-        });
-        this.lastSeenMem.delete(this.key(stream, id));
-        this.dirtyLastSeen.delete(this.key(stream, id));
-      }
-    } finally {
-      try {
-        update.finalize?.();
-      } catch {
-        // ignore
-      }
+    this.db.retireLiveTemplatesForCap(stream, ids, nowMs);
+    for (const id of ids) {
+      out.push({
+        type: "live.template_evicted",
+        ts: nowIso(nowMs),
+        stream,
+        templateId: id,
+        reason: "cap_exceeded",
+        cap: scope.cap,
+      });
+      this.lastSeenMem.delete(this.key(stream, id));
+      this.dirtyLastSeen.delete(this.key(stream, id));
     }
 
     return out;

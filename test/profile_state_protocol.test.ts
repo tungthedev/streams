@@ -50,7 +50,7 @@ describe("state-protocol profile", () => {
 
       expect(app.deps.db.getStream("state-install")?.profile).toBe("state-protocol");
       expect(app.deps.db.getStreamProfile("state-install")).not.toBeNull();
-      expect(app.deps.db.getStreamTouchState("state-install")).not.toBeNull();
+      expect(app.deps.db.touch.getStreamTouchState("state-install")).not.toBeNull();
     } finally {
       await app.close();
       rmSync(root, { recursive: true, force: true });
@@ -90,7 +90,7 @@ describe("state-protocol profile", () => {
       });
       expect(app.deps.db.getStream("state-non-json")?.profile).toBe("generic");
       expect(app.deps.db.getStreamProfile("state-non-json")).toBeNull();
-      expect(app.deps.db.getStreamTouchState("state-non-json")).toBeNull();
+      expect(app.deps.db.touch.getStreamTouchState("state-non-json")).toBeNull();
     } finally {
       await app.close();
       rmSync(root, { recursive: true, force: true });
@@ -177,7 +177,7 @@ describe("state-protocol profile", () => {
 
       expect(app.deps.db.getStream("state-disabled")?.profile).toBe("state-protocol");
       expect(app.deps.db.getStreamProfile("state-disabled")).not.toBeNull();
-      expect(app.deps.db.getStreamTouchState("state-disabled")).toBeNull();
+      expect(app.deps.db.touch.getStreamTouchState("state-disabled")).toBeNull();
 
       const touchMetaRes = await app.fetch(new Request("http://local/v1/stream/state-disabled/touch/meta", { method: "GET" }));
       expect(touchMetaRes.status).toBe(404);
@@ -231,7 +231,7 @@ describe("state-protocol profile", () => {
         expect(profileRow).not.toBeNull();
         expect(JSON.parse(profileRow!.profile_json)).toEqual(installedProfile);
 
-        expect(app2.deps.db.getStreamTouchState("state-bootstrap")).not.toBeNull();
+        expect(app2.deps.db.touch.getStreamTouchState("state-bootstrap")).not.toBeNull();
 
         const getRes = await fetchJsonApp(app2, "http://local/v1/stream/state-bootstrap/_profile", { method: "GET" });
         expect(getRes.status).toBe(200);

@@ -134,6 +134,7 @@ export function createLocalApp(cfg: Config, os?: ObjectStore, opts: CreateLocalA
   const controlStore = localControlStore(db);
   return createAppCore(cfg, {
     db,
+    touchStore: db.touch,
     store: controlStore,
     stats: opts.stats,
     createRuntime: ({ config, registry, memorySampler, memory }) => {
