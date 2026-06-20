@@ -30,6 +30,7 @@ import type {
   SchemaStore,
 } from "../store/schema_profile_store";
 import type { WalControlPlaneStore, DurableStoreCapabilities } from "../store/capabilities";
+import type { ObjectStoreAccountingStore, StorageStatsStore } from "../store/stats_accounting_store";
 import { SqliteWalStore } from "./sqlite_wal_store";
 import { loadSqliteManifestPublicationSnapshot } from "./sqlite_manifest_snapshot";
 import { SqliteTouchStore } from "./sqlite_touch_store";
@@ -83,7 +84,9 @@ export class SqliteDurableStore
     SegmentStore,
     ManifestStore,
     SchemaStore,
-    ProfileStore
+    ProfileStore,
+    StorageStatsStore,
+    ObjectStoreAccountingStore
 {
   readonly kind = "sqlite" as const;
   readonly capabilities: DurableStoreCapabilities = {

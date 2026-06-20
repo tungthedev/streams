@@ -160,8 +160,8 @@ if (process.env.DS_STATS_INTERVAL_MS && !Number.isFinite(statsIntervalMs)) {
   process.exit(1);
 }
 const statsReporter =
-  statsEnabled && stats && app.deps.db && app.deps.uploader
-    ? new StatsReporter(stats, app.deps.db, app.deps.uploader, app.deps.ingest, app.deps.backpressure, app.deps.memory, statsIntervalMs)
+  statsEnabled && stats && app.deps.storageStats && app.deps.uploader
+    ? new StatsReporter(stats, app.deps.storageStats, app.deps.uploader, app.deps.ingest, app.deps.backpressure, app.deps.memory, statsIntervalMs)
     : null;
 const histReporter = histEnabled && hist ? new HistogramReporter(hist, statsIntervalMs) : null;
 

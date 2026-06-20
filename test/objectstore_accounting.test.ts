@@ -3,6 +3,7 @@ import { describe, expect, test } from "bun:test";
 import { Metrics } from "../src/metrics";
 import { AccountingObjectStore } from "../src/objectstore/accounting";
 import type { ObjectStore, PutResult } from "../src/objectstore/interface";
+import type { ObjectStoreAccountingRecorder } from "../src/store/stats_accounting_store";
 
 const STREAM_HASH = "0123456789abcdef0123456789abcdef";
 
@@ -42,15 +43,12 @@ describe("AccountingObjectStore", () => {
       },
     };
 
-    const store = new AccountingObjectStore(
-      inner,
-      {
-        recordObjectStoreRequestByHash(streamHash: string, artifact: string, op: string, size: number) {
-          requestCounts.push([streamHash, artifact, op, size]);
-        },
-      } as any,
-      metrics
-    );
+    const accounting: ObjectStoreAccountingRecorder = {
+      recordObjectStoreRequestByHash(streamHash: string, artifact: string, op: string, size = 0) {
+        requestCounts.push([streamHash, artifact, op, size]);
+      },
+    };
+    const store = new AccountingObjectStore(inner, accounting, metrics);
 
     await store.put(`streams/${STREAM_HASH}/manifest.json`, new Uint8Array([7, 8, 9]));
     await store.get(`streams/${STREAM_HASH}/segments/0000000000000000.bin`);
@@ -96,13 +94,10 @@ describe("AccountingObjectStore", () => {
       },
     };
 
-    const store = new AccountingObjectStore(
-      inner,
-      {
-        recordObjectStoreRequestByHash() {},
-      } as any,
-      metrics
-    );
+    const accounting: ObjectStoreAccountingRecorder = {
+      recordObjectStoreRequestByHash() {},
+    };
+    const store = new AccountingObjectStore(inner, accounting, metrics);
 
     await expect(store.get(`streams/${STREAM_HASH}/segments/0000000000000001.bin`)).resolves.toBeNull();
     await expect(store.list("streams/")).resolves.toEqual(["streams/example"]);

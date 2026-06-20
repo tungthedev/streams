@@ -109,6 +109,8 @@ export function createApp(cfg: Config, os?: ObjectStore, opts: CreateAppOptions 
   return createAppCore(cfg, {
     db,
     touchStore: db.touch,
+    storageStatsStore: db,
+    objectStoreAccountingStore: db,
     store: db,
     stats: opts.stats,
     createRuntime: ({ config, ingest, registry, notifier, stats, backpressure, metrics, memorySampler, memory, asyncIndexGate, foregroundActivity }) => {

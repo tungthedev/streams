@@ -1,8 +1,8 @@
-import type { SqliteDurableStore } from "./db/db";
 import type { UploaderController } from "./uploader";
 import type { MemoryPressureMonitor } from "./memory";
 import type { BackpressureGate } from "./backpressure";
 import type { IngestQueue } from "./ingest";
+import type { StorageStatsStore } from "./store/stats_accounting_store";
 
 export type StatsSnapshot = {
   ingestedBytes: number;
@@ -106,7 +106,7 @@ export class StatsReporter {
   private rejectActiveMs = 0;
   private readonly intervalMs: number;
   private readonly stats: StatsCollector;
-  private readonly db: SqliteDurableStore;
+  private readonly storageStats: StorageStatsStore;
   private readonly uploader: UploaderController;
   private readonly ingest?: IngestQueue;
   private readonly backpressure?: BackpressureGate;
@@ -114,7 +114,7 @@ export class StatsReporter {
 
   constructor(
     stats: StatsCollector,
-    db: SqliteDurableStore,
+    storageStats: StorageStatsStore,
     uploader: UploaderController,
     ingest?: IngestQueue,
     backpressure?: BackpressureGate,
@@ -122,7 +122,7 @@ export class StatsReporter {
     intervalMs = 60_000
   ) {
     this.stats = stats;
-    this.db = db;
+    this.storageStats = storageStats;
     this.uploader = uploader;
     this.ingest = ingest;
     this.backpressure = backpressure;
@@ -178,10 +178,10 @@ export class StatsReporter {
       const backpressurePct = Math.min(100, Math.max(queueWaitPct, rejectPct));
       this.rejectActiveMs = 0;
       const avgSegmentSize = snap.segmentsSealed > 0 ? formatBytes(snap.sealedBytes / snap.segmentsSealed) : "n/a";
-      const totalStreams = this.db.countStreams();
+      const totalStreams = this.storageStats.countStreams();
       const segmentsWaiting = this.uploader.countSegmentsWaiting();
-      const walDbBytes = this.db.getWalDbSizeBytes();
-      const metaDbBytes = this.db.getMetaDbSizeBytes();
+      const walDbBytes = this.storageStats.getWalDbSizeBytes();
+      const metaDbBytes = this.storageStats.getMetaDbSizeBytes();
       const maxRss = this.memory ? formatBytes(this.memory.snapshotMaxRssBytes(true)) : null;
       const line =
         `ingested=${formatBytes(snap.ingestedBytes)} ` +

@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { StatsCollector, StatsReporter } from "../src/stats";
-import type { SqliteDurableStore } from "../src/db/db";
+import type { StorageStatsStore } from "../src/store/stats_accounting_store";
 import type { Uploader } from "../src/uploader";
 
 describe("stats reporter", () => {
@@ -14,17 +14,17 @@ describe("stats reporter", () => {
     stats.recordStreamTouched("alpha");
     stats.recordStreamTouched("beta");
 
-    const db = {
+    const storageStats: StorageStatsStore = {
       countStreams: () => 5,
       getWalDbSizeBytes: () => 8192,
       getMetaDbSizeBytes: () => 4096,
-    } as unknown as SqliteDurableStore;
+    };
 
     const uploader = {
       countSegmentsWaiting: () => 3,
     } as unknown as Uploader;
 
-    const reporter = new StatsReporter(stats, db, uploader, undefined, 60_000);
+    const reporter = new StatsReporter(stats, storageStats, uploader, undefined, 60_000);
 
     const logs: string[] = [];
     const original = console.log;

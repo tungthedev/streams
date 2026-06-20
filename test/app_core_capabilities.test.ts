@@ -45,6 +45,32 @@ function limitedControlStore(db: SqliteDurableStore): WalControlPlaneStore {
   }) as WalControlPlaneStore;
 }
 
+function controlStoreWithCapabilities(
+  db: SqliteDurableStore,
+  overrides: Partial<WalControlPlaneStore["capabilities"]>
+): WalControlPlaneStore {
+  return new Proxy(db, {
+    get(target, prop, receiver) {
+      if (prop === "capabilities") {
+        return {
+          ...target.capabilities,
+          indexes: false,
+          manifests: false,
+          objectStoreAccounting: false,
+          storageStats: false,
+          schemaPublication: false,
+          builtinProfiles: false,
+          internalMetrics: false,
+          touch: false,
+          ...overrides,
+        };
+      }
+      const value = Reflect.get(target, prop, receiver);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  }) as WalControlPlaneStore;
+}
+
 async function withLimitedApp<T>(fn: (ctx: { app: App; baseUrl: string; sqlite: SqliteDurableStore }) => Promise<T>): Promise<T> {
   const root = mkdtempSync(join(tmpdir(), "ds-app-core-caps-"));
   const cfg = makeConfig(root);
@@ -104,6 +130,66 @@ describe("app core capability gates", () => {
       const resp = await fetch(`${baseUrl}/v1/stream/__stream_metrics__?offset=0`);
       expect(resp.status).toBe(404);
     });
+  });
+
+  test("startup rejects advertised stats/accounting capabilities without matching stores", () => {
+    const root = mkdtempSync(join(tmpdir(), "ds-app-core-caps-stats-invalid-"));
+    const cfg = makeConfig(root);
+    const db = new SqliteDurableStore(cfg.dbPath, { cacheBytes: cfg.sqliteCacheBytes });
+    try {
+      const storageStatsStore = controlStoreWithCapabilities(db, { storageStats: true });
+      expect(() =>
+        createAppCore(cfg, {
+          store: storageStatsStore,
+          createRuntime: ({ config, registry, memorySampler, memory }) => ({
+            reader: new StreamReader(config, storageStatsStore, registry, undefined, memorySampler, memory),
+            start(): void {},
+          }),
+        })
+      ).toThrow("storage stats capability requires a storage stats store");
+
+      const objectStoreAccountingStore = controlStoreWithCapabilities(db, { objectStoreAccounting: true });
+      expect(() =>
+        createAppCore(cfg, {
+          store: objectStoreAccountingStore,
+          createRuntime: ({ config, registry, memorySampler, memory }) => ({
+            reader: new StreamReader(config, objectStoreAccountingStore, registry, undefined, memorySampler, memory),
+            start(): void {},
+          }),
+        })
+      ).toThrow("object-store accounting capability requires an accounting store");
+    } finally {
+      db.close();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("details route rejects missing object-store accounting before building details", async () => {
+    const root = mkdtempSync(join(tmpdir(), "ds-app-core-caps-details-accounting-"));
+    const cfg = makeConfig(root);
+    const db = new SqliteDurableStore(cfg.dbPath, { cacheBytes: cfg.sqliteCacheBytes });
+    const controlStore = controlStoreWithCapabilities(db, { storageStats: true });
+    const app = createAppCore(cfg, {
+      store: controlStore,
+      storageStatsStore: db,
+      createRuntime: ({ config, registry, memorySampler, memory }) => ({
+        reader: new StreamReader(config, controlStore, registry, undefined, memorySampler, memory),
+        start(): void {},
+      }),
+    });
+    const server = Bun.serve({ port: 0, fetch: app.fetch });
+    try {
+      await app.ready;
+      const resp = await fetch(`http://localhost:${server.port}/v1/stream/caps/_details`);
+      expect(resp.status).toBe(501);
+      expect(await readJson(resp)).toMatchObject({
+        error: { code: "unsupported_capability", message: "object-store accounting capability is not available" },
+      });
+    } finally {
+      server.stop();
+      await app.close();
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   test("WAL-only core routes reject unsupported full-mode capabilities before mutation", async () => {

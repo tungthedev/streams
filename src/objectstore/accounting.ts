@@ -1,5 +1,5 @@
-import type { SqliteDurableStore } from "../db/db";
 import type { Metrics } from "../metrics";
+import type { ObjectStoreAccountingRecorder } from "../store/stats_accounting_store";
 import type { GetOptions, ObjectStore, PutResult } from "./interface";
 
 type ClassifiedRequest = {
@@ -37,7 +37,7 @@ function classifyListPrefix(prefix: string): ClassifiedRequest | null {
 export class AccountingObjectStore implements ObjectStore {
   constructor(
     private readonly inner: ObjectStore,
-    private readonly db: SqliteDurableStore,
+    private readonly accounting: ObjectStoreAccountingRecorder,
     private readonly metrics?: Metrics
   ) {}
 
@@ -56,7 +56,7 @@ export class AccountingObjectStore implements ObjectStore {
     const artifact = classified?.artifact ?? "unknown";
     try {
       const res = await this.inner.put(key, data, opts);
-      if (classified) this.db.recordObjectStoreRequestByHash(classified.streamHash, classified.artifact, "put", data.byteLength);
+      if (classified) this.accounting.recordObjectStoreRequestByHash(classified.streamHash, classified.artifact, "put", data.byteLength);
       this.recordLatency("put", artifact, startedNs, "ok");
       return res;
     } catch (error) {
@@ -76,12 +76,12 @@ export class AccountingObjectStore implements ObjectStore {
           contentType: opts?.contentType,
           contentLength: size,
         });
-        if (classified) this.db.recordObjectStoreRequestByHash(classified.streamHash, classified.artifact, "put", size);
+        if (classified) this.accounting.recordObjectStoreRequestByHash(classified.streamHash, classified.artifact, "put", size);
         this.recordLatency("put", artifact, startedNs, "ok");
         return res;
       }
       const res = await this.inner.putFile(key, path, size, opts);
-      if (classified) this.db.recordObjectStoreRequestByHash(classified.streamHash, classified.artifact, "put", size);
+      if (classified) this.accounting.recordObjectStoreRequestByHash(classified.streamHash, classified.artifact, "put", size);
       this.recordLatency("put", artifact, startedNs, "ok");
       return res;
     } catch (error) {
@@ -96,7 +96,7 @@ export class AccountingObjectStore implements ObjectStore {
     const artifact = classified?.artifact ?? "unknown";
     try {
       const res = await this.inner.get(key, opts);
-      if (classified) this.db.recordObjectStoreRequestByHash(classified.streamHash, classified.artifact, "get", res?.byteLength ?? 0);
+      if (classified) this.accounting.recordObjectStoreRequestByHash(classified.streamHash, classified.artifact, "get", res?.byteLength ?? 0);
       this.recordLatency("get", artifact, startedNs, res == null ? "miss" : "ok");
       return res;
     } catch (error) {
@@ -111,7 +111,7 @@ export class AccountingObjectStore implements ObjectStore {
     const artifact = classified?.artifact ?? "unknown";
     try {
       const res = await this.inner.head(key);
-      if (classified) this.db.recordObjectStoreRequestByHash(classified.streamHash, classified.artifact, "head", res?.size ?? 0);
+      if (classified) this.accounting.recordObjectStoreRequestByHash(classified.streamHash, classified.artifact, "head", res?.size ?? 0);
       this.recordLatency("head", artifact, startedNs, res == null ? "miss" : "ok");
       return res;
     } catch (error) {
@@ -126,7 +126,7 @@ export class AccountingObjectStore implements ObjectStore {
     const artifact = classified?.artifact ?? "unknown";
     try {
       await this.inner.delete(key);
-      if (classified) this.db.recordObjectStoreRequestByHash(classified.streamHash, classified.artifact, "delete", 0);
+      if (classified) this.accounting.recordObjectStoreRequestByHash(classified.streamHash, classified.artifact, "delete", 0);
       this.recordLatency("delete", artifact, startedNs, "ok");
     } catch (error) {
       this.recordLatency("delete", artifact, startedNs, "error");
@@ -140,7 +140,7 @@ export class AccountingObjectStore implements ObjectStore {
     const artifact = classified?.artifact ?? (prefix.replace(/\/+$/, "") === "streams" ? "stream_catalog" : "unknown");
     try {
       const res = await this.inner.list(prefix);
-      if (classified) this.db.recordObjectStoreRequestByHash(classified.streamHash, classified.artifact, "list", 0);
+      if (classified) this.accounting.recordObjectStoreRequestByHash(classified.streamHash, classified.artifact, "list", 0);
       this.recordLatency("list", artifact, startedNs, "ok");
       return res;
     } catch (error) {

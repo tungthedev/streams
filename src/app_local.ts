@@ -135,6 +135,8 @@ export function createLocalApp(cfg: Config, os?: ObjectStore, opts: CreateLocalA
   return createAppCore(cfg, {
     db,
     touchStore: db.touch,
+    storageStatsStore: db,
+    objectStoreAccountingStore: db,
     store: controlStore,
     stats: opts.stats,
     createRuntime: ({ config, registry, memorySampler, memory }) => {

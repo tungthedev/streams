@@ -25,6 +25,7 @@ import { resolvePointerResult } from "./util/json_pointer";
 import { ExpirySweeper } from "./expiry_sweeper";
 import type { StatsCollector } from "./stats";
 import type { TouchProcessorStore } from "./store/touch_store";
+import type { ObjectStoreAccountingStore, StorageStatsStore } from "./store/stats_accounting_store";
 import { BackpressureGate } from "./backpressure";
 import { MemoryPressureMonitor } from "./memory";
 import { RuntimeMemorySampler } from "./runtime_memory_sampler";
@@ -470,6 +471,8 @@ export type App = {
     profiles: StreamProfileStore;
     touch?: TouchProcessorManager;
     stats?: StatsCollector;
+    storageStats?: StorageStatsStore;
+    objectStoreAccounting?: ObjectStoreAccountingStore;
     backpressure?: BackpressureGate;
     memory?: MemoryPressureMonitor;
     concurrency?: {
@@ -530,6 +533,8 @@ export type CreateAppCoreOptions = {
   store: WalControlPlaneStore;
   db?: SqliteDurableStore;
   touchStore?: TouchProcessorStore;
+  storageStatsStore?: StorageStatsStore;
+  objectStoreAccountingStore?: ObjectStoreAccountingStore;
   stats?: StatsCollector;
   createRuntime(args: CreateAppRuntimeArgs): AppRuntimeDeps;
 };
@@ -538,14 +543,16 @@ function validateRuntimeCapabilityBundle(
   controlStore: WalControlPlaneStore,
   db: SqliteDurableStore | undefined,
   touchStore: TouchProcessorStore | undefined,
+  storageStatsStore: StorageStatsStore | undefined,
+  objectStoreAccountingStore: ObjectStoreAccountingStore | undefined,
   runtime: AppRuntimeDeps
 ): void {
   const caps = controlStore.capabilities;
   if (caps.indexes && !runtime.indexer) throw dsError("index capability requires an index runtime");
   if (caps.schemaPublication && !runtime.schemaPublication) throw dsError("schema publication capability requires a schema publication runtime");
   if (caps.manifests && !runtime.fullMode?.manifestPublication) throw dsError("manifest capability requires a full-mode manifest runtime");
-  if (caps.storageStats && !db) throw dsError("storage stats capability requires a sqlite metadata store");
-  if (caps.objectStoreAccounting && !db) throw dsError("object-store accounting capability requires a sqlite metadata store");
+  if (caps.storageStats && !storageStatsStore) throw dsError("storage stats capability requires a storage stats store");
+  if (caps.objectStoreAccounting && !objectStoreAccountingStore) throw dsError("object-store accounting capability requires an accounting store");
   if (caps.touch && !touchStore) throw dsError("touch capability requires a touch metadata store");
   if (caps.internalMetrics && !caps.builtinProfiles) throw dsError("internal metrics capability requires built-in profile support");
   if (runtime.fullMode && !db) throw dsError("full-mode runtime requires a sqlite metadata store");
@@ -575,6 +582,8 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
   const controlStore = requireWalControlPlaneStore(opts.store);
   const db = opts.db;
   const touchStore = opts.touchStore;
+  const storageStatsStore = opts.storageStatsStore;
+  const objectStoreAccountingStore = opts.objectStoreAccountingStore;
   db?.resetSegmentInProgress();
   if (db) reconcileDeletedStreamAccelerationState(db);
   const stats = opts.stats;
@@ -665,7 +674,7 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
     metrics,
     memorySampler,
   });
-  validateRuntimeCapabilityBundle(controlStore, db, touchStore, runtime);
+  validateRuntimeCapabilityBundle(controlStore, db, touchStore, storageStatsStore, objectStoreAccountingStore, runtime);
   const {
     reader,
     indexer,
@@ -1501,7 +1510,8 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
       companion_cache_bytes: 0,
       ...(getLocalStorageUsage?.(stream) ?? {}),
     };
-    const sqliteSharedBytes = BigInt(sqlite.getWalDbSizeBytes() + sqlite.getMetaDbSizeBytes());
+    if (!storageStatsStore) throw dsError("storage stats capability requires a storage stats store");
+    const sqliteSharedBytes = BigInt(storageStatsStore.getWalDbSizeBytes() + storageStatsStore.getMetaDbSizeBytes());
     const exactIndexBytes = indexStatus.exact_indexes.reduce((sum: bigint, entry: any) => sum + BigInt(entry.bytes_at_rest ?? 0), 0n);
     const familyBytes = new Map<string, bigint>();
     for (const row of currentCompanionRows) {
@@ -1563,9 +1573,8 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
   };
 
   const buildObjectStoreRequestSummary = (stream: string) => {
-    const sqliteRes = requireSqliteFullModeStore();
-    if (Result.isError(sqliteRes)) throw dsError(sqliteRes.error.message);
-    const summary = sqliteRes.value.getObjectStoreRequestSummaryByHash(streamHash16Hex(stream));
+    if (!objectStoreAccountingStore) throw dsError("object-store accounting capability requires an accounting store");
+    const summary = objectStoreAccountingStore.getObjectStoreRequestSummaryByHash(streamHash16Hex(stream));
     return {
       puts: summary.puts.toString(),
       reads: summary.reads.toString(),
@@ -2411,6 +2420,7 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
         if (isDetails || isIndexStatus) {
           if (req.method !== "GET") return badRequest("unsupported method");
           if (isDetails && !controlStore.capabilities.storageStats) return unsupportedCapability("storage stats");
+          if (isDetails && !controlStore.capabilities.objectStoreAccounting) return unsupportedCapability("object-store accounting");
           if (isIndexStatus && !controlStore.capabilities.indexes) return unsupportedCapability("index");
           const liveParam = url.searchParams.get("live") ?? "";
           let longPoll = false;
@@ -3493,6 +3503,8 @@ export function createAppCore(cfg: Config, opts: CreateAppCoreOptions): App {
       profiles,
       touch,
       stats,
+      storageStats: storageStatsStore,
+      objectStoreAccounting: objectStoreAccountingStore,
       backpressure,
       memory,
       concurrency: {
