@@ -1645,10 +1645,10 @@ export class SqliteDurableStore
     this.db.query(`UPDATE streams SET segment_in_progress=?, updated_at_ms=? WHERE stream=?;`).run(inProgress, this.nowMs(), stream);
   }
 
-  tryClaimSegment(stream: string): boolean {
+  tryClaimSegment(stream: string): { token: string } | null {
     const res = this.stmts.tryClaimSegment.run(this.nowMs(), stream) as any;
     const changes = typeof res?.changes === "bigint" ? res.changes : BigInt(Number(res?.changes ?? 0));
-    return changes > 0n;
+    return changes > 0n ? { token: "sqlite" } : null;
   }
 
   resetSegmentInProgress(): void {

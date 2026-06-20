@@ -25,6 +25,7 @@ import type {
 import type { WalReadRow } from "../store/wal_store";
 import { dsError } from "../util/ds_error";
 import { migratePostgresStore } from "./schema";
+import { PostgresSegmentManifestStore } from "./segments";
 import type { PgExecutor, PgStreamRow } from "./types";
 
 const STREAM_FLAG_DELETED = 1 << 0;
@@ -45,26 +46,35 @@ type StreamState = {
 
 type ProducerState = { epoch: number; lastSeq: number };
 type ProducerCheck = { duplicate: boolean; update: boolean; epoch: number; seq: number };
+type PostgresStoreOptions = { fullMode?: boolean };
 
 export class PostgresDurableStore implements WalControlPlaneStore {
   readonly kind = "postgres" as const;
-  readonly capabilities: DurableStoreCapabilities = {
-    wal: true,
-    schemas: true,
-    profiles: true,
-    streamLifecycle: true,
-    segmentReads: false,
-    indexes: false,
-    manifests: false,
-    objectStoreAccounting: false,
-    storageStats: false,
-    schemaPublication: false,
-    builtinProfiles: false,
-    internalMetrics: false,
-    touch: false,
-  };
+  readonly capabilities: DurableStoreCapabilities;
+  private readonly segments?: PostgresSegmentManifestStore;
 
-  constructor(private readonly pool: Pool) {}
+  constructor(private readonly pool: Pool, private readonly opts: PostgresStoreOptions = {}) {
+    this.capabilities = {
+      wal: true,
+      schemas: true,
+      profiles: true,
+      streamLifecycle: true,
+      segmentReads: opts.fullMode === true,
+      indexes: false,
+      manifests: opts.fullMode === true,
+      objectStoreAccounting: false,
+      storageStats: false,
+      schemaPublication: opts.fullMode === true,
+      builtinProfiles: false,
+      internalMetrics: false,
+      touch: false,
+    };
+    if (opts.fullMode) {
+      this.segments = new PostgresSegmentManifestStore(this.pool, () => this.nowMs(), (stream, startOffset, endOffset, routingKey) =>
+        this.readWalRange(stream, startOffset, endOffset, routingKey)
+      );
+    }
+  }
 
   static async connect(connectionString: string): Promise<PostgresDurableStore> {
     const store = new PostgresDurableStore(new Pool({ connectionString }));
@@ -72,8 +82,14 @@ export class PostgresDurableStore implements WalControlPlaneStore {
     return store;
   }
 
+  static async connectFull(connectionString: string): Promise<PostgresDurableStore> {
+    const store = new PostgresDurableStore(new Pool({ connectionString }), { fullMode: true });
+    await store.migrate();
+    return store;
+  }
+
   async migrate(): Promise<void> {
-    await migratePostgresStore(this.pool);
+    await migratePostgresStore(this.pool, { fullMode: this.opts.fullMode });
   }
 
   async close(): Promise<void> {
@@ -105,8 +121,18 @@ export class PostgresDurableStore implements WalControlPlaneStore {
       throw dsError("postgres storage supports generic profiles only", { code: "unsupported_capability" });
     }
     const now = this.nowMs();
-    const row = await this.pool.query<PgStreamRow>(
-      `INSERT INTO streams(
+    const sql = this.opts.fullMode
+      ? `INSERT INTO streams(
+         stream, created_at_ms, updated_at_ms,
+         content_type, profile, stream_seq, closed, closed_producer_id, closed_producer_epoch, closed_producer_seq, ttl_seconds,
+         epoch, next_offset, sealed_through, uploaded_through, uploaded_segment_count,
+         pending_rows, pending_bytes, logical_size_bytes, wal_rows, wal_bytes, last_append_ms, last_segment_cut_ms, segment_in_progress,
+         expires_at_ms, stream_flags
+       )
+       VALUES($1, $2, $2, $3, $4, $5, $6, NULL, NULL, NULL, $7, 0, 0, -1, -1, 0, 0, 0, 0, 0, 0, $2, $2, 0, $8, 0)
+       ON CONFLICT (stream) DO NOTHING
+       RETURNING *;`
+      : `INSERT INTO streams(
          stream, created_at_ms, updated_at_ms,
          content_type, profile, stream_seq, closed, closed_producer_id, closed_producer_epoch, closed_producer_seq, ttl_seconds,
          epoch, next_offset, logical_size_bytes, wal_rows, wal_bytes, last_append_ms,
@@ -114,7 +140,9 @@ export class PostgresDurableStore implements WalControlPlaneStore {
        )
        VALUES($1, $2, $2, $3, $4, $5, $6, NULL, NULL, NULL, $7, 0, 0, 0, 0, 0, $2, $8, 0)
        ON CONFLICT (stream) DO NOTHING
-       RETURNING *;`,
+       RETURNING *;`;
+    const row = await this.pool.query<PgStreamRow>(
+      sql,
       [
         stream,
         pgInt(now),
@@ -207,6 +235,10 @@ export class PostgresDurableStore implements WalControlPlaneStore {
     );
     const value = res.rows[0]?.min_ts;
     return value == null ? null : toBigInt(value);
+  }
+
+  fullModeSegments(): PostgresSegmentManifestStore {
+    return this.requireSegments();
   }
 
   async getSchemaRegistryForRead(stream: string): Promise<SchemaRegistryRow | null> {
@@ -562,35 +594,69 @@ export class PostgresDurableStore implements WalControlPlaneStore {
       st.closedProducerSeq = task.producer?.seq ?? null;
     }
 
-    await client.query(
-      `UPDATE streams
-       SET next_offset = $1,
-           updated_at_ms = $2,
-           last_append_ms = $3,
-           logical_size_bytes = logical_size_bytes + $5,
-           wal_rows = wal_rows + $4,
-           wal_bytes = wal_bytes + $5,
-           stream_seq = $6,
-           closed = CASE WHEN $7 = 1 THEN 1 ELSE closed END,
-           closed_producer_id = CASE WHEN $7 = 1 THEN $8 ELSE closed_producer_id END,
-           closed_producer_epoch = CASE WHEN $7 = 1 THEN $9 ELSE closed_producer_epoch END,
-           closed_producer_seq = CASE WHEN $7 = 1 THEN $10 ELSE closed_producer_seq END
-       WHERE stream = $11 AND (stream_flags & $12) = 0;`,
-      [
-        pgInt(st.nextOffset),
-        pgInt(nowMs),
-        pgInt(st.lastAppendMs),
-        pgInt(BigInt(task.rows.length)),
-        pgInt(totalBytes),
-        st.streamSeq,
-        task.close ? 1 : 0,
-        task.producer?.id ?? null,
-        task.producer?.epoch ?? null,
-        task.producer?.seq ?? null,
-        task.stream,
-        STREAM_FLAG_DELETED,
-      ]
-    );
+    if (this.opts.fullMode) {
+      await client.query(
+        `UPDATE streams
+         SET next_offset = $1,
+             updated_at_ms = $2,
+             last_append_ms = $3,
+             pending_rows = pending_rows + $4,
+             pending_bytes = pending_bytes + $5,
+             logical_size_bytes = logical_size_bytes + $5,
+             wal_rows = wal_rows + $4,
+             wal_bytes = wal_bytes + $5,
+             stream_seq = $6,
+             closed = CASE WHEN $7 = 1 THEN 1 ELSE closed END,
+             closed_producer_id = CASE WHEN $7 = 1 THEN $8 ELSE closed_producer_id END,
+             closed_producer_epoch = CASE WHEN $7 = 1 THEN $9 ELSE closed_producer_epoch END,
+             closed_producer_seq = CASE WHEN $7 = 1 THEN $10 ELSE closed_producer_seq END
+         WHERE stream = $11 AND (stream_flags & $12) = 0;`,
+        [
+          pgInt(st.nextOffset),
+          pgInt(nowMs),
+          pgInt(st.lastAppendMs),
+          pgInt(BigInt(task.rows.length)),
+          pgInt(totalBytes),
+          st.streamSeq,
+          task.close ? 1 : 0,
+          task.producer?.id ?? null,
+          task.producer?.epoch ?? null,
+          task.producer?.seq ?? null,
+          task.stream,
+          STREAM_FLAG_DELETED,
+        ]
+      );
+    } else {
+      await client.query(
+        `UPDATE streams
+         SET next_offset = $1,
+             updated_at_ms = $2,
+             last_append_ms = $3,
+             logical_size_bytes = logical_size_bytes + $5,
+             wal_rows = wal_rows + $4,
+             wal_bytes = wal_bytes + $5,
+             stream_seq = $6,
+             closed = CASE WHEN $7 = 1 THEN 1 ELSE closed END,
+             closed_producer_id = CASE WHEN $7 = 1 THEN $8 ELSE closed_producer_id END,
+             closed_producer_epoch = CASE WHEN $7 = 1 THEN $9 ELSE closed_producer_epoch END,
+             closed_producer_seq = CASE WHEN $7 = 1 THEN $10 ELSE closed_producer_seq END
+         WHERE stream = $11 AND (stream_flags & $12) = 0;`,
+        [
+          pgInt(st.nextOffset),
+          pgInt(nowMs),
+          pgInt(st.lastAppendMs),
+          pgInt(BigInt(task.rows.length)),
+          pgInt(totalBytes),
+          st.streamSeq,
+          task.close ? 1 : 0,
+          task.producer?.id ?? null,
+          task.producer?.epoch ?? null,
+          task.producer?.seq ?? null,
+          task.stream,
+          STREAM_FLAG_DELETED,
+        ]
+      );
+    }
 
     return {
       result: Result.ok({ lastOffset, appendedRows: task.rows.length, closed: task.close, duplicate: false, producer: producerInfo }),
@@ -642,8 +708,10 @@ export class PostgresDurableStore implements WalControlPlaneStore {
   }
 
   private async getSchemaRegistryWithExecutor(executor: PgExecutor, stream: string): Promise<SchemaRegistryRow | null> {
-    const res = await executor.query<{ stream: string; schema_json: string; updated_at_ms: string | number | bigint }>(
-      `SELECT stream, schema_json, updated_at_ms FROM schemas WHERE stream = $1;`,
+    const res = await executor.query<{ stream: string; schema_json: string; updated_at_ms: string | number | bigint; uploaded_size_bytes?: string | number | bigint }>(
+      this.opts.fullMode
+        ? `SELECT stream, schema_json, updated_at_ms, uploaded_size_bytes FROM schemas WHERE stream = $1;`
+        : `SELECT stream, schema_json, updated_at_ms FROM schemas WHERE stream = $1;`,
       [stream]
     );
     const row = res.rows[0];
@@ -652,7 +720,7 @@ export class PostgresDurableStore implements WalControlPlaneStore {
           stream: row.stream,
           registry_json: row.schema_json,
           updated_at_ms: toBigInt(row.updated_at_ms),
-          uploaded_size_bytes: 0n,
+          uploaded_size_bytes: row.uploaded_size_bytes == null ? 0n : toBigInt(row.uploaded_size_bytes),
         }
       : null;
   }
@@ -664,6 +732,11 @@ export class PostgresDurableStore implements WalControlPlaneStore {
     );
     const row = res.rows[0];
     return row ? { stream: row.stream, profile_json: row.profile_json, updated_at_ms: toBigInt(row.updated_at_ms) } : null;
+  }
+
+  private requireSegments(): PostgresSegmentManifestStore {
+    if (!this.segments) throw dsError("postgres full-mode segment capability is not enabled", { code: "unsupported_capability" });
+    return this.segments;
   }
 }
 
@@ -694,6 +767,9 @@ function toBytes(value: unknown): Uint8Array | null {
 }
 
 function coerceStreamRow(row: PgStreamRow): StreamReadRow {
+  const walRows = toBigInt(row.wal_rows);
+  const walBytes = toBigInt(row.wal_bytes);
+  const lastAppendMs = toBigInt(row.last_append_ms);
   return {
     stream: String(row.stream),
     created_at_ms: toBigInt(row.created_at_ms),
@@ -708,17 +784,17 @@ function coerceStreamRow(row: PgStreamRow): StreamReadRow {
     ttl_seconds: row.ttl_seconds == null ? null : Number(row.ttl_seconds),
     epoch: Number(row.epoch),
     next_offset: toBigInt(row.next_offset),
-    sealed_through: -1n,
-    uploaded_through: -1n,
-    uploaded_segment_count: 0,
-    pending_rows: toBigInt(row.wal_rows),
-    pending_bytes: toBigInt(row.wal_bytes),
+    sealed_through: row.sealed_through == null ? -1n : toBigInt(row.sealed_through),
+    uploaded_through: row.uploaded_through == null ? -1n : toBigInt(row.uploaded_through),
+    uploaded_segment_count: row.uploaded_segment_count == null ? 0 : Number(row.uploaded_segment_count),
+    pending_rows: row.pending_rows == null ? walRows : toBigInt(row.pending_rows),
+    pending_bytes: row.pending_bytes == null ? walBytes : toBigInt(row.pending_bytes),
     logical_size_bytes: toBigInt(row.logical_size_bytes),
-    wal_rows: toBigInt(row.wal_rows),
-    wal_bytes: toBigInt(row.wal_bytes),
-    last_append_ms: toBigInt(row.last_append_ms),
-    last_segment_cut_ms: toBigInt(row.last_append_ms),
-    segment_in_progress: 0,
+    wal_rows: walRows,
+    wal_bytes: walBytes,
+    last_append_ms: lastAppendMs,
+    last_segment_cut_ms: row.last_segment_cut_ms == null ? lastAppendMs : toBigInt(row.last_segment_cut_ms),
+    segment_in_progress: row.segment_in_progress == null ? 0 : Number(row.segment_in_progress),
     expires_at_ms: row.expires_at_ms == null ? null : toBigInt(row.expires_at_ms),
     stream_flags: Number(row.stream_flags),
   };

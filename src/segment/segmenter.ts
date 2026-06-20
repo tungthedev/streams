@@ -187,19 +187,23 @@ export class Segmenter {
 
   private async buildOne(stream: string): Promise<void> {
     if (this.stopping) return;
-    const row = await this.db.getSegmentStreamState(stream);
+    let row = await this.db.getSegmentStreamState(stream);
     if (!row || this.db.isDeleted(row)) return;
-    if (row.segment_in_progress) return;
     if (!(await this.shouldSealStream(row))) return;
 
-    const startOffset = row.sealed_through + 1n;
-    const maxOffset = row.next_offset - 1n;
-    if (startOffset > maxOffset) return;
-
     // Claim.
-    if (!(await this.db.tryClaimSegment(stream))) return;
+    const claim = await this.db.tryClaimSegment(stream);
+    if (!claim) return;
 
     try {
+      const claimedRow = await this.db.getSegmentStreamState(stream);
+      if (!claimedRow || this.db.isDeleted(claimedRow)) return;
+      row = claimedRow;
+      if (!(await this.shouldSealStream(row))) return;
+      const startOffset = row.sealed_through + 1n;
+      const maxOffset = row.next_offset - 1n;
+      if (startOffset > maxOffset) return;
+
       this.activeBuildStream = stream;
       this.activePayloadBytes = 0;
       this.activeSegmentBytesEstimate = 0;
@@ -337,6 +341,7 @@ export class Segmenter {
                 localPath,
                 payloadBytes,
                 rowsSealed,
+                claimToken: claim.token,
               });
             });
             if (this.hooks?.onSegmentSealed) this.hooks.onSegmentSealed(stream, Number(payloadBytes), fileBytes);
@@ -362,7 +367,7 @@ export class Segmenter {
       // Release claim.
       if (!this.stopping) {
         try {
-          await this.db.setSegmentInProgress(stream, 0);
+          await this.db.setSegmentInProgress(stream, 0, claim);
         } catch {
           // ignore
         }

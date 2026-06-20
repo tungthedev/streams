@@ -5,7 +5,11 @@ export const POSTGRES_SCHEMA_VERSION = 1;
 
 type PgSchemaExecutor = Pick<Pool, "query">;
 
-export async function migratePostgresStore(pool: Pool): Promise<void> {
+export type PostgresMigrationOptions = {
+  fullMode?: boolean;
+};
+
+export async function migratePostgresStore(pool: Pool, opts: PostgresMigrationOptions = {}): Promise<void> {
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
@@ -15,6 +19,7 @@ export async function migratePostgresStore(pool: Pool): Promise<void> {
       throw dsError(`postgres schema version ${currentVersion} is not supported by version ${POSTGRES_SCHEMA_VERSION}`);
     }
     await installWalControlPlaneSchema(client);
+    if (opts.fullMode) await installFullModeSegmentSchema(client);
     await setPostgresSchemaVersion(client, POSTGRES_SCHEMA_VERSION);
     await client.query("COMMIT");
   } catch (error) {
@@ -111,4 +116,72 @@ async function installWalControlPlaneSchema(executor: PgSchemaExecutor): Promise
   await executor.query(`CREATE INDEX IF NOT EXISTS wal_stream_offset_idx ON wal(stream, "offset");`);
   await executor.query(`CREATE INDEX IF NOT EXISTS wal_stream_routing_offset_idx ON wal(stream, routing_key, "offset");`);
   await executor.query(`CREATE INDEX IF NOT EXISTS streams_updated_at_idx ON streams(updated_at_ms);`);
+}
+
+async function installFullModeSegmentSchema(executor: PgSchemaExecutor): Promise<void> {
+  await executor.query(`ALTER TABLE streams ADD COLUMN IF NOT EXISTS sealed_through bigint NOT NULL DEFAULT -1;`);
+  await executor.query(`ALTER TABLE streams ADD COLUMN IF NOT EXISTS uploaded_through bigint NOT NULL DEFAULT -1;`);
+  await executor.query(`ALTER TABLE streams ADD COLUMN IF NOT EXISTS uploaded_segment_count integer NOT NULL DEFAULT 0;`);
+  await executor.query(`ALTER TABLE streams ADD COLUMN IF NOT EXISTS pending_rows bigint NOT NULL DEFAULT 0;`);
+  await executor.query(`ALTER TABLE streams ADD COLUMN IF NOT EXISTS pending_bytes bigint NOT NULL DEFAULT 0;`);
+  await executor.query(`ALTER TABLE streams ADD COLUMN IF NOT EXISTS last_segment_cut_ms bigint NOT NULL DEFAULT 0;`);
+  await executor.query(`ALTER TABLE streams ADD COLUMN IF NOT EXISTS segment_in_progress integer NOT NULL DEFAULT 0;`);
+  await executor.query(`ALTER TABLE streams ADD COLUMN IF NOT EXISTS segment_claim_token text NULL;`);
+  await executor.query(`ALTER TABLE streams ADD COLUMN IF NOT EXISTS segment_claimed_at_ms bigint NULL;`);
+  await executor.query(`
+    UPDATE streams
+    SET pending_rows = wal_rows,
+        pending_bytes = wal_bytes,
+        last_segment_cut_ms = last_append_ms
+    WHERE sealed_through = -1
+      AND uploaded_through = -1
+      AND uploaded_segment_count = 0
+      AND segment_in_progress = 0
+      AND segment_claim_token IS NULL
+      AND pending_rows = 0
+      AND pending_bytes = 0;
+  `);
+  await executor.query(`
+    CREATE TABLE IF NOT EXISTS segments (
+      segment_id text PRIMARY KEY,
+      stream text NOT NULL REFERENCES streams(stream) ON DELETE CASCADE,
+      segment_index integer NOT NULL,
+      start_offset bigint NOT NULL,
+      end_offset bigint NOT NULL,
+      block_count integer NOT NULL,
+      last_append_ms bigint NOT NULL,
+      payload_bytes bigint NOT NULL DEFAULT 0,
+      size_bytes integer NOT NULL,
+      local_path text NOT NULL,
+      created_at_ms bigint NOT NULL,
+      uploaded_at_ms bigint NULL,
+      r2_etag text NULL,
+      UNIQUE(stream, segment_index)
+    );
+  `);
+  await executor.query(`
+    CREATE TABLE IF NOT EXISTS stream_segment_meta (
+      stream text PRIMARY KEY REFERENCES streams(stream) ON DELETE CASCADE,
+      segment_count integer NOT NULL,
+      segment_offsets bytea NOT NULL,
+      segment_blocks bytea NOT NULL,
+      segment_last_ts bytea NOT NULL
+    );
+  `);
+  await executor.query(`
+    CREATE TABLE IF NOT EXISTS manifests (
+      stream text PRIMARY KEY REFERENCES streams(stream) ON DELETE CASCADE,
+      generation integer NOT NULL,
+      uploaded_generation integer NOT NULL,
+      last_uploaded_at_ms bigint NULL,
+      last_uploaded_etag text NULL,
+      last_uploaded_size_bytes bigint NULL
+    );
+  `);
+  await executor.query(`ALTER TABLE schemas ADD COLUMN IF NOT EXISTS uploaded_size_bytes bigint NOT NULL DEFAULT 0;`);
+  await executor.query(`CREATE INDEX IF NOT EXISTS streams_pending_bytes_idx ON streams(pending_bytes);`);
+  await executor.query(`CREATE INDEX IF NOT EXISTS streams_last_cut_idx ON streams(last_segment_cut_ms);`);
+  await executor.query(`CREATE INDEX IF NOT EXISTS streams_inprog_pending_idx ON streams(segment_in_progress, pending_bytes, last_segment_cut_ms);`);
+  await executor.query(`CREATE INDEX IF NOT EXISTS segments_stream_start_idx ON segments(stream, start_offset);`);
+  await executor.query(`CREATE INDEX IF NOT EXISTS segments_pending_upload_idx ON segments(uploaded_at_ms);`);
 }

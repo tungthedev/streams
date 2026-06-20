@@ -36,6 +36,10 @@ export type SegmentCandidateRow = {
   epoch: number;
 };
 
+export type SegmentClaim = {
+  token: string;
+};
+
 export type SealedSegmentCommit = {
   segmentId: string;
   stream: string;
@@ -48,6 +52,7 @@ export type SealedSegmentCommit = {
   sizeBytes: number;
   localPath: string;
   rowsSealed: bigint;
+  claimToken?: string;
 };
 
 export type ManifestRow = {
@@ -66,6 +71,7 @@ export type StreamProfileRow = {
 };
 
 export type ManifestPublicationSnapshot = {
+  publicationToken?: string;
   streamRow: StreamReadRow;
   prevUploadedSegmentCount: number;
   uploadedPrefixCount: number;
@@ -87,31 +93,37 @@ export type ManifestPublicationSnapshot = {
   searchSegmentCompanions: SearchSegmentCompanionRow[];
 };
 
+export type ManifestPublicationOptions = {
+  wait?: boolean;
+};
+
 export interface SegmentStore {
   getSegmentStreamState(stream: string): MaybePromise<StreamReadRow | null>;
   isDeleted(row: StreamReadRow): boolean;
   readWalRange(stream: string, startOffset: bigint, endOffset: bigint, routingKey?: Uint8Array): AsyncIterable<WalReadRow>;
   candidates(minPendingBytes: bigint, minPendingRows: bigint, maxIntervalMs: bigint, limit: number): MaybePromise<SegmentCandidateRow[]>;
   recentSegmentCompressionRatio(stream: string, limit?: number): MaybePromise<number | null>;
-  tryClaimSegment(stream: string): MaybePromise<boolean>;
-  setSegmentInProgress(stream: string, inProgress: number): MaybePromise<void>;
+  tryClaimSegment(stream: string): MaybePromise<SegmentClaim | null>;
+  setSegmentInProgress(stream: string, inProgress: number, claim?: SegmentClaim): MaybePromise<void>;
   nextSegmentIndexForStream(stream: string): MaybePromise<number>;
   commitSealedSegment(row: SealedSegmentCommit): MaybePromise<void>;
 }
 
 export interface ManifestStore {
   nowMs(): bigint;
-  countPendingSegments(): number;
+  countPendingSegments(): MaybePromise<number>;
   pendingUploadHeads(limit: number): MaybePromise<SegmentRow[]>;
   markSegmentUploaded(segmentId: string, etag: string, uploadedAtMs: bigint): MaybePromise<void>;
-  loadManifestPublicationSnapshot(stream: string): MaybePromise<ManifestPublicationSnapshot | null>;
+  loadManifestPublicationSnapshot(stream: string, opts?: ManifestPublicationOptions): MaybePromise<ManifestPublicationSnapshot | null>;
   commitManifest(
     stream: string,
     generation: number,
     etag: string,
     uploadedAtMs: bigint,
     uploadedThrough: bigint,
-    sizeBytes: number
+    sizeBytes: number,
+    publicationToken?: string
   ): MaybePromise<void>;
+  releaseManifestPublication?(publicationToken: string): MaybePromise<void>;
   getSegmentForManifestCleanup(stream: string, segmentIndex: number): MaybePromise<SegmentRow | null>;
 }

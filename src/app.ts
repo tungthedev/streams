@@ -267,7 +267,7 @@ export function createApp(cfg: Config, os?: ObjectStore, opts: CreateAppOptions 
           segmentDiskCache: diskCache,
           sizeReconciler,
           manifestPublication: {
-            publishDeletedStreamManifest: (stream: string) => uploader.publishManifest(stream),
+            publishDeletedStreamManifest: (stream: string) => uploader.publishManifest(stream, { wait: true }),
           },
           getLocalStorageUsage: (stream: string) => ({
             segment_cache_bytes: diskCache.bytesForObjectKeyPrefix(`streams/${streamHash16Hex(stream)}/segments/`),
@@ -425,5 +425,81 @@ export function createPostgresApp(cfg: Config, store: PostgresDurableStore, opts
       reader: new StreamReader(config, store, registry, undefined, memorySampler, memory),
       start: (): void => {},
     }),
+  });
+}
+
+export function createPostgresFullApp(cfg: Config, store: PostgresDurableStore, os: ObjectStore, opts: CreateAppOptions = {}): App {
+  return createAppCore(cfg, {
+    store,
+    stats: opts.stats,
+    createRuntime: ({ config, registry, notifier, stats, backpressure, memorySampler, memory }) => {
+      const segmentStore = store.fullModeSegments();
+      const diskCache = new SegmentDiskCache(`${config.rootDir}/cache`, config.segmentCacheMaxBytes);
+      const segmenterHooks: SegmenterHooks = {
+        onSegmentSealed: (stream, payloadBytes, segmentBytes) => {
+          if (stats) stats.recordSegmentSealed(payloadBytes, segmentBytes);
+          if (backpressure) backpressure.adjustOnSeal(payloadBytes, segmentBytes);
+          notifier.notifyDetailsChanged(stream);
+        },
+      };
+      const uploader = new Uploader(config, segmentStore, os, diskCache, stats, backpressure, undefined, memorySampler);
+      uploader.setHooks({
+        onMetadataChanged: (stream) => notifier.notifyDetailsChanged(stream),
+      });
+      const segmenter = new Segmenter(config, segmentStore, {}, segmenterHooks, memorySampler);
+      const reader = new StreamReader(
+        config,
+        store,
+        registry,
+        { segmentReads: segmentStore, objectStore: os, diskCache },
+        memorySampler,
+        memory
+      );
+      const schemaPublication = {
+        uploadSchemaRegistry: async (stream: string, reg: SchemaRegistry): Promise<void> => {
+          const shash = streamHash16Hex(stream);
+          const key = schemaObjectKey(shash);
+          const body = new TextEncoder().encode(JSON.stringify(reg));
+          await retry(
+            () => os.put(key, body, { contentType: "application/json", contentLength: body.byteLength }),
+            {
+              retries: config.objectStoreRetries,
+              baseDelayMs: config.objectStoreBaseDelayMs,
+              maxDelayMs: config.objectStoreMaxDelayMs,
+              timeoutMs: config.objectStoreTimeoutMs,
+            }
+          );
+          await segmentStore.setSchemaUploadedSizeBytes(stream, body.byteLength);
+        },
+        publishProfileSchemaRegistry: async (stream: string, reg: SchemaRegistry): Promise<void> => {
+          await schemaPublication.uploadSchemaRegistry(stream, reg);
+          await uploader.publishManifest(stream);
+        },
+      };
+      return {
+        reader,
+        schemaPublication,
+        fullMode: {
+          store: os,
+          segmenter,
+          uploader,
+          segmentDiskCache: diskCache,
+          manifestPublication: {
+            publishDeletedStreamManifest: (stream: string) => uploader.publishManifest(stream, { wait: true }),
+          },
+          getLocalStorageUsage: (stream: string) => ({
+            segment_cache_bytes: diskCache.bytesForObjectKeyPrefix(`streams/${streamHash16Hex(stream)}/segments/`),
+            routing_index_cache_bytes: 0,
+            exact_index_cache_bytes: 0,
+            lexicon_index_cache_bytes: 0,
+            companion_cache_bytes: 0,
+          }),
+        },
+        start: () => {
+          segmenter.start();
+          uploader.start();
+        },
+      };
+    },
   });
 }

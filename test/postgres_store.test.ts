@@ -174,6 +174,67 @@ maybeDescribe("postgres durable store", () => {
     });
   });
 
+  test("full-mode migration installs only segment and manifest capability tables", async () => {
+    await withPostgresSchema(async ({ schema, connectionString }) => {
+      const store = await PostgresDurableStore.connectFull(connectionString);
+      try {
+        expect(store.capabilities.segmentReads).toBe(true);
+        expect(store.capabilities.manifests).toBe(true);
+        expect(store.capabilities.schemaPublication).toBe(true);
+        expect(store.capabilities.indexes).toBe(false);
+        expect(store.capabilities.touch).toBe(false);
+        expect(store.capabilities.storageStats).toBe(false);
+
+        const inspectPool = new Pool({ connectionString });
+        try {
+          const tables = await inspectPool.query<{ table_name: string }>(
+            `SELECT table_name
+             FROM information_schema.tables
+             WHERE table_schema = $1
+             ORDER BY table_name ASC;`,
+            [schema]
+          );
+          expect(tables.rows.map((row) => row.table_name)).toEqual([
+            "manifests",
+            "producer_state",
+            "schema_version",
+            "schemas",
+            "segments",
+            "stream_profiles",
+            "stream_segment_meta",
+            "streams",
+            "wal",
+          ]);
+
+          const streamColumns = await inspectPool.query<{ column_name: string }>(
+            `SELECT column_name
+             FROM information_schema.columns
+             WHERE table_schema = $1 AND table_name = 'streams';`,
+            [schema]
+          );
+          const columnNames = new Set(streamColumns.rows.map((row) => row.column_name));
+          for (const column of [
+            "sealed_through",
+            "uploaded_through",
+            "uploaded_segment_count",
+            "pending_rows",
+            "pending_bytes",
+            "last_segment_cut_ms",
+            "segment_in_progress",
+            "segment_claim_token",
+            "segment_claimed_at_ms",
+          ]) {
+            expect(columnNames.has(column)).toBe(true);
+          }
+        } finally {
+          await inspectPool.end();
+        }
+      } finally {
+        await store.close();
+      }
+    });
+  });
+
   test("append assigns contiguous offsets and reads wal ranges", async () => {
     await withPostgresStore(async (store) => {
       await store.ensureStream("s", { contentType: "application/json" });

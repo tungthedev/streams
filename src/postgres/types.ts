@@ -16,10 +16,17 @@ export type PgStreamRow = {
   ttl_seconds: number | null;
   epoch: number;
   next_offset: string | number | bigint;
+  sealed_through?: string | number | bigint;
+  uploaded_through?: string | number | bigint;
+  uploaded_segment_count?: number | string;
+  pending_rows?: string | number | bigint;
+  pending_bytes?: string | number | bigint;
   logical_size_bytes: string | number | bigint;
   wal_rows: string | number | bigint;
   wal_bytes: string | number | bigint;
   last_append_ms: string | number | bigint;
+  last_segment_cut_ms?: string | number | bigint;
+  segment_in_progress?: number | string;
   expires_at_ms: string | number | bigint | null;
   stream_flags: number;
 };

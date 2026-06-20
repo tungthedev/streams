@@ -24,7 +24,7 @@ export type UploaderController = {
     manifest_inflight_streams: number;
   };
   setHooks(hooks: UploaderHooks | undefined): void;
-  publishManifest(stream: string): Promise<void>;
+  publishManifest(stream: string, opts?: { wait?: boolean }): Promise<void>;
 };
 
 export type UploaderHooks = {
@@ -90,7 +90,6 @@ export class Uploader {
   }
 
   countSegmentsWaiting(): number {
-    this.pendingSegmentsWaiting = this.db.countPendingSegments();
     return this.pendingSegmentsWaiting;
   }
 
@@ -223,19 +222,26 @@ export class Uploader {
     }
   }
 
-  async publishManifest(stream: string): Promise<void> {
+  async publishManifest(stream: string, opts: { wait?: boolean } = {}): Promise<void> {
     if (this.stopping) return;
-    if (this.manifestInflight.has(stream)) return;
+    while (this.manifestInflight.has(stream)) {
+      if (!opts.wait) return;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      if (this.stopping) return;
+    }
     this.manifestInflight.add(stream);
+    let publicationToken: string | undefined;
+    let committed = false;
     try {
       let snapshot;
       try {
-        snapshot = await this.db.loadManifestPublicationSnapshot(stream);
+        snapshot = await this.db.loadManifestPublicationSnapshot(stream, { wait: opts.wait });
       } catch (e) {
         this.failures.recordFailure(stream);
         throw e;
       }
       if (!snapshot) return;
+      publicationToken = snapshot.publicationToken;
       const manifestRes = buildManifestResult({
         streamName: stream,
         streamRow: snapshot.streamRow,
@@ -282,7 +288,8 @@ export class Uploader {
       }
 
       // Commit point: advance uploaded_through and delete WAL prefix.
-      await this.db.commitManifest(stream, snapshot.generation, putRes.etag, this.db.nowMs(), snapshot.uploadedThrough, body.byteLength);
+      await this.db.commitManifest(stream, snapshot.generation, putRes.etag, this.db.nowMs(), snapshot.uploadedThrough, body.byteLength, publicationToken);
+      committed = true;
       this.hooks?.onMetadataChanged?.(stream);
 
       // Local disk cleanup: delete newly uploaded segment files.
@@ -302,6 +309,13 @@ export class Uploader {
         }
       }
     } finally {
+      if (publicationToken && !committed) {
+        try {
+          await this.db.releaseManifestPublication?.(publicationToken);
+        } catch {
+          // ignore release failures
+        }
+      }
       this.manifestInflight.delete(stream);
     }
   }
