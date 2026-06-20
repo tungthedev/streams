@@ -2,7 +2,6 @@ import { Result } from "better-result";
 import type { SchemaRegistry } from "../schema/registry";
 import type { StreamReadRow as StreamRow, StreamReadStore } from "../store/segment_read_store";
 import type { ProfileStore } from "../store/schema_profile_store";
-import type { ProfileTouchStatePlan, ProfileTouchStateStore } from "../store/profile_touch_store";
 import { LruCache } from "../util/lru";
 import { dsError } from "../util/ds_error.ts";
 import { GENERIC_STREAM_PROFILE_DEFINITION } from "./generic";
@@ -141,12 +140,12 @@ export type StreamProfileUpdateResult = {
 
 export class StreamProfileStore {
   private readonly store: ProfileStore & StreamReadStore;
-  private readonly touchStore?: ProfileTouchStateStore;
+  private readonly touchEnabled: boolean;
   private readonly cache: LruCache<string, CachedStreamProfile>;
 
-  constructor(store: ProfileStore & StreamReadStore, opts?: { cacheEntries?: number; touchStore?: ProfileTouchStateStore }) {
+  constructor(store: ProfileStore & StreamReadStore, opts?: { cacheEntries?: number; touchEnabled?: boolean }) {
     this.store = store;
-    this.touchStore = opts?.touchStore;
+    this.touchEnabled = opts?.touchEnabled === true;
     this.cache = new LruCache(opts?.cacheEntries ?? 1024);
   }
 
@@ -206,26 +205,24 @@ export class StreamProfileStore {
       return Result.err({ kind: "bad_request", message: `profile.kind must be ${supportedProfileKindsMessage()}` });
     }
 
-    let touchState: ProfileTouchStatePlan = "preserve";
     const commitRes = await this.store.commitProfileMetadataMutation<StreamProfilePersistResult, StreamProfileMutationError>(stream, ({ streamRow }) => {
       if (!streamRow) return Result.err({ kind: "bad_request", message: "stream not found" });
       const persistRes = definition.persistProfileResult({ stream, streamRow, profile });
       if (Result.isError(persistRes)) return persistRes;
-      if (persistRes.value.touchState !== "preserve" && !this.touchStore) {
+      if (persistRes.value.touchState !== "preserve" && !this.touchEnabled) {
         return Result.err({ kind: "bad_request", message: `${persistRes.value.profile.kind} profile requires touch capability` });
       }
-      touchState = persistRes.value.touchState;
       return Result.ok({
         metadata: {
           streamProfile: persistRes.value.streamProfile,
           profileJson: persistRes.value.profileJson,
           schemaRegistry: persistRes.value.schemaRegistry ?? null,
+          touchState: persistRes.value.touchState,
         },
         value: persistRes.value,
       });
     });
     if (Result.isError(commitRes)) return commitRes;
-    if (touchState !== "preserve") await this.touchStore!.updateProfileTouchState(stream, touchState);
 
     const persist = commitRes.value.value;
     const cache = persist.cache ? { ...persist.cache, updatedAtMs: commitRes.value.profileUpdatedAtMs } : null;

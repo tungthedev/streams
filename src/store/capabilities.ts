@@ -48,6 +48,7 @@ export type EnsureStreamOptions = {
   closed?: boolean;
   ttlSeconds?: number | null;
   expiresAtMs?: bigint | null;
+  streamFlags?: number;
 };
 
 export interface WalControlPlaneStore extends StoreLifecycle, StreamStore, StreamReadStore, WalStore, SchemaStore, ProfileStore {}

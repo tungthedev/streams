@@ -5,6 +5,7 @@ import type { StreamProfileStore } from "../profiles";
 import { listTouchCapableProfileKinds, resolveEnabledTouchCapability, resolveTouchCapability } from "../profiles";
 import type { TouchProcessorStore } from "../store/touch_store";
 import { TouchProcessorWorkerPool } from "./worker_pool";
+import { processTouchBatch } from "./process_batch";
 import { LruCache } from "../util/lru";
 import type { BackpressureGate } from "../backpressure";
 import { LiveTemplateRegistry, type TemplateDecl } from "./live_templates";
@@ -131,6 +132,7 @@ export class TouchProcessorManager {
   private readonly db: TouchProcessorStore;
   private readonly profiles: StreamProfileStore;
   private readonly pool: TouchProcessorWorkerPool;
+  private readonly useWorkers: boolean;
   private timer: any | null = null;
   private running = false;
   private stopping = false;
@@ -162,11 +164,13 @@ export class TouchProcessorManager {
     ingest: IngestQueue,
     notifier: StreamNotifier,
     profiles: StreamProfileStore,
-    backpressure?: BackpressureGate
+    backpressure?: BackpressureGate,
+    opts?: { useWorkers?: boolean }
   ) {
     this.cfg = cfg;
     this.db = db;
     this.profiles = profiles;
+    this.useWorkers = opts?.useWorkers !== false;
     this.pool = new TouchProcessorWorkerPool(cfg, cfg.touchWorkers);
     this.templates = new LiveTemplateRegistry(db);
     this.liveMetrics = new LiveMetricsV2(db, ingest, profiles, {
@@ -186,13 +190,14 @@ export class TouchProcessorManager {
     if (this.timer) return;
     this.stopping = false;
     void this.ensureTouchStateSeeded();
-    const liveMetricsRes = this.liveMetrics.ensureStreamResult();
-    if (Result.isError(liveMetricsRes)) {
-      // eslint-disable-next-line no-console
-      console.error("touch live metrics stream validation failed", liveMetricsRes.error.message);
-    } else {
-      this.liveMetrics.start();
-    }
+    void this.liveMetrics.ensureStreamResult().then((liveMetricsRes) => {
+      if (Result.isError(liveMetricsRes)) {
+        // eslint-disable-next-line no-console
+        console.error("touch live metrics stream validation failed", liveMetricsRes.error.message);
+      } else {
+        this.liveMetrics.start();
+      }
+    });
     if (this.cfg.touchCheckIntervalMs > 0) {
       this.timer = setInterval(() => {
         void this.tick();
@@ -267,16 +272,16 @@ export class TouchProcessorManager {
   async tick(): Promise<void> {
     if (this.stopping) return;
     if (this.running) return;
-    if (this.cfg.touchWorkers <= 0) return;
+    if (this.useWorkers && this.cfg.touchWorkers <= 0) return;
     this.running = true;
     try {
       await this.ensureTouchStateSeeded();
       const nowMs = Date.now();
       const dirtyNow = new Set(this.dirty);
       this.dirty.clear();
-      const states = this.db.listStreamTouchStates();
+      const states = await this.db.listStreamTouchStates();
       if (states.length === 0) return;
-      this.pool.start();
+      if (this.useWorkers) this.pool.start();
       const stateByStream = new Map(states.map((s) => [s.stream, s]));
 
       const ordered: string[] = [];
@@ -324,11 +329,11 @@ export class TouchProcessorManager {
       // deterministic for "catch up after lag" scenarios.
       for (const stream of stateByStream.keys()) {
         if (this.stopping) break;
-        const srow = this.db.getStream(stream);
+        const srow = await this.db.getStream(stream);
         if (!srow || this.db.isDeleted(srow)) continue;
-        const touchState = this.db.getStreamTouchState(stream);
+        const touchState = await this.db.getStreamTouchState(stream);
         if (!touchState) continue;
-        this.maybeGcBaseWal(stream, srow.uploaded_through, touchState.processed_through);
+        await this.maybeGcBaseWal(stream, srow.uploaded_through, touchState.processed_through);
       }
 
       // Template retirement GC + last-seen flush (sliding window).
@@ -352,7 +357,7 @@ export class TouchProcessorManager {
       }
 
       if (touchCfgByStream.size > 0 && Number.isFinite(persistIntervalMin)) {
-        this.templates.flushLastSeen(nowMs, persistIntervalMin);
+        await this.templates.flushLastSeen(nowMs, persistIntervalMin);
       }
 
       for (const [stream, touchCfg] of touchCfgByStream.entries()) {
@@ -362,7 +367,7 @@ export class TouchProcessorManager {
         if (nowMs - last < gcInterval) continue;
         this.lastTemplateGcMsByStream.set(stream, nowMs);
 
-        const retired = this.templates.gcRetireExpired(stream, nowMs);
+        const retired = await this.templates.gcRetireExpired(stream, nowMs);
         if (retired.retired.length > 0) {
           void this.liveMetrics.emitLifecycle(retired.retired);
         }
@@ -373,9 +378,9 @@ export class TouchProcessorManager {
   }
 
   private async processOne(stream: string, processedThroughAtStart: bigint): Promise<void> {
-    const srow = this.db.getStream(stream);
+    const srow = await this.db.getStream(stream);
     if (!srow || this.db.isDeleted(srow)) {
-      this.db.deleteStreamTouchState(stream);
+      await this.db.deleteStreamTouchState(stream);
       return;
     }
 
@@ -389,13 +394,13 @@ export class TouchProcessorManager {
     if (Result.isError(profileRes)) {
       // eslint-disable-next-line no-console
       console.error("touch profile read failed", stream, profileRes.error.message);
-      this.db.deleteStreamTouchState(stream);
+      await this.db.deleteStreamTouchState(stream);
       return;
     }
     const profile = profileRes.value;
     const enabledTouch = resolveEnabledTouchCapability(profile);
     if (!enabledTouch) {
-      this.db.deleteStreamTouchState(stream);
+      await this.db.deleteStreamTouchState(stream);
       return;
     }
     const touchCfg = enabledTouch.touchCfg;
@@ -456,7 +461,7 @@ export class TouchProcessorManager {
     const touchMode: "idle" | "fine" | "restricted" | "coarseOnly" = !hasAnyWaiters ? "idle" : emitFineTouches ? (suppressFineDueToLag ? "restricted" : "fine") : "coarseOnly";
     this.touchModeByStream.set(stream, touchMode);
 
-    const processRes = await this.pool.processResult({
+    const processRequest = {
       stream,
       fromOffset,
       toOffset,
@@ -469,7 +474,10 @@ export class TouchProcessorManager {
       processingMode,
       filterHotTemplates: !!(hotFine && hotFine.templateFilteringEnabled),
       hotTemplateIds: hotFine?.hotTemplateIdsForWorker ?? null,
-    });
+    };
+    const processRes: Result<Awaited<ReturnType<TouchProcessorWorkerPool["process"]>>, { message: string }> = this.useWorkers
+      ? await this.pool.processResult(processRequest)
+      : await processTouchBatch({ db: this.db, ...processRequest });
     if (Result.isError(processRes)) {
       failProcessing(processRes.error.message);
       return;
@@ -622,12 +630,12 @@ export class TouchProcessorManager {
     totals.fineTouchesSkippedColdKeyTotal += fineSkippedColdKey;
     totals.fineTouchesSkippedTemplateBucketTotal += fineSkippedTemplateBucket;
 
-    this.db.updateStreamTouchStateThrough(stream, res.processedThrough);
+    await this.db.updateStreamTouchStateThrough(stream, res.processedThrough);
     if (res.processedThrough < toOffset) this.dirty.add(stream);
     this.failures.recordSuccess(stream);
   }
 
-  private maybeGcBaseWal(stream: string, uploadedThrough: bigint, processedThrough: bigint): void {
+  private async maybeGcBaseWal(stream: string, uploadedThrough: bigint, processedThrough: bigint): Promise<void> {
     const gcTargetThrough = processedThrough < uploadedThrough ? processedThrough : uploadedThrough;
     if (gcTargetThrough < 0n) return;
 
@@ -647,7 +655,7 @@ export class TouchProcessorManager {
 
     try {
       const start = Date.now();
-      const res = this.db.deleteWalThrough(stream, gcThrough);
+      const res = await this.db.deleteWalThrough(stream, gcThrough);
       const durationMs = Date.now() - start;
       if (res.deletedRows > 0 || res.deletedBytes > 0) {
         this.liveMetrics.recordBaseWalGc(stream, { deletedRows: res.deletedRows, deletedBytes: res.deletedBytes, durationMs });
@@ -666,13 +674,13 @@ export class TouchProcessorManager {
     // after bootstraps and restarts without requiring a no-op config update.
     try {
       for (const kind of listTouchCapableProfileKinds()) {
-        const streams = this.db.listStreamsByProfile(kind);
+        const streams = await this.db.listStreamsByProfile(kind);
         for (const stream of streams) {
           const profileRes = await this.profiles.getProfileResult(stream);
           if (Result.isError(profileRes)) continue;
           const touchCapability = resolveTouchCapability(profileRes.value);
           if (!touchCapability) continue;
-          touchCapability.syncState({ db: this.db, stream, profile: profileRes.value });
+          await touchCapability.syncState({ db: this.db, stream, profile: profileRes.value });
         }
       }
     } catch {
@@ -691,14 +699,14 @@ export class TouchProcessorManager {
     return this.seedPromise;
   }
 
-  activateTemplates(args: {
+  async activateTemplates(args: {
     stream: string;
     touchCfg: TouchConfig;
     baseStreamNextOffset: bigint;
     activeFromTouchOffset: string;
     templates: TemplateDecl[];
     inactivityTtlMs: number;
-  }): { activated: Array<{ templateId: string; state: "active"; activeFromTouchOffset: string }>; denied: Array<{ templateId: string; reason: string }> } {
+  }): Promise<{ activated: Array<{ templateId: string; state: "active"; activeFromTouchOffset: string }>; denied: Array<{ templateId: string; reason: string }> }> {
     const nowMs = Date.now();
     const limits = {
       maxActiveTemplatesPerStream: args.touchCfg.templates?.maxActiveTemplatesPerStream ?? 2048,
@@ -706,7 +714,7 @@ export class TouchProcessorManager {
       activationRateLimitPerMinute: args.touchCfg.templates?.activationRateLimitPerMinute ?? 100,
     };
 
-    const res = this.templates.activate({
+    const res = await this.templates.activate({
       stream: args.stream,
       activeFromTouchOffset: args.activeFromTouchOffset,
       baseStreamNextOffset: args.baseStreamNextOffset,
@@ -723,11 +731,11 @@ export class TouchProcessorManager {
     return { activated: res.activated, denied: res.denied };
   }
 
-  heartbeatTemplates(args: { stream: string; touchCfg: TouchConfig; templateIdsUsed: string[] }): void {
+  async heartbeatTemplates(args: { stream: string; touchCfg: TouchConfig; templateIdsUsed: string[] }): Promise<void> {
     const nowMs = Date.now();
     this.templates.heartbeat(args.stream, args.templateIdsUsed, nowMs);
     const persistInterval = args.touchCfg.templates?.lastSeenPersistIntervalMs ?? 5 * 60 * 1000;
-    this.templates.flushLastSeen(nowMs, persistInterval);
+    await this.templates.flushLastSeen(nowMs, persistInterval);
   }
 
   beginHotWaitInterest(args: {
@@ -878,7 +886,7 @@ export class TouchProcessorManager {
     else totals.waitStaleTotal += 1;
   }
 
-  resolveTemplateEntitiesForWait(args: { stream: string; templateIdsUsed: string[] }): string[] {
+  async resolveTemplateEntitiesForWait(args: { stream: string; templateIdsUsed: string[] }): Promise<string[]> {
     const ids = Array.from(
       new Set(args.templateIdsUsed.map((x) => String(x).trim()).filter((x) => /^[0-9a-f]{16}$/.test(x)))
     );

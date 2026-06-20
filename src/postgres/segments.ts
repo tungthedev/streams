@@ -13,7 +13,7 @@ import type {
   ManifestStore,
 } from "../store/segment_manifest_store";
 import type { WalReadRow } from "../store/wal_store";
-import { STREAM_FLAG_DELETED } from "../store/rows";
+import { STREAM_FLAG_DELETED, STREAM_FLAG_TOUCH } from "../store/rows";
 import { readU64LE } from "../util/endian";
 import { dsError } from "../util/ds_error";
 import type { PgExecutor, PgStreamRow } from "./types";
@@ -124,9 +124,10 @@ export class PostgresSegmentManifestStore implements SegmentReadStore, SegmentSt
            AND (pending_bytes >= $2 OR pending_rows >= $3)
          ORDER BY pending_bytes DESC
          LIMIT $5;`;
+    const excludedFlags = STREAM_FLAG_DELETED | STREAM_FLAG_TOUCH;
     const params = includeInterval
-      ? [STREAM_FLAG_DELETED, pgInt(minPendingBytes), pgInt(minPendingRows), pgInt(now), pgInt(maxIntervalMs), pgInt(now - BigInt(SEGMENT_CLAIM_LEASE_MS)), limit]
-      : [STREAM_FLAG_DELETED, pgInt(minPendingBytes), pgInt(minPendingRows), pgInt(now - BigInt(SEGMENT_CLAIM_LEASE_MS)), limit];
+      ? [excludedFlags, pgInt(minPendingBytes), pgInt(minPendingRows), pgInt(now), pgInt(maxIntervalMs), pgInt(now - BigInt(SEGMENT_CLAIM_LEASE_MS)), limit]
+      : [excludedFlags, pgInt(minPendingBytes), pgInt(minPendingRows), pgInt(now - BigInt(SEGMENT_CLAIM_LEASE_MS)), limit];
     const res = await this.pool.query(sql, params);
     return res.rows.map((row) => ({
       stream: String(row.stream),
@@ -421,7 +422,17 @@ export class PostgresSegmentManifestStore implements SegmentReadStore, SegmentSt
         pgInt(this.currentTimeMs()),
         stream,
       ]);
-      if (uploadedThrough >= 0n) await this.deleteWalThrough(client, stream, uploadedThrough);
+      let gcThrough = uploadedThrough;
+      const touchState = await client.query<{ processed_through: string | number | bigint }>(
+        `SELECT processed_through FROM stream_touch_state WHERE stream = $1;`,
+        [stream]
+      );
+      const processedThrough = touchState.rows[0]?.processed_through;
+      if (processedThrough != null) {
+        const touchThrough = toBigInt(processedThrough);
+        gcThrough = touchThrough < gcThrough ? touchThrough : gcThrough;
+      }
+      if (gcThrough >= 0n) await this.deleteWalThrough(client, stream, gcThrough);
       await client.query("COMMIT");
     } catch (error) {
       await client.query("ROLLBACK").catch(() => {});

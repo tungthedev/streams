@@ -1,4 +1,4 @@
-import type { LiveTemplateStore, LiveTemplateStoreRow } from "../store/touch_store";
+import type { LiveTemplateActivationInput, LiveTemplateStore } from "../store/touch_store";
 import { canonicalizeTemplateFields, templateIdFor, type TemplateEncoding } from "./live_keys";
 
 export type TemplateFieldSpec = { name: string; encoding: TemplateEncoding };
@@ -13,21 +13,6 @@ export type ActivatedTemplate = {
 export type DeniedTemplate = {
   templateId: string;
   reason: "rate_limited" | "invalid";
-};
-
-export type LiveTemplateRow = {
-  stream: string;
-  template_id: string;
-  entity: string;
-  fields_json: string;
-  encodings_json: string;
-  state: string;
-  created_at_ms: bigint;
-  last_seen_at_ms: bigint;
-  inactivity_ttl_ms: bigint;
-  active_from_source_offset: bigint;
-  retired_at_ms: bigint | null;
-  retired_reason: string | null;
 };
 
 export type TemplateLifecycleEvent =
@@ -76,23 +61,6 @@ function nowIso(ms: number): string {
   return new Date(ms).toISOString();
 }
 
-function parseTemplateRow(row: LiveTemplateStoreRow): LiveTemplateRow {
-  return {
-    stream: String(row.stream),
-    template_id: String(row.template_id),
-    entity: String(row.entity),
-    fields_json: String(row.fields_json),
-    encodings_json: String(row.encodings_json),
-    state: String(row.state),
-    created_at_ms: row.created_at_ms,
-    last_seen_at_ms: row.last_seen_at_ms,
-    inactivity_ttl_ms: row.inactivity_ttl_ms,
-    active_from_source_offset: row.active_from_source_offset,
-    retired_at_ms: row.retired_at_ms,
-    retired_reason: row.retired_reason == null ? null : String(row.retired_reason),
-  };
-}
-
 export class LiveTemplateRegistry {
   private readonly db: LiveTemplateStore;
 
@@ -101,6 +69,7 @@ export class LiveTemplateRegistry {
   private readonly dirtyLastSeen = new Set<string>();
 
   private readonly rate = new Map<string, RateState>();
+  private readonly activationLocks = new Map<string, Promise<void>>();
 
   constructor(db: LiveTemplateStore) {
     this.db = db;
@@ -118,33 +87,54 @@ export class LiveTemplateRegistry {
     };
   }
 
-  private allowActivation(stream: string, nowMs: number, limitPerMinute: number): boolean {
-    if (limitPerMinute <= 0) return true;
+  private availableActivationTokens(stream: string, nowMs: number, limitPerMinute: number): number {
+    if (limitPerMinute <= 0) return Number.MAX_SAFE_INTEGER;
     const ratePerMs = limitPerMinute / 60_000;
     const st = this.rate.get(stream) ?? { tokens: limitPerMinute, lastRefillMs: nowMs };
     const elapsed = Math.max(0, nowMs - st.lastRefillMs);
     st.tokens = Math.min(limitPerMinute, st.tokens + elapsed * ratePerMs);
     st.lastRefillMs = nowMs;
-    if (st.tokens < 1) {
-      this.rate.set(stream, st);
-      return false;
-    }
-    st.tokens -= 1;
     this.rate.set(stream, st);
-    return true;
+    return Math.max(0, Math.floor(st.tokens));
   }
 
-  getActiveTemplateCount(stream: string): number {
+  private consumeActivationTokens(stream: string, nowMs: number, limitPerMinute: number, count: number): void {
+    if (limitPerMinute <= 0 || count <= 0) return;
+    this.availableActivationTokens(stream, nowMs, limitPerMinute);
+    const st = this.rate.get(stream);
+    if (!st) return;
+    st.tokens = Math.max(0, st.tokens - count);
+    this.rate.set(stream, st);
+  }
+
+  private async withActivationLock<T>(stream: string, fn: () => Promise<T>): Promise<T> {
+    const previous = this.activationLocks.get(stream) ?? Promise.resolve();
+    let release!: () => void;
+    const current = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const chained = previous.then(() => current, () => current);
+    this.activationLocks.set(stream, chained);
+    await previous.catch(() => {});
     try {
-      return this.db.countActiveLiveTemplates(stream);
+      return await fn();
+    } finally {
+      release();
+      if (this.activationLocks.get(stream) === chained) this.activationLocks.delete(stream);
+    }
+  }
+
+  async getActiveTemplateCount(stream: string): Promise<number> {
+    try {
+      return await this.db.countActiveLiveTemplates(stream);
     } catch {
       return 0;
     }
   }
 
-  listActiveTemplates(stream: string): Array<{ templateId: string; entity: string; fields: string[]; encodings: TemplateEncoding[]; lastSeenAtMs: number }> {
+  async listActiveTemplates(stream: string): Promise<Array<{ templateId: string; entity: string; fields: string[]; encodings: TemplateEncoding[]; lastSeenAtMs: number }>> {
     try {
-      const rows = this.db.listActiveLiveTemplates(stream);
+      const rows = await this.db.listActiveLiveTemplates(stream);
       const out: Array<{ templateId: string; entity: string; fields: string[]; encodings: TemplateEncoding[]; lastSeenAtMs: number }> = [];
       for (const row of rows) {
         const templateId = row.template_id;
@@ -168,7 +158,7 @@ export class LiveTemplateRegistry {
    * not backfill fine touches for history when a template is activated while
    * touch processing is behind.
    */
-  activate(args: {
+  async activate(args: {
     stream: string;
     activeFromTouchOffset: string;
     baseStreamNextOffset: bigint;
@@ -180,7 +170,23 @@ export class LiveTemplateRegistry {
       activationRateLimitPerMinute: number;
     };
     nowMs: number;
-  }): { activated: ActivatedTemplate[]; denied: DeniedTemplate[]; lifecycle: TemplateLifecycleEvent[] } {
+  }): Promise<{ activated: ActivatedTemplate[]; denied: DeniedTemplate[]; lifecycle: TemplateLifecycleEvent[] }> {
+    return this.withActivationLock(args.stream, () => this.activateLocked(args));
+  }
+
+  private async activateLocked(args: {
+    stream: string;
+    activeFromTouchOffset: string;
+    baseStreamNextOffset: bigint;
+    templates: TemplateDecl[];
+    inactivityTtlMs: number;
+    limits: {
+      maxActiveTemplatesPerStream: number;
+      maxActiveTemplatesPerEntity: number;
+      activationRateLimitPerMinute: number;
+    };
+    nowMs: number;
+  }): Promise<{ activated: ActivatedTemplate[]; denied: DeniedTemplate[]; lifecycle: TemplateLifecycleEvent[] }> {
     const { stream, templates, inactivityTtlMs, nowMs } = args;
     const { maxActiveTemplatesPerStream, maxActiveTemplatesPerEntity, activationRateLimitPerMinute } = args.limits;
 
@@ -188,7 +194,8 @@ export class LiveTemplateRegistry {
     const denied: DeniedTemplate[] = [];
     const lifecycle: TemplateLifecycleEvent[] = [];
 
-    const protectedIds = new Set<string>();
+    const atomicInputs: LiveTemplateActivationInput[] = [];
+    const atomicLifecycleById = new Map<string, TemplateLifecycleEvent>();
 
     for (const t of templates) {
       const entity = typeof t?.entity === "string" ? t.entity.trim() : "";
@@ -231,68 +238,21 @@ export class LiveTemplateRegistry {
       const encodings = fields.map((f) => f.encoding);
 
       const templateId = templateIdFor(entity, fieldNames);
+      const fieldsJson = JSON.stringify(fieldNames);
+      const encodingsJson = JSON.stringify(encodings);
 
-      const existing = this.db.getLiveTemplate(stream, templateId);
+      if (atomicLifecycleById.has(templateId)) continue;
 
-      const alreadyActive = existing && String(existing.state) === "active";
-      const needsToken = !alreadyActive;
-
-      if (needsToken && !this.allowActivation(stream, nowMs, activationRateLimitPerMinute)) {
-        denied.push({ templateId, reason: "rate_limited" });
-        continue;
-      }
-
-      if (existing) {
-        const row = parseTemplateRow(existing);
-        if (row.entity !== entity) {
-          denied.push({ templateId, reason: "invalid" });
-          continue;
-        }
-        let storedFields: any;
-        let storedEnc: any;
-        try {
-          storedFields = JSON.parse(row.fields_json);
-          storedEnc = JSON.parse(row.encodings_json);
-        } catch {
-          denied.push({ templateId, reason: "invalid" });
-          continue;
-        }
-        if (!Array.isArray(storedFields) || !Array.isArray(storedEnc) || storedFields.length !== storedEnc.length) {
-          denied.push({ templateId, reason: "invalid" });
-          continue;
-        }
-        const sf = storedFields.map(String);
-        const se = storedEnc.map(String);
-        if (sf.join("\0") !== fieldNames.join("\0")) {
-          denied.push({ templateId, reason: "invalid" });
-          continue;
-        }
-        if (se.join("\0") !== encodings.join("\0")) {
-          denied.push({ templateId, reason: "invalid" });
-          continue;
-        }
-
-        if (row.state === "active") {
-          this.db.updateLiveTemplateHeartbeat(stream, templateId, nowMs, inactivityTtlMs);
-        } else {
-          this.db.reactivateLiveTemplate(stream, templateId, nowMs, inactivityTtlMs, args.baseStreamNextOffset);
-        }
-      } else {
-        this.db.insertLiveTemplate({
-          stream,
-          templateId,
-          entity,
-          fieldsJson: JSON.stringify(fieldNames),
-          encodingsJson: JSON.stringify(encodings),
-          nowMs,
-          inactivityTtlMs,
-          activeFromSourceOffset: args.baseStreamNextOffset,
-        });
-      }
-
-      protectedIds.add(templateId);
-      activated.push({ templateId, state: "active", activeFromTouchOffset: args.activeFromTouchOffset });
-      lifecycle.push({
+      atomicInputs.push({
+        templateId,
+        entity,
+        fieldsJson,
+        encodingsJson,
+        nowMs,
+        inactivityTtlMs,
+        activeFromSourceOffset: args.baseStreamNextOffset,
+      });
+      atomicLifecycleById.set(templateId, {
         type: "live.template_activated",
         ts: nowIso(nowMs),
         stream,
@@ -304,13 +264,47 @@ export class LiveTemplateRegistry {
         activeFromTouchOffset: args.activeFromTouchOffset,
         inactivityTtlMs,
       });
-      this.markSeen(stream, templateId, nowMs);
     }
 
-    // Enforce caps with LRU eviction.
-    const evicted = this.evictToCaps(stream, nowMs, { maxActiveTemplatesPerStream, maxActiveTemplatesPerEntity }, protectedIds);
-    for (const e of evicted) lifecycle.push(e);
+    if (atomicInputs.length === 0) return { activated, denied, lifecycle };
 
+    const atomicRes = await this.db.activateLiveTemplates({
+      stream,
+      templates: atomicInputs,
+      maxActiveTemplatesPerStream,
+      maxActiveTemplatesPerEntity,
+      maxActivationTokens: this.availableActivationTokens(stream, nowMs, activationRateLimitPerMinute),
+    });
+    const invalidIds = new Set(atomicRes.invalid);
+    const rateLimitedIds = new Set(atomicRes.rateLimited);
+    for (const input of atomicInputs) {
+      if (invalidIds.has(input.templateId)) {
+        denied.push({ templateId: input.templateId, reason: "invalid" });
+        continue;
+      }
+      if (rateLimitedIds.has(input.templateId)) {
+        denied.push({ templateId: input.templateId, reason: "rate_limited" });
+        continue;
+      }
+      if (!atomicRes.activated.includes(input.templateId)) continue;
+      activated.push({ templateId: input.templateId, state: "active", activeFromTouchOffset: args.activeFromTouchOffset });
+      const event = atomicLifecycleById.get(input.templateId);
+      if (event) lifecycle.push(event);
+      this.markSeen(stream, input.templateId, nowMs);
+    }
+    this.consumeActivationTokens(stream, nowMs, activationRateLimitPerMinute, atomicRes.activationTokensUsed);
+    for (const evicted of atomicRes.evicted) {
+      lifecycle.push({
+        type: "live.template_evicted",
+        ts: nowIso(nowMs),
+        stream,
+        templateId: evicted.templateId,
+        reason: evicted.reason,
+        cap: evicted.cap,
+      });
+      this.lastSeenMem.delete(this.key(stream, evicted.templateId));
+      this.dirtyLastSeen.delete(this.key(stream, evicted.templateId));
+    }
     return { activated, denied, lifecycle };
   }
 
@@ -322,7 +316,7 @@ export class LiveTemplateRegistry {
     }
   }
 
-  flushLastSeen(nowMs: number, persistIntervalMs: number): void {
+  async flushLastSeen(nowMs: number, persistIntervalMs: number): Promise<void> {
     if (this.dirtyLastSeen.size === 0) return;
 
     const updates: Array<{ key: string; item: { lastSeenMs: number; lastPersistMs: number }; stream: string; templateId: string }> = [];
@@ -338,7 +332,7 @@ export class LiveTemplateRegistry {
     }
     if (updates.length === 0) return;
 
-    this.db.updateLiveTemplateLastSeenBatch(
+    await this.db.updateLiveTemplateLastSeenBatch(
       updates.map((update) => ({
         stream: update.stream,
         templateId: update.templateId,
@@ -351,10 +345,10 @@ export class LiveTemplateRegistry {
     }
   }
 
-  gcRetireExpired(stream: string, nowMs: number): { retired: TemplateLifecycleEvent[] } {
+  async gcRetireExpired(stream: string, nowMs: number): Promise<{ retired: TemplateLifecycleEvent[] }> {
     const expired: any[] = [];
     try {
-      const rows = this.db.listExpiredLiveTemplates(stream, nowMs, 1000);
+      const rows = await this.db.listExpiredLiveTemplates(stream, nowMs, 1000);
       expired.push(...rows);
     } catch {
       return { retired: [] };
@@ -386,7 +380,7 @@ export class LiveTemplateRegistry {
     }
 
     if (refreshes.length > 0) {
-      this.db.updateLiveTemplateLastSeenBatch(
+      await this.db.updateLiveTemplateLastSeenBatch(
         refreshes.map((refresh) => ({
           stream: refresh.stream,
           templateId: refresh.templateId,
@@ -436,7 +430,7 @@ export class LiveTemplateRegistry {
       });
     }
 
-    this.db.retireLiveTemplatesForInactivity(stream, retiredIds, nowMs);
+    await this.db.retireLiveTemplatesForInactivity(stream, retiredIds, nowMs);
     for (const templateId of retiredIds) {
       this.lastSeenMem.delete(this.key(stream, templateId));
       this.dirtyLastSeen.delete(this.key(stream, templateId));
@@ -451,101 +445,5 @@ export class LiveTemplateRegistry {
     if (nowMs > item.lastSeenMs) item.lastSeenMs = nowMs;
     this.lastSeenMem.set(k, item);
     this.dirtyLastSeen.add(k);
-  }
-
-  private evictToCaps(
-    stream: string,
-    nowMs: number,
-    caps: { maxActiveTemplatesPerStream: number; maxActiveTemplatesPerEntity: number },
-    protectedIds: Set<string>
-  ): TemplateLifecycleEvent[] {
-    const out: TemplateLifecycleEvent[] = [];
-    const { maxActiveTemplatesPerStream, maxActiveTemplatesPerEntity } = caps;
-
-    // Per-entity cap.
-    let entities: Array<{ entity: string; cnt: number }> = [];
-    try {
-      entities = this.db.listActiveLiveTemplateEntityCounts(stream).map((row) => ({ entity: row.entity, cnt: row.count }));
-    } catch {
-      // ignore
-    }
-
-    for (const e of entities) {
-      if (e.cnt <= maxActiveTemplatesPerEntity) continue;
-      const extra = e.cnt - maxActiveTemplatesPerEntity;
-      const evicted = this.evictLru(stream, nowMs, extra, { entity: e.entity, cap: maxActiveTemplatesPerEntity }, protectedIds);
-      out.push(...evicted);
-    }
-
-    // Per-stream cap.
-    let activeCount = 0;
-    try {
-      activeCount = this.db.countActiveLiveTemplates(stream);
-    } catch {
-      activeCount = 0;
-    }
-    if (activeCount > maxActiveTemplatesPerStream) {
-      const extra = activeCount - maxActiveTemplatesPerStream;
-      const evicted = this.evictLru(stream, nowMs, extra, { cap: maxActiveTemplatesPerStream }, protectedIds);
-      out.push(...evicted);
-    }
-
-    return out;
-  }
-
-  private evictLru(
-    stream: string,
-    nowMs: number,
-    count: number,
-    scope: { entity?: string; cap: number },
-    protectedIds: Set<string>
-  ): TemplateLifecycleEvent[] {
-    if (count <= 0) return [];
-    const out: TemplateLifecycleEvent[] = [];
-
-    const pick = (excludeProtected: boolean): string[] => {
-      try {
-        return this.db.listLiveTemplateLruIds({
-          stream,
-          entity: scope.entity,
-          excludeTemplateIds: excludeProtected ? Array.from(protectedIds) : [],
-          limit: count,
-        });
-      } catch {
-        return [];
-      }
-    };
-
-    let ids = pick(true);
-    if (ids.length < count) {
-      // Evict protected templates only if we have to.
-      const extra = pick(false);
-      const merged: string[] = [];
-      const seen = new Set<string>();
-      for (const id of [...ids, ...extra]) {
-        if (seen.has(id)) continue;
-        seen.add(id);
-        merged.push(id);
-        if (merged.length >= count) break;
-      }
-      ids = merged;
-    }
-    if (ids.length === 0) return [];
-
-    this.db.retireLiveTemplatesForCap(stream, ids, nowMs);
-    for (const id of ids) {
-      out.push({
-        type: "live.template_evicted",
-        ts: nowIso(nowMs),
-        stream,
-        templateId: id,
-        reason: "cap_exceeded",
-        cap: scope.cap,
-      });
-      this.lastSeenMem.delete(this.key(stream, id));
-      this.dirtyLastSeen.delete(this.key(stream, id));
-    }
-
-    return out;
   }
 }

@@ -10,6 +10,7 @@ import { manifestObjectKey, streamHash16Hex } from "../src/util/stream_paths";
 import { PostgresDurableStore } from "../src/postgres/store";
 import { Segmenter } from "../src/segment/segmenter";
 import { Result } from "better-result";
+import { STREAM_FLAG_TOUCH } from "../src/store/rows";
 
 const POSTGRES_URL = process.env.DS_TEST_POSTGRES_URL;
 const maybeDescribe = POSTGRES_URL ? describe : describe.skip;
@@ -47,6 +48,36 @@ async function waitFor(predicate: () => Promise<boolean>, label: string, timeout
 }
 
 maybeDescribe("postgres full-mode segment and manifest store", () => {
+  test("segment candidates exclude touch-flagged streams", async () => {
+    await withPostgresSchema(async ({ connectionString }) => {
+      const store = await PostgresDurableStore.connectFull(connectionString);
+      const segmentStore = store.fullModeSegments();
+      try {
+        await store.ensureStream("touch_metrics", { contentType: "application/json", streamFlags: STREAM_FLAG_TOUCH });
+        await store.appendBatch([
+          {
+            stream: "touch_metrics",
+            baseAppendMs: store.nowMs(),
+            rows: ["a", "b", "c"].map((value) => ({
+              routingKey: null,
+              contentType: "application/json",
+              payload: new TextEncoder().encode(JSON.stringify({ value })),
+            })),
+            contentType: "application/json",
+            streamSeq: null,
+            producer: null,
+            close: false,
+          },
+        ]);
+
+        const candidates = await segmentStore.candidates(1n, 1n, 0n, 10);
+        expect(candidates.map((candidate) => candidate.stream)).not.toContain("touch_metrics");
+      } finally {
+        await store.close();
+      }
+    });
+  });
+
   test("segment claims are token-fenced and stale claims can be reclaimed", async () => {
     await withPostgresSchema(async ({ connectionString }) => {
       const store = await PostgresDurableStore.connectFull(connectionString);

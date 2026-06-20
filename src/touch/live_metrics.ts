@@ -271,11 +271,7 @@ export class LiveMetricsV2 {
     }, this.snapshotIntervalMs);
     // Retention trims are best-effort; 60s granularity is fine.
     this.retentionTimer = setInterval(() => {
-      try {
-        this.db.trimWalByAge(this.metricsStream, this.retentionMs);
-      } catch {
-        // ignore
-      }
+      void Promise.resolve(this.db.trimWalByAge(this.metricsStream, this.retentionMs)).catch(() => {});
     }, 60_000);
 
     // Track event-loop lag at a tighter cadence than the tick interval to
@@ -308,22 +304,22 @@ export class LiveMetricsV2 {
     this.lagTimer = null;
   }
 
-  ensureStreamResult(): Result<void, EnsureLiveMetricsStreamError> {
+  async ensureStreamResult(): Promise<Result<void, EnsureLiveMetricsStreamError>> {
     if (!this.enabled) return Result.ok(undefined);
-    const existing = this.db.getStream(this.metricsStream);
+    const existing = await this.db.getStream(this.metricsStream);
     if (existing) {
       if (String(existing.content_type) !== "application/json") {
         return Result.err({
           kind: "live_metrics_stream_content_type_mismatch",
           message: `live metrics stream content-type mismatch: ${existing.content_type}`,
-        });
+      });
       }
-      if ((existing.stream_flags & STREAM_FLAG_TOUCH) === 0) this.db.addStreamFlags(this.metricsStream, STREAM_FLAG_TOUCH);
+      if ((existing.stream_flags & STREAM_FLAG_TOUCH) === 0) await this.db.addStreamFlags(this.metricsStream, STREAM_FLAG_TOUCH);
       return Result.ok(undefined);
     }
     // Treat live.metrics as WAL-only (like touch streams) so age-based retention
     // is enforceable without segment/object-store GC.
-    this.db.ensureStream(this.metricsStream, { contentType: "application/json", streamFlags: STREAM_FLAG_TOUCH });
+    await this.db.ensureStream(this.metricsStream, { contentType: "application/json", streamFlags: STREAM_FLAG_TOUCH });
     return Result.ok(undefined);
   }
 
@@ -508,7 +504,7 @@ export class LiveMetricsV2 {
       return v > max ? Number.MAX_SAFE_INTEGER : Number(v);
     };
 
-    const states = this.db.listStreamTouchStates();
+    const states = await this.db.listStreamTouchStates();
     if (states.length === 0) return;
 
     const rows: Array<{ routingKey: Uint8Array | null; contentType: string; payload: Uint8Array }> = [];
@@ -522,7 +518,7 @@ export class LiveMetricsV2 {
 
     for (const st of states) {
       const stream = st.stream;
-      const regRow = this.db.getStream(stream);
+      const regRow = await this.db.getStream(stream);
       if (!regRow) continue;
 
       const profileRes = await this.profiles.getProfileResult(stream, regRow);
@@ -539,18 +535,17 @@ export class LiveMetricsV2 {
       const backlogNum = backlog > BigInt(Number.MAX_SAFE_INTEGER) ? Number.MAX_SAFE_INTEGER : Number(backlog);
       let walOldestOffset: string | null = null;
       try {
-        const oldest = this.db.getWalOldestOffset(stream);
+        const oldest = await this.db.getWalOldestOffset(stream);
         walOldestOffset = oldest == null ? null : encodeOffset(regRow.epoch, oldest);
       } catch {
         walOldestOffset = null;
       }
-      const activeTemplates = (() => {
-        try {
-          return this.db.countActiveLiveTemplates(stream);
-        } catch {
-          return 0;
-        }
-      })();
+      let activeTemplates = 0;
+      try {
+        activeTemplates = await this.db.countActiveLiveTemplates(stream);
+      } catch {
+        activeTemplates = 0;
+      }
 
       const tick = {
         type: "live.tick",
@@ -738,16 +733,16 @@ export class LiveMetricsV2 {
   private async emitSnapshots(): Promise<void> {
     if (!this.enabled) return;
     const nowMs = Date.now();
-    const streams = this.db.listStreamTouchStates().map((r) => r.stream);
+    const streams = (await this.db.listStreamTouchStates()).map((r) => r.stream);
     if (streams.length === 0) return;
 
     const encoder = new TextEncoder();
     const rows: Array<{ routingKey: Uint8Array | null; contentType: string; payload: Uint8Array }> = [];
 
     for (const stream of streams) {
-      let templates: ReturnType<TouchProcessorStore["listActiveLiveTemplates"]> = [];
+      let templates: Awaited<ReturnType<TouchProcessorStore["listActiveLiveTemplates"]>> = [];
       try {
-        templates = this.db.listActiveLiveTemplates(stream);
+        templates = await this.db.listActiveLiveTemplates(stream);
       } catch {
         continue;
       }

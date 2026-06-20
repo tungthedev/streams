@@ -22,6 +22,7 @@ export async function migratePostgresStore(pool: Pool, opts: PostgresMigrationOp
     if (opts.fullMode) {
       await installFullModeSegmentSchema(client);
       await installFullModeIndexSchema(client);
+      await installFullModeTouchSchema(client);
     }
     await setPostgresSchemaVersion(client, POSTGRES_SCHEMA_VERSION);
     await client.query("COMMIT");
@@ -297,4 +298,39 @@ async function installFullModeIndexSchema(executor: PgSchemaExecutor): Promise<v
   await executor.query(`CREATE INDEX IF NOT EXISTS lexicon_index_runs_active_idx ON lexicon_index_runs(stream, source_kind, source_name, retired_gen, level, start_segment);`);
   await executor.query(`CREATE INDEX IF NOT EXISTS lexicon_index_runs_retired_idx ON lexicon_index_runs(stream, source_kind, source_name, retired_gen, retired_at_ms);`);
   await executor.query(`CREATE INDEX IF NOT EXISTS search_segment_companions_plan_idx ON search_segment_companions(stream, plan_generation, segment_index);`);
+}
+
+async function installFullModeTouchSchema(executor: PgSchemaExecutor): Promise<void> {
+  await executor.query(`
+    CREATE TABLE IF NOT EXISTS stream_touch_state (
+      stream text PRIMARY KEY REFERENCES streams(stream) ON DELETE CASCADE,
+      processed_through bigint NOT NULL,
+      updated_at_ms bigint NOT NULL
+    );
+  `);
+  await executor.query(`
+    CREATE TABLE IF NOT EXISTS live_templates (
+      stream text NOT NULL REFERENCES streams(stream) ON DELETE CASCADE,
+      template_id text NOT NULL,
+      entity text NOT NULL,
+      fields_json text NOT NULL,
+      encodings_json text NOT NULL,
+      state text NOT NULL,
+      created_at_ms bigint NOT NULL,
+      last_seen_at_ms bigint NOT NULL,
+      inactivity_ttl_ms bigint NOT NULL,
+      active_from_source_offset bigint NOT NULL,
+      retired_at_ms bigint NULL,
+      retired_reason text NULL,
+      PRIMARY KEY(stream, template_id)
+    );
+  `);
+  await executor.query(`
+    CREATE INDEX IF NOT EXISTS live_templates_stream_entity_state_last_seen_idx
+      ON live_templates(stream, entity, state, last_seen_at_ms);
+  `);
+  await executor.query(`
+    CREATE INDEX IF NOT EXISTS live_templates_stream_state_last_seen_idx
+      ON live_templates(stream, state, last_seen_at_ms);
+  `);
 }

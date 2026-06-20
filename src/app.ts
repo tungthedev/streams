@@ -431,6 +431,8 @@ export function createPostgresApp(cfg: Config, store: PostgresDurableStore, opts
 export function createPostgresFullApp(cfg: Config, store: PostgresDurableStore, os: ObjectStore, opts: CreateAppOptions = {}): App {
   return createAppCore(cfg, {
     store,
+    touchStore: store.fullModeTouch(),
+    touchUseWorkers: false,
     detailsStore: store.fullModeDetails(),
     stats: opts.stats,
     createRuntime: ({ config, registry, notifier, stats, backpressure, metrics, memorySampler, memory, asyncIndexGate, foregroundActivity }) => {

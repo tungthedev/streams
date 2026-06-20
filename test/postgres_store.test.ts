@@ -174,7 +174,7 @@ maybeDescribe("postgres durable store", () => {
     });
   });
 
-  test("full-mode migration installs segment, manifest, and index capability tables", async () => {
+  test("full-mode migration installs segment, manifest, index, and touch capability tables", async () => {
     await withPostgresSchema(async ({ schema, connectionString }) => {
       const store = await PostgresDurableStore.connectFull(connectionString);
       try {
@@ -182,7 +182,9 @@ maybeDescribe("postgres durable store", () => {
         expect(store.capabilities.manifests).toBe(true);
         expect(store.capabilities.schemaPublication).toBe(true);
         expect(store.capabilities.indexes).toBe(true);
-        expect(store.capabilities.touch).toBe(false);
+        expect(store.capabilities.builtinProfiles).toBe(true);
+        expect(store.capabilities.internalMetrics).toBe(true);
+        expect(store.capabilities.touch).toBe(true);
         expect(store.capabilities.storageStats).toBe(false);
 
         const inspectPool = new Pool({ connectionString });
@@ -199,6 +201,7 @@ maybeDescribe("postgres durable store", () => {
             "index_state",
             "lexicon_index_runs",
             "lexicon_index_state",
+            "live_templates",
             "manifests",
             "producer_state",
             "schema_version",
@@ -210,6 +213,7 @@ maybeDescribe("postgres durable store", () => {
             "segments",
             "stream_profiles",
             "stream_segment_meta",
+            "stream_touch_state",
             "streams",
             "wal",
           ]);

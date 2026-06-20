@@ -31,6 +31,7 @@ import { PostgresSecondaryIndexStore } from "./secondary_index";
 import { PostgresLexiconIndexStore } from "./lexicon_index";
 import { PostgresCompanionIndexStore } from "./companions";
 import { PostgresFullModeDetailsStore } from "./details";
+import { PostgresTouchStore } from "./touch";
 import type { PgExecutor, PgStreamRow } from "./types";
 
 const STREAM_FLAG_DELETED = 1 << 0;
@@ -65,6 +66,7 @@ export class PostgresDurableStore implements WalControlPlaneStore {
   private readonly segments?: PostgresSegmentManifestStore;
   private readonly indexStores?: PostgresFullModeIndexStores;
   private readonly details?: PostgresFullModeDetailsStore;
+  private readonly touch?: PostgresTouchStore;
 
   constructor(private readonly pool: Pool, private readonly opts: PostgresStoreOptions = {}) {
     this.capabilities = {
@@ -78,9 +80,9 @@ export class PostgresDurableStore implements WalControlPlaneStore {
       objectStoreAccounting: false,
       storageStats: false,
       schemaPublication: opts.fullMode === true,
-      builtinProfiles: false,
-      internalMetrics: false,
-      touch: false,
+      builtinProfiles: opts.fullMode === true,
+      internalMetrics: opts.fullMode === true,
+      touch: opts.fullMode === true,
     };
     if (opts.fullMode) {
       this.segments = new PostgresSegmentManifestStore(this.pool, () => this.nowMs(), (stream, startOffset, endOffset, routingKey) =>
@@ -97,6 +99,13 @@ export class PostgresDurableStore implements WalControlPlaneStore {
         companions: new PostgresCompanionIndexStore(this.pool, () => this.nowMs()),
       };
       this.details = new PostgresFullModeDetailsStore(this.pool);
+      this.touch = new PostgresTouchStore(this.pool, {
+        nowMs: () => this.nowMs(),
+        getStream: (stream) => this.getStream(stream),
+        ensureStream: (stream, ensureOpts) => this.ensureStream(stream, ensureOpts),
+        isDeleted: (row) => this.isDeleted(row),
+        readWalRange: (stream, startOffset, endOffset, routingKey) => this.readWalRange(stream, startOffset, endOffset, routingKey),
+      });
     }
   }
 
@@ -141,7 +150,7 @@ export class PostgresDurableStore implements WalControlPlaneStore {
   }
 
   async ensureStream(stream: string, opts?: EnsureStreamOptions | null): Promise<StreamReadRow> {
-    if (opts?.profile != null && opts.profile !== "generic") {
+    if (!this.opts.fullMode && opts?.profile != null && opts.profile !== "generic") {
       throw dsError("postgres storage supports generic profiles only", { code: "unsupported_capability" });
     }
     const now = this.nowMs();
@@ -153,7 +162,7 @@ export class PostgresDurableStore implements WalControlPlaneStore {
          pending_rows, pending_bytes, logical_size_bytes, wal_rows, wal_bytes, last_append_ms, last_segment_cut_ms, segment_in_progress,
          expires_at_ms, stream_flags
        )
-       VALUES($1, $2, $2, $3, $4, $5, $6, NULL, NULL, NULL, $7, 0, 0, -1, -1, 0, 0, 0, 0, 0, 0, $2, $2, 0, $8, 0)
+       VALUES($1, $2, $2, $3, $4, $5, $6, NULL, NULL, NULL, $7, 0, 0, -1, -1, 0, 0, 0, 0, 0, 0, $2, $2, 0, $8, $9)
        ON CONFLICT (stream) DO NOTHING
        RETURNING *;`
       : `INSERT INTO streams(
@@ -162,7 +171,7 @@ export class PostgresDurableStore implements WalControlPlaneStore {
          epoch, next_offset, logical_size_bytes, wal_rows, wal_bytes, last_append_ms,
          expires_at_ms, stream_flags
        )
-       VALUES($1, $2, $2, $3, $4, $5, $6, NULL, NULL, NULL, $7, 0, 0, 0, 0, 0, $2, $8, 0)
+       VALUES($1, $2, $2, $3, $4, $5, $6, NULL, NULL, NULL, $7, 0, 0, 0, 0, 0, $2, $8, $9)
        ON CONFLICT (stream) DO NOTHING
        RETURNING *;`;
     const row = await this.pool.query<PgStreamRow>(
@@ -176,6 +185,7 @@ export class PostgresDurableStore implements WalControlPlaneStore {
         opts?.closed ? 1 : 0,
         opts?.ttlSeconds ?? null,
         opts?.expiresAtMs == null ? null : pgInt(opts.expiresAtMs),
+        Math.max(0, Math.floor(opts?.streamFlags ?? 0)),
       ]
     );
     if (row.rows[0]) return coerceStreamRow(row.rows[0]);
@@ -299,6 +309,11 @@ export class PostgresDurableStore implements WalControlPlaneStore {
     return this.details;
   }
 
+  fullModeTouch(): PostgresTouchStore {
+    if (!this.touch) throw dsError("postgres full-mode touch store is not enabled", { code: "unsupported_capability" });
+    return this.touch;
+  }
+
   async getSchemaRegistryForRead(stream: string): Promise<SchemaRegistryRow | null> {
     return this.getSchemaRegistryWithExecutor(this.pool, stream);
   }
@@ -363,7 +378,7 @@ export class PostgresDurableStore implements WalControlPlaneStore {
         return mutationRes;
       }
       const metadata = mutationRes.value.metadata;
-      if ((metadata.streamProfile != null && metadata.streamProfile !== "generic") || metadata.profileJson != null) {
+      if (!this.opts.fullMode && ((metadata.streamProfile != null && metadata.streamProfile !== "generic") || metadata.profileJson != null)) {
         await client.query("ROLLBACK");
         return Result.err(unsupportedProfileError() as E);
       }
@@ -372,7 +387,18 @@ export class PostgresDurableStore implements WalControlPlaneStore {
         `UPDATE streams SET profile = $1, updated_at_ms = $2 WHERE stream = $3;`,
         [metadata.streamProfile, pgInt(updatedAtMs), stream]
       );
-      await client.query(`DELETE FROM stream_profiles WHERE stream = $1;`, [stream]);
+      if (metadata.profileJson == null) {
+        await client.query(`DELETE FROM stream_profiles WHERE stream = $1;`, [stream]);
+      } else {
+        await client.query(
+          `INSERT INTO stream_profiles(stream, profile_json, updated_at_ms)
+           VALUES($1, $2, $3)
+           ON CONFLICT(stream) DO UPDATE SET
+             profile_json = excluded.profile_json,
+             updated_at_ms = excluded.updated_at_ms;`,
+          [stream, metadata.profileJson, pgInt(updatedAtMs)]
+        );
+      }
       if (metadata.schemaRegistry) {
         await client.query(
           `INSERT INTO schemas(stream, schema_json, updated_at_ms)
@@ -382,6 +408,16 @@ export class PostgresDurableStore implements WalControlPlaneStore {
              updated_at_ms = excluded.updated_at_ms;`,
           [stream, JSON.stringify(metadata.schemaRegistry), pgInt(updatedAtMs)]
         );
+      }
+      if (metadata.touchState === "ensure" && streamRow) {
+        await client.query(
+          `INSERT INTO stream_touch_state(stream, processed_through, updated_at_ms)
+           VALUES($1, $2, $3)
+           ON CONFLICT(stream) DO NOTHING;`,
+          [stream, pgInt(streamRow.next_offset - 1n), pgInt(updatedAtMs)]
+        );
+      } else if (metadata.touchState === "delete") {
+        await client.query(`DELETE FROM stream_touch_state WHERE stream = $1;`, [stream]);
       }
       await client.query("COMMIT");
       return Result.ok({
@@ -806,6 +842,8 @@ export class PostgresDurableStore implements WalControlPlaneStore {
     await executor.query(`DELETE FROM lexicon_index_state WHERE stream = $1;`, [stream]);
     await executor.query(`DELETE FROM search_segment_companions WHERE stream = $1;`, [stream]);
     await executor.query(`DELETE FROM search_companion_plans WHERE stream = $1;`, [stream]);
+    await executor.query(`DELETE FROM live_templates WHERE stream = $1;`, [stream]);
+    await executor.query(`DELETE FROM stream_touch_state WHERE stream = $1;`, [stream]);
   }
 }
 

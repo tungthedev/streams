@@ -1116,6 +1116,16 @@ export class SqliteDurableStore
       }
       if (metadata.profileJson == null) this.stmts.deleteStreamProfile.run(stream);
       else this.stmts.upsertStreamProfile.run(stream, metadata.profileJson, updatedAtMs);
+      if (metadata.touchState === "ensure" && streamRow) {
+        this.db
+          .query(
+            `INSERT OR IGNORE INTO stream_touch_state(stream, processed_through, updated_at_ms)
+             VALUES(?, ?, ?);`
+          )
+          .run(stream, this.bindInt(streamRow.next_offset - 1n), updatedAtMs);
+      } else if (metadata.touchState === "delete") {
+        this.db.query(`DELETE FROM stream_touch_state WHERE stream=?;`).run(stream);
+      }
 
       return Result.ok({
         schemaRegistry: metadata.schemaRegistry,

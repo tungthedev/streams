@@ -450,6 +450,7 @@ export type CreateAppCoreOptions<TDebugStore extends AppDebugStore = AppDebugSto
   store: WalControlPlaneStore;
   debugStore?: TDebugStore;
   touchStore?: TouchProcessorStore;
+  touchUseWorkers?: boolean;
   storageStatsStore?: StorageStatsStore;
   objectStoreAccountingStore?: ObjectStoreAccountingStore;
   detailsStore?: FullModeDetailsStore;
@@ -583,8 +584,11 @@ export function createAppCore<TDebugStore extends AppDebugStore = AppDebugStore>
   const ingest = new IngestQueue(cfg, controlStore, stats, backpressure, metrics);
   const notifier = new StreamNotifier();
   const registry = new SchemaRegistryStore(controlStore);
-  const profiles = new StreamProfileStore(controlStore, { touchStore });
-  const touch = touchStore && controlStore.capabilities.touch ? new TouchProcessorManager(cfg, touchStore, ingest, notifier, profiles, backpressure) : undefined;
+  const profiles = new StreamProfileStore(controlStore, { touchEnabled: !!touchStore });
+  const touch =
+    touchStore && controlStore.capabilities.touch
+      ? new TouchProcessorManager(cfg, touchStore, ingest, notifier, profiles, backpressure, { useWorkers: opts.touchUseWorkers })
+      : undefined;
   const runtime = opts.createRuntime({
     config: cfg,
     controlStore,

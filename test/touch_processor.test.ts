@@ -359,6 +359,70 @@ describe("live touches (state protocol)", () => {
     }
   });
 
+  test("repeat activation of an active template does not consume rate-limit budget", async () => {
+    const root = mkdtempSync(join(tmpdir(), "ds-live-rate-repeat-"));
+    let app: ReturnType<typeof createApp> | null = null;
+    let server: any | null = null;
+    try {
+      app = createApp(makeConfig(root), new MockR2Store());
+      app.deps.segmenter.stop();
+      app.deps.uploader.stop();
+
+      server = Bun.serve({ port: 0, fetch: app.fetch });
+      const baseUrl = `http://localhost:${server.port}`;
+
+      const stream = "state_rate_repeat";
+      await fetch(`${baseUrl}/v1/stream/${encodeURIComponent(stream)}`, {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+      });
+      await installStateProtocolProfile(baseUrl, stream, {
+        templates: { activationRateLimitPerMinute: 1 },
+      });
+
+      const entity = "posts";
+      const fields = ["tenantId"];
+      const templateId = templateIdFor(entity, fields);
+      const body = JSON.stringify({
+        templates: [
+          {
+            entity,
+            fields: fields.map((name) => ({ name, encoding: "string" })),
+          },
+        ],
+        inactivityTtlMs: 60 * 60 * 1000,
+      });
+
+      const first = await fetchJson(`${baseUrl}/v1/stream/${encodeURIComponent(stream)}/touch/templates/activate`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body,
+      });
+      expect(first.activated.map((row: any) => row.templateId)).toEqual([templateId]);
+      expect(first.denied).toEqual([]);
+
+      const second = await fetchJson(`${baseUrl}/v1/stream/${encodeURIComponent(stream)}/touch/templates/activate`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body,
+      });
+      expect(second.activated.map((row: any) => row.templateId)).toEqual([templateId]);
+      expect(second.denied).toEqual([]);
+    } finally {
+      try {
+        server?.stop?.();
+      } catch {
+        // ignore
+      }
+      try {
+        await app?.close?.();
+      } catch {
+        // ignore
+      }
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("touch/wait supports large key sets", async () => {
     const root = mkdtempSync(join(tmpdir(), "ds-live-wait-keys-"));
     let app: ReturnType<typeof createApp> | null = null;

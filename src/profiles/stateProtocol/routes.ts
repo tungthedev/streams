@@ -10,9 +10,9 @@ import { getStateProtocolTouchConfig } from "./validation";
 
 const EXACT_FINE_WAIT_MAX_KEYS = 16;
 
-function countActiveTemplates(stream: string, db: StreamTouchRouteArgs["db"]): number {
+async function countActiveTemplates(stream: string, db: StreamTouchRouteArgs["db"]): Promise<number> {
   try {
-    return db.countActiveLiveTemplates(stream);
+    return await db.countActiveLiveTemplates(stream);
   } catch {
     return 0;
   }
@@ -101,7 +101,7 @@ async function handleTemplatesActivateRoute(args: StreamTouchRouteArgs, touchCfg
     maxActiveTemplatesPerEntity: touchCfg.templates?.maxActiveTemplatesPerEntity ?? 256,
   };
   const activeFromTouchOffset = touchManager.getOrCreateJournal(stream, touchCfg).getCursor();
-  const res = touchManager.activateTemplates({
+  const res = await touchManager.activateTemplates({
     stream,
     touchCfg,
     baseStreamNextOffset: streamRow.next_offset,
@@ -113,17 +113,17 @@ async function handleTemplatesActivateRoute(args: StreamTouchRouteArgs, touchCfg
   return respond.json(200, { activated: res.activated, denied: res.denied, limits });
 }
 
-function buildMetaRoutePayload(args: StreamTouchRouteArgs, touchCfg: TouchConfig) {
+async function buildMetaRoutePayload(args: StreamTouchRouteArgs, touchCfg: TouchConfig) {
   const { stream, streamRow, db, touchManager } = args;
   const meta = touchManager.getOrCreateJournal(stream, touchCfg).getMeta();
   const runtime = touchManager.getTouchRuntimeSnapshot({ stream, touchCfg });
-  const touchState = db.getStreamTouchState(stream);
+  const touchState = await db.getStreamTouchState(stream);
   return {
     ...meta,
     settled: meta.pendingKeys === 0 && runtime.lagSourceOffsets === 0,
     coarseIntervalMs: touchCfg.coarseIntervalMs ?? 100,
     touchCoalesceWindowMs: touchCfg.touchCoalesceWindowMs ?? 100,
-    activeTemplates: countActiveTemplates(stream, db),
+    activeTemplates: await countActiveTemplates(stream, db),
     lagSourceOffsets: runtime.lagSourceOffsets,
     touchMode: runtime.touchMode,
     walScannedThrough: touchState ? encodeOffset(streamRow.epoch, touchState.processed_through) : null,
@@ -176,12 +176,12 @@ async function handleMetaRoute(args: StreamTouchRouteArgs, touchCfg: TouchConfig
   if (Result.isError(timeoutMsRes)) return respond.badRequest(timeoutMsRes.error.message);
 
   if (settleRaw !== "flush") {
-    return respond.json(200, buildMetaRoutePayload(args, touchCfg));
+    return respond.json(200, await buildMetaRoutePayload(args, touchCfg));
   }
 
   const deadlineMs = Date.now() + timeoutMsRes.value;
   for (;;) {
-    const payload = buildMetaRoutePayload(args, touchCfg);
+    const payload = await buildMetaRoutePayload(args, touchCfg);
     if (payload.settled || Date.now() >= deadlineMs) {
       return respond.json(200, payload);
     }
@@ -272,7 +272,7 @@ async function handleWaitRoute(args: StreamTouchRouteArgs, touchCfg: TouchConfig
   const interestMode: "fine" | "coarse" = interestModeRaw === "coarse" ? "coarse" : "fine";
 
   if (interestMode === "fine" && templateIdsUsed.length > 0) {
-    touchManager.heartbeatTemplates({ stream, touchCfg, templateIdsUsed });
+    await touchManager.heartbeatTemplates({ stream, touchCfg, templateIdsUsed });
   }
 
   const declareTemplatesRaw = body?.declareTemplates;
@@ -288,7 +288,7 @@ async function handleWaitRoute(args: StreamTouchRouteArgs, touchCfg: TouchConfig
     if (Result.isError(inactivityTtlRes)) return respond.badRequest(inactivityTtlRes.error.message);
 
     const activeFromTouchOffset = touchManager.getOrCreateJournal(stream, touchCfg).getCursor();
-    touchManager.activateTemplates({
+    await touchManager.activateTemplates({
       stream,
       touchCfg,
       baseStreamNextOffset: streamRow.next_offset,
@@ -327,7 +327,7 @@ async function handleWaitRoute(args: StreamTouchRouteArgs, touchCfg: TouchConfig
   if (effectiveWaitKind === "templateKey") {
     waitKeyIds = templateWaitKeyIds;
   } else if (effectiveWaitKind === "tableKey" && templateIdsUsed.length > 0) {
-    const entities = touchManager.resolveTemplateEntitiesForWait({ stream, templateIdsUsed });
+    const entities = await touchManager.resolveTemplateEntitiesForWait({ stream, templateIdsUsed });
     waitKeyIds = Array.from(new Set(entities.map((entity) => tableKeyIdFor(entity) >>> 0)));
   }
 

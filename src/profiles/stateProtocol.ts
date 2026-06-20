@@ -24,8 +24,8 @@ const STATE_PROTOCOL_TOUCH_CAPABILITY: StreamTouchCapability = {
   },
 
   syncState({ db, stream, profile }) {
-    if (getStateProtocolTouchConfig(profile)) db.ensureStreamTouchState(stream);
-    else db.deleteStreamTouchState(stream);
+    if (getStateProtocolTouchConfig(profile)) return db.ensureStreamTouchState(stream);
+    return db.deleteStreamTouchState(stream);
   },
 
   deriveCanonicalChanges(record) {

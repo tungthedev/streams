@@ -1,6 +1,8 @@
 import type { SqliteDatabase, SqliteStatement } from "../sqlite/adapter";
 import type { StreamRow } from "../store/rows";
 import type {
+  LiveTemplateActivationInput,
+  LiveTemplateActivationResult,
   LiveTemplateIdentityRow,
   LiveTemplateLastSeenUpdate,
   LiveTemplateStoreRow,
@@ -178,11 +180,6 @@ export class SqliteTouchStore implements TouchProcessorStore {
     return this.delegates.trimWalByAge(stream, maxAgeMs);
   }
 
-  async updateProfileTouchState(stream: string, plan: "ensure" | "delete"): Promise<void> {
-    if (plan === "ensure") this.ensureStreamTouchState(stream);
-    else this.deleteStreamTouchState(stream);
-  }
-
   getStreamTouchState(stream: string): StreamTouchStateRow | null {
     const row = this.stmts.getStreamTouchState.get(stream) as any;
     if (!row) return null;
@@ -228,25 +225,95 @@ export class SqliteTouchStore implements TouchProcessorStore {
     return Number(row?.cnt ?? 0);
   }
 
+  activateLiveTemplates(args: {
+    stream: string;
+    templates: LiveTemplateActivationInput[];
+    maxActiveTemplatesPerStream: number;
+    maxActiveTemplatesPerEntity: number;
+    maxActivationTokens: number;
+  }): LiveTemplateActivationResult {
+    if (args.templates.length === 0) return { activated: [], invalid: [], rateLimited: [], activationTokensUsed: 0, evicted: [] };
+    const tx = this.db.transaction(() => {
+      const activated: string[] = [];
+      const invalid: string[] = [];
+      const rateLimited: string[] = [];
+      let activationTokensUsed = 0;
+      for (const template of args.templates) {
+        const existing = this.stmts.getLiveTemplate.get(args.stream, template.templateId) as any;
+        if (
+          existing &&
+          (String(existing.entity) !== template.entity ||
+            String(existing.fields_json) !== template.fieldsJson ||
+            String(existing.encodings_json) !== template.encodingsJson)
+        ) {
+          invalid.push(template.templateId);
+          continue;
+        }
+        const alreadyActive = existing && String(existing.state) === "active";
+        if (!alreadyActive && activationTokensUsed >= args.maxActivationTokens) {
+          rateLimited.push(template.templateId);
+          continue;
+        }
+        if (existing) {
+          const state = String(existing.state);
+          if (state === "active") {
+            this.stmts.updateLiveTemplateHeartbeat.run(template.nowMs, template.inactivityTtlMs, args.stream, template.templateId);
+          } else {
+            this.stmts.reactivateLiveTemplate.run(
+              template.nowMs,
+              template.inactivityTtlMs,
+              bindInt(template.activeFromSourceOffset),
+              args.stream,
+              template.templateId
+            );
+          }
+        } else {
+          this.stmts.insertLiveTemplate.run(
+            args.stream,
+            template.templateId,
+            template.entity,
+            template.fieldsJson,
+            template.encodingsJson,
+            template.nowMs,
+            template.nowMs,
+            template.inactivityTtlMs,
+            bindInt(template.activeFromSourceOffset)
+          );
+        }
+        if (!alreadyActive) activationTokensUsed += 1;
+        activated.push(template.templateId);
+      }
+      const evicted = this.evictToCapsInTransaction({
+        stream: args.stream,
+        protectedIds: new Set(activated),
+        maxActiveTemplatesPerStream: args.maxActiveTemplatesPerStream,
+        maxActiveTemplatesPerEntity: args.maxActiveTemplatesPerEntity,
+        nowMs: args.templates.reduce((max, template) => Math.max(max, template.nowMs), 0),
+      });
+      return { activated, invalid, rateLimited, activationTokensUsed, evicted };
+    });
+    return tx();
+  }
+
   listActiveLiveTemplates(stream: string): LiveTemplateStoreRow[] {
     const rows = this.stmts.listActiveLiveTemplates.all(stream) as any[];
     return rows.map((row) => this.coerceLiveTemplateRow(row));
   }
 
-  getLiveTemplate(stream: string, templateId: string): LiveTemplateStoreRow | null {
+  private getLiveTemplate(stream: string, templateId: string): LiveTemplateStoreRow | null {
     const row = this.stmts.getLiveTemplate.get(stream, templateId) as any;
     return row ? this.coerceLiveTemplateRow(row) : null;
   }
 
-  updateLiveTemplateHeartbeat(stream: string, templateId: string, nowMs: number, inactivityTtlMs: number): void {
+  private updateLiveTemplateHeartbeat(stream: string, templateId: string, nowMs: number, inactivityTtlMs: number): void {
     this.stmts.updateLiveTemplateHeartbeat.run(nowMs, inactivityTtlMs, stream, templateId);
   }
 
-  reactivateLiveTemplate(stream: string, templateId: string, nowMs: number, inactivityTtlMs: number, activeFromSourceOffset: bigint): void {
+  private reactivateLiveTemplate(stream: string, templateId: string, nowMs: number, inactivityTtlMs: number, activeFromSourceOffset: bigint): void {
     this.stmts.reactivateLiveTemplate.run(nowMs, inactivityTtlMs, activeFromSourceOffset, stream, templateId);
   }
 
-  insertLiveTemplate(args: {
+  private insertLiveTemplate(args: {
     stream: string;
     templateId: string;
     entity: string;
@@ -269,10 +336,6 @@ export class SqliteTouchStore implements TouchProcessorStore {
     );
   }
 
-  updateLiveTemplateLastSeen(stream: string, templateId: string, lastSeenAtMs: number): void {
-    this.stmts.updateLiveTemplateLastSeen.run(lastSeenAtMs, stream, templateId);
-  }
-
   updateLiveTemplateLastSeenBatch(updates: LiveTemplateLastSeenUpdate[]): void {
     for (const update of updates) {
       this.stmts.updateLiveTemplateLastSeen.run(update.lastSeenAtMs, update.stream, update.templateId);
@@ -291,22 +354,18 @@ export class SqliteTouchStore implements TouchProcessorStore {
     }));
   }
 
-  retireLiveTemplateForInactivity(stream: string, templateId: string, nowMs: number): void {
-    this.stmts.retireLiveTemplateForInactivity.run(nowMs, stream, templateId);
-  }
-
   retireLiveTemplatesForInactivity(stream: string, templateIds: string[], nowMs: number): void {
     for (const templateId of templateIds) {
       this.stmts.retireLiveTemplateForInactivity.run(nowMs, stream, templateId);
     }
   }
 
-  listActiveLiveTemplateEntityCounts(stream: string): Array<{ entity: string; count: number }> {
+  private listActiveLiveTemplateEntityCounts(stream: string): Array<{ entity: string; count: number }> {
     const rows = this.stmts.listActiveLiveTemplateEntityCounts.all(stream) as any[];
     return rows.map((row) => ({ entity: String(row.entity), count: Number(row.cnt) }));
   }
 
-  listLiveTemplateLruIds(args: { stream: string; entity?: string; excludeTemplateIds?: string[]; limit: number }): string[] {
+  private listLiveTemplateLruIds(args: { stream: string; entity?: string; excludeTemplateIds?: string[]; limit: number }): string[] {
     const params: any[] = [args.stream];
     let where = `stream=? AND state='active'`;
     if (args.entity) {
@@ -325,11 +384,11 @@ export class SqliteTouchStore implements TouchProcessorStore {
     return rows.map((row) => String(row.template_id));
   }
 
-  retireLiveTemplateForCap(stream: string, templateId: string, nowMs: number): void {
+  private retireLiveTemplateForCap(stream: string, templateId: string, nowMs: number): void {
     this.stmts.retireLiveTemplateForCap.run(nowMs, stream, templateId);
   }
 
-  retireLiveTemplatesForCap(stream: string, templateIds: string[], nowMs: number): void {
+  private retireLiveTemplatesForCap(stream: string, templateIds: string[], nowMs: number): void {
     for (const templateId of templateIds) {
       this.stmts.retireLiveTemplateForCap.run(nowMs, stream, templateId);
     }
@@ -355,6 +414,62 @@ export class SqliteTouchStore implements TouchProcessorStore {
       }
     }
     return Array.from(entities);
+  }
+
+  private evictToCapsInTransaction(args: {
+    stream: string;
+    protectedIds: Set<string>;
+    maxActiveTemplatesPerStream: number;
+    maxActiveTemplatesPerEntity: number;
+    nowMs: number;
+  }): Array<{ templateId: string; reason: "cap_exceeded"; cap: number }> {
+    const evicted: Array<{ templateId: string; reason: "cap_exceeded"; cap: number }> = [];
+    const entities = this.listActiveLiveTemplateEntityCounts(args.stream);
+    for (const row of entities) {
+      if (row.count <= args.maxActiveTemplatesPerEntity) continue;
+      const ids = this.pickLruTemplatesForCap({
+        stream: args.stream,
+        entity: row.entity,
+        protectedIds: args.protectedIds,
+        count: row.count - args.maxActiveTemplatesPerEntity,
+      });
+      this.retireLiveTemplatesForCap(args.stream, ids, args.nowMs);
+      for (const id of ids) evicted.push({ templateId: id, reason: "cap_exceeded", cap: args.maxActiveTemplatesPerEntity });
+    }
+
+    const streamCount = this.countActiveLiveTemplates(args.stream);
+    if (streamCount > args.maxActiveTemplatesPerStream) {
+      const ids = this.pickLruTemplatesForCap({
+        stream: args.stream,
+        protectedIds: args.protectedIds,
+        count: streamCount - args.maxActiveTemplatesPerStream,
+      });
+      this.retireLiveTemplatesForCap(args.stream, ids, args.nowMs);
+      for (const id of ids) evicted.push({ templateId: id, reason: "cap_exceeded", cap: args.maxActiveTemplatesPerStream });
+    }
+    return evicted;
+  }
+
+  private pickLruTemplatesForCap(args: { stream: string; entity?: string; protectedIds: Set<string>; count: number }): string[] {
+    if (args.count <= 0) return [];
+    const pick = (excludeProtected: boolean): string[] =>
+      this.listLiveTemplateLruIds({
+        stream: args.stream,
+        entity: args.entity,
+        excludeTemplateIds: excludeProtected ? Array.from(args.protectedIds) : [],
+        limit: args.count,
+      });
+    const ids = pick(true);
+    if (ids.length >= args.count) return ids;
+    const merged: string[] = [];
+    const seen = new Set<string>();
+    for (const id of [...ids, ...pick(false)]) {
+      if (seen.has(id)) continue;
+      seen.add(id);
+      merged.push(id);
+      if (merged.length >= args.count) break;
+    }
+    return merged;
   }
 
   private coerceLiveTemplateRow(row: any): LiveTemplateStoreRow {

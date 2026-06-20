@@ -1,6 +1,7 @@
 import type { Result } from "better-result";
 import type { StreamReadRow } from "./segment_read_store";
 import type { SchemaRegistry } from "../schema/registry";
+import type { ProfileTouchStatePlan } from "./profile_touch_store";
 
 export type SchemaRegistryRow = {
   stream: string;
@@ -49,6 +50,7 @@ export type ProfileMetadataPlan = {
   streamProfile: string | null;
   profileJson: string | null;
   schemaRegistry: SchemaRegistry | null;
+  touchState?: ProfileTouchStatePlan;
 };
 
 export type ProfileMetadataMutationPlan<T> = {

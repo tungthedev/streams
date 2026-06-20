@@ -174,7 +174,7 @@ describe("schema registry", () => {
       const db = new FixedClockStore(`${root}/wal.sqlite`);
       db.ensureStream("s", { contentType: "application/json" });
       const regStore = new SchemaRegistryStore(db);
-      const profileStore = new StreamProfileStore(db, { touchStore: db });
+      const profileStore = new StreamProfileStore(db, { touchEnabled: true });
 
       const reg = await regStore.updateRegistry("s", {
         schema: {
