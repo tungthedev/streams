@@ -4,6 +4,7 @@ export type Config = {
   autoTunePresetMb: number | null;
   autoTuneEffectiveMemoryLimitMb: number | null;
   storage: "sqlite" | "postgres";
+  postgresMode: "wal" | "full";
   postgresUrl: string | null;
   host: string;
   rootDir: string;
@@ -77,6 +78,7 @@ export type Config = {
 
 const KNOWN_DS_ENVS = new Set<string>([
   "DS_STORAGE",
+  "DS_POSTGRES_MODE",
   "DS_POSTGRES_URL",
   "DS_TEST_POSTGRES_URL",
   "DS_ROOT",
@@ -258,9 +260,17 @@ function parseStorageMode(): "sqlite" | "postgres" {
   throw dsError(`invalid DS_STORAGE: ${process.env.DS_STORAGE}`);
 }
 
+function parsePostgresMode(): "wal" | "full" {
+  const raw = process.env.DS_POSTGRES_MODE?.trim().toLowerCase();
+  if (raw == null || raw === "" || raw === "wal") return "wal";
+  if (raw === "full") return "full";
+  throw dsError(`invalid DS_POSTGRES_MODE: ${process.env.DS_POSTGRES_MODE}`);
+}
+
 export function loadConfig(): Config {
   warnUnknownEnv();
   const storage = parseStorageMode();
+  const postgresMode = storage === "postgres" ? parsePostgresMode() : "wal";
   const postgresUrl = process.env.DS_POSTGRES_URL?.trim() || null;
   if (storage === "postgres" && postgresUrl == null) throw dsError("DS_POSTGRES_URL is required when DS_STORAGE=postgres");
   const rootDir = process.env.DS_ROOT ?? "./ds-data";
@@ -314,6 +324,7 @@ export function loadConfig(): Config {
     autoTunePresetMb,
     autoTuneEffectiveMemoryLimitMb,
     storage,
+    postgresMode,
     postgresUrl,
     host,
     rootDir,

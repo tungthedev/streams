@@ -32,31 +32,34 @@ streams and instruments an app from scratch. UIs should use the explicit
 `observability.request` descriptor from `GET /v1/streams` or
 `GET /v1/stream/{name}/_details` to pair `evlog` and `otel-traces` streams.
 
-This repository currently contains three server modes:
+This repository currently contains four server modes:
 
 - `full` mode: a self-hosted server with SQLite WAL storage, segmenting, upload, and index maintenance
 - `local` mode: an embedded single-SQLite server intended for trusted local development workflows, especially `npx prisma dev`
-- `postgres` mode: a self-hosted WAL/control-plane server backed by Postgres, without segmenting, object-store upload, search, touch/live, or built-in profile side effects
+- `postgres wal` mode: a self-hosted WAL/control-plane server backed by Postgres
+- `postgres full` mode: a self-hosted Postgres metadata server with segmenting, manifests, search, aggregate, touch/live, metrics, built-in profiles, and object-store recovery
 
 All modes share the same HTTP route stack where the storage capability is
 available. SQLite full mode provides the segment, manifest, index,
 schema-publication, storage-stat, and object-store accounting capabilities.
 SQLite local mode uses the SQLite WAL/control-plane and local touch/live
-capabilities without segmenting or object-store upload. Postgres currently
-provides only the WAL/control-plane capability bundle.
+capabilities without segmenting or object-store upload. Postgres WAL mode
+provides only the WAL/control-plane capability bundle. Postgres full mode
+provides the full-mode capability bundle using Postgres for durable metadata
+and object storage for published artifacts.
 
 ## Current Durability Model
 
-Full mode today has two different durability points:
+SQLite and Postgres full modes have two different durability points:
 
-- append ACK means the write is durable in local SQLite
+- append ACK means the write is durable in the active WAL/control-plane store
 - object-store durability happens only after segment upload plus manifest
   publication
 
 `--bootstrap-from-r2` rebuilds published stream history and metadata from
-object storage. It does not restore transient local SQLite state
-such as the unuploaded WAL tail, producer dedupe state, or runtime live/template
-state.
+object storage. It does not restore transient WAL/control-plane or runtime
+state such as the unuploaded WAL tail, producer dedupe state, touch journals,
+or live-template runtime state.
 
 A stream becomes recoverable from object storage after its first manifest is
 published.
@@ -107,6 +110,10 @@ bun run src/server.ts --object-store local --no-auth
 DS_STORAGE=postgres DS_POSTGRES_URL=postgres://user:pass@host:5432/db \
   bun run src/server.ts --no-auth
 
+# Postgres full server
+DS_STORAGE=postgres DS_POSTGRES_MODE=full DS_POSTGRES_URL=postgres://user:pass@host:5432/db \
+  bun run src/server.ts --object-store local --no-auth
+
 # Local development server
 bun run src/local/cli.ts start --name default --port 8080
 
@@ -119,9 +126,11 @@ bun run src/local/cli.ts reset --name default
 Notes:
 
 - Full server startup requires `--object-store local|r2` and exactly one auth mode: `--no-auth` or `--auth-strategy api-key`.
-- Postgres mode requires `DS_STORAGE=postgres` and `DS_POSTGRES_URL`, rejects
-  `--object-store` and `--bootstrap-from-r2`, and supports only endpoints backed
-  by the WAL/control-plane capability bundle. See [postgres-store.md](./postgres-store.md).
+- Postgres mode requires `DS_STORAGE=postgres` and `DS_POSTGRES_URL`.
+  `DS_POSTGRES_MODE=wal` is the default and rejects `--object-store` and
+  `--bootstrap-from-r2`. `DS_POSTGRES_MODE=full` requires
+  `--object-store local|r2` and supports the full-mode capability bundle. See
+  [postgres-store.md](./postgres-store.md).
 - Prisma Compute deployments from npm should follow the package-based flow in
   the top-level [README.md](../README.md#deploy-to-prisma-compute).
 - Repository Compute bundle deployments can use `src/compute/entry.ts`, which
@@ -213,10 +222,10 @@ Optional OTLP trace receiver configuration:
 - `DS_OTLP_AUTO_CREATE=true` lets `/v1/traces` create and profile that stream
   as `otel-traces` before accepting spans
 
-## Postgres Server
+## Postgres WAL Server
 
-Postgres mode starts the same Bun HTTP server with a Postgres WAL/control-plane
-store:
+Postgres WAL mode starts the same Bun HTTP server with a Postgres
+WAL/control-plane store:
 
 ```bash
 DS_STORAGE=postgres \
@@ -232,9 +241,28 @@ routing-key lexicon listing, `_details` storage/accounting fields, touch/live
 invalidation, OTLP ingestion, internal metrics profile streams, or non-generic
 built-in profile side effects.
 
+## Postgres Full Server
+
+Postgres full mode keeps stream metadata and full-mode indexes in Postgres while
+publishing segments, manifests, schemas, and companion artifacts to object
+storage:
+
+```bash
+DS_STORAGE=postgres \
+DS_POSTGRES_MODE=full \
+DS_POSTGRES_URL=postgres://user:pass@host:5432/database \
+bun run src/server.ts --object-store local --no-auth
+```
+
+It supports the full-mode capability bundle: segmenting, manifest publication,
+search, aggregate queries, routing-key lexicon listing, `_details`
+storage/accounting fields, touch/live invalidation, OTLP ingestion, internal
+metrics profile streams, built-in profile side effects, and object-store
+recovery with `--bootstrap-from-r2`.
+
 See [postgres-store.md](./postgres-store.md).
 
-### Object Store Configuration
+## Object Store Configuration
 
 Local MockR2:
 

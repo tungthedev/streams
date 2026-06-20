@@ -78,7 +78,7 @@ and remote serving structures, not durable record stores.
 
 1. WAL commit remains the only write acknowledgment point.
 2. Heavy indexing stays off the request path.
-3. Local SQLite stays bounded and rebuildable.
+3. Active metadata stores stay bounded and rebuildable.
 4. Published search state is recovered from manifests and object-store objects.
 5. Missing or stale search coverage must fall back to source-segment or WAL-tail
    scan instead of returning false negatives.
@@ -316,8 +316,8 @@ Current implementation:
 - presence docsets, typed value streams, min/max values, and optional page
   indexes
 - no `.col` run compaction yet
-- local SQLite stores only the bundled companion plan and per-segment companion
-  object keys
+- the active metadata store keeps only the bundled companion plan and
+  per-segment companion object keys
 - published companion objects live under `streams/<hash>/segments/...cix`
 - bundled companion backfill is oldest-missing-first and batched, so `.col`
   coverage grows contiguously across the uploaded segment prefix
@@ -354,8 +354,8 @@ Current implementation:
 - document-frequency and postings-offset tables stay as zero-copy views over
   the mapped file
 - no `.fts` run compaction yet
-- local SQLite stores only the bundled companion plan and per-segment companion
-  object keys
+- the active metadata store keeps only the bundled companion plan and
+  per-segment companion object keys
 - published companion objects live under `streams/<hash>/segments/...cix`
 - bundled companion backfill is oldest-missing-first and batched, so `.fts`
   coverage grows contiguously across the uploaded segment prefix
@@ -384,8 +384,8 @@ Current implementation:
 - per-interval zstd compression when a payload shrinks, with lazy inflate on
   first read of that interval
 - no `.agg` compaction yet
-- local SQLite stores only the bundled companion plan and per-segment companion
-  object keys
+- the active metadata store keeps only the bundled companion plan and
+  per-segment companion object keys
 - published companion objects live under `streams/<hash>/segments/...cix`
 - bundled companion backfill is oldest-missing-first and batched, so `.agg`
   coverage grows contiguously across the uploaded segment prefix
@@ -414,8 +414,8 @@ Current implementation:
 - zstd-compressed metrics-record payloads when the blob shrinks, with lazy
   inflate on first fallback scan
 - no `.mblk` compaction yet
-- local SQLite stores only the bundled companion plan and per-segment companion
-  object keys
+- the active metadata store keeps only the bundled companion plan and
+  per-segment companion object keys
 - published companion objects live under `streams/<hash>/segments/...cix`
 
 Current responsibilities:
@@ -424,9 +424,9 @@ Current responsibilities:
 - aligned-window edge serving when `.agg` cannot fully answer the query
 - metrics-profile aggregate serving without decoding full JSON segments
 
-## SQLite Catalog
+## Active Metadata Catalog
 
-Current local catalog tables:
+Current logical catalog tables:
 
 - `secondary_index_state`
 - `secondary_index_runs`
@@ -440,8 +440,10 @@ Interpretation:
 - `search_segment_companions` maps each covered segment to its current bundled
   companion object key, generation, and section inventory
 
-These tables are rebuildable from manifest state and remote objects. They are
-not durable source-of-truth data stores.
+SQLite full mode stores these as SQLite tables. Postgres full mode stores the
+same logical catalog in Postgres tables. The catalog is rebuildable from
+manifest state and remote objects; it is not a durable source-of-truth data
+store.
 
 ## Manifest And Bootstrap
 
@@ -815,7 +817,7 @@ progress from low-level objects or manifest rows.
 ## Current Evlog Shape
 
 The evlog profile now has a search-capable foundation without adding unbounded
-local SQLite projections.
+local database projections.
 
 The built-in `evlog` profile auto-installs these `search.fields`:
 

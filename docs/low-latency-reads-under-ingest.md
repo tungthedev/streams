@@ -46,7 +46,7 @@ For UI workloads, the better trade is usually:
 ## Non-Goals
 
 1. Do not change WAL commit as the write acknowledgment point.
-2. Do not make local SQLite a second source of truth.
+2. Do not make the local metadata store a second source of truth.
 3. Do not require zero-lag indexing before data becomes queryable.
 4. Do not force exact completeness for default UI search requests.
 

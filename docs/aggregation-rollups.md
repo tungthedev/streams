@@ -21,7 +21,7 @@ The rollup system should:
 
 - be schema-owned and generic, not profile-specific
 - remain asynchronous with respect to appends
-- keep local SQLite bounded
+- keep active metadata stores bounded
 - store durable rollup artifacts in object storage
 - support query-time composition when requested time ranges do not align to
   rollup windows
@@ -158,7 +158,7 @@ The first implementation uses **per-segment companions**:
   payloads
 - each bucket contains one or more dimension groups and measure states
 
-SQLite stores only:
+The active metadata store keeps only:
 
 - `search_companion_plans`
 - `search_segment_companions` rows whose `sections_json` includes `agg`
@@ -166,7 +166,7 @@ SQLite stores only:
 This means:
 
 - object store is the durable rollup store
-- SQLite only tracks local catalog state
+- the active metadata store only tracks rebuildable catalog state
 - bootstrap-from-R2 restores bundled companion catalog state from manifests
 - query reads load only the requested rollup/interval view instead of decoding
   the whole bundled companion

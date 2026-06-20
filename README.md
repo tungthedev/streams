@@ -5,8 +5,8 @@ protocol.
 
 It provides:
 
-- a full server mode with SQLite WAL storage, segmenting, upload, and index
-  maintenance
+- full server modes with SQLite or Postgres WAL/control-plane storage,
+  segmenting, upload, and index maintenance
 - a trusted local mode for Prisma development workflows
 - a stream profile model that cleanly separates durable storage semantics from
   payload structure
@@ -412,19 +412,28 @@ always exists.
 
 ## Current Durability Model
 
-In full mode today:
+In SQLite and Postgres full modes:
 
-- append ACK means the write is durable in local SQLite
+- append ACK means the write is durable in the active WAL/control-plane store
 - object-store durability happens only after segment upload and manifest
   publication
 
 `--bootstrap-from-r2` rebuilds published stream history and metadata from
 manifest, segment, and schema objects in object storage. It does
-not restore transient local SQLite state such as the unuploaded WAL tail,
-producer dedupe state, or runtime live/template state.
+not restore transient WAL/control-plane state such as the unuploaded WAL tail,
+producer dedupe state, touch journals, or runtime live/template state.
 
 A stream becomes recoverable from object storage after its first manifest is
 published.
+
+Postgres full-mode recovery uses the explicit Postgres mode matrix:
+
+```bash
+DS_STORAGE=postgres \
+DS_POSTGRES_MODE=full \
+DS_POSTGRES_URL=postgres://user:pass@host:5432/database \
+bun run src/server.ts --object-store r2 --bootstrap-from-r2 --no-auth
+```
 
 ## Possible Future Durability Modes
 

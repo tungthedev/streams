@@ -14,7 +14,7 @@ The v1 profile:
 - store one canonical JSON event per appended record
 - install a canonical schema registry, default search fields, and default
   rollups automatically
-- avoid unbounded local SQLite indexing
+- avoid unbounded local database indexing
 - preserve exact append-only durability semantics
 - support request-centric lookup through the existing routing-key path
 
@@ -165,7 +165,7 @@ The profile may allow extending this list.
 
 ## Reads And Lookup
 
-V1 does not add a local SQLite observability index.
+V1 does not add a local database observability index.
 
 Instead:
 
@@ -180,7 +180,7 @@ projection tables.
 ## Secondary Indexing
 
 Evlog indexing builds on the generic schema-owned `search` system, not on
-unbounded local SQLite tables.
+unbounded local database tables.
 
 The auto-installed evlog `search.fields` are:
 
@@ -224,7 +224,8 @@ The required properties stay the same:
 - rebuildable from the durable stream
 - stored as object-store-native index artifacts
 
-This keeps local SQLite bounded and preserves the existing recovery model.
+This keeps the active metadata store bounded and preserves the existing
+recovery model.
 
 ## Schema Relationship
 

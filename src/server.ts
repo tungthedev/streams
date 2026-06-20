@@ -1,10 +1,12 @@
 import { loadConfig } from "./config";
-import { createApp, createPostgresApp, type App } from "./app";
+import { createApp, createPostgresApp, createPostgresFullApp, type App } from "./app";
 import { StatsCollector, StatsReporter } from "./stats";
 import { LatencyHistogramCollector, HistogramReporter } from "./hist";
 import { MockR2Store } from "./objectstore/mock_r2";
+import type { ObjectStore } from "./objectstore/interface";
 import { R2ObjectStore } from "./objectstore/r2";
 import { bootstrapFromR2 } from "./bootstrap";
+import { bootstrapPostgresFromR2 } from "./postgres/bootstrap";
 import { PostgresDurableStore } from "./postgres/store";
 import { initConsoleLogging } from "./util/log";
 import { applyAutoTune, AutoTuneApplyError, parseAutoTuneArg } from "./server_auto_tune";
@@ -52,35 +54,17 @@ const hist = histEnabled ? new LatencyHistogramCollector() : undefined;
 const storeIdx = args.indexOf("--object-store");
 const storeChoice = storeIdx >= 0 ? args[storeIdx + 1] : null;
 
-let app: App;
-if (cfg.storage === "postgres") {
-  if (storeIdx >= 0) {
-    // eslint-disable-next-line no-console
-    console.error("postgres storage does not support --object-store");
-    process.exit(1);
-  }
-  if (bootstrapEnabled) {
-    // eslint-disable-next-line no-console
-    console.error("postgres storage does not support --bootstrap-from-r2");
-    process.exit(1);
-  }
-  if (cfg.postgresUrl == null) {
-    // loadConfig validates this; keep the local guard for future call-site changes.
-    // eslint-disable-next-line no-console
-    console.error("DS_POSTGRES_URL is required when DS_STORAGE=postgres");
-    process.exit(1);
-  }
-  const postgresStore = await PostgresDurableStore.connect(cfg.postgresUrl);
-  app = createPostgresApp(cfg, postgresStore, { stats });
-} else {
+function requireObjectStoreChoice(): "r2" | "local" {
   if (!storeChoice || (storeChoice !== "r2" && storeChoice !== "local")) {
     // eslint-disable-next-line no-console
     console.error("missing or invalid --object-store (expected: r2 | local)");
     process.exit(1);
   }
+  return storeChoice;
+}
 
-  let store;
-  if (storeChoice === "local") {
+function createConfiguredObjectStore(choice: "r2" | "local"): ObjectStore {
+  if (choice === "local") {
     const memBytesRaw = process.env.DS_MOCK_R2_MAX_INMEM_BYTES;
     const memMbRaw = process.env.DS_MOCK_R2_MAX_INMEM_MB;
     const putDelayRaw = process.env.DS_MOCK_R2_PUT_DELAY_MS;
@@ -114,10 +98,9 @@ if (cfg.storage === "postgres") {
         process.exit(1);
       }
     }
-    const spillDir = process.env.DS_MOCK_R2_SPILL_DIR;
-    store = new MockR2Store({
+    return new MockR2Store({
       maxInMemoryBytes: memBytes ?? undefined,
-      spillDir,
+      spillDir: process.env.DS_MOCK_R2_SPILL_DIR,
       faults: {
         putDelayMs,
         getDelayMs,
@@ -125,27 +108,60 @@ if (cfg.storage === "postgres") {
         listDelayMs,
       },
     });
-  } else {
-    const bucket = process.env.DURABLE_STREAMS_R2_BUCKET;
-    const accountId = process.env.DURABLE_STREAMS_R2_ACCOUNT_ID;
-    const accessKeyId = process.env.DURABLE_STREAMS_R2_ACCESS_KEY_ID;
-    const secretAccessKey = process.env.DURABLE_STREAMS_R2_SECRET_ACCESS_KEY;
-    const endpoint = process.env.DURABLE_STREAMS_R2_ENDPOINT;
-    const region = process.env.DURABLE_STREAMS_R2_REGION;
-    if (!bucket || !accountId || !accessKeyId || !secretAccessKey) {
+  }
+
+  const bucket = process.env.DURABLE_STREAMS_R2_BUCKET;
+  const accountId = process.env.DURABLE_STREAMS_R2_ACCOUNT_ID;
+  const accessKeyId = process.env.DURABLE_STREAMS_R2_ACCESS_KEY_ID;
+  const secretAccessKey = process.env.DURABLE_STREAMS_R2_SECRET_ACCESS_KEY;
+  const endpoint = process.env.DURABLE_STREAMS_R2_ENDPOINT;
+  const region = process.env.DURABLE_STREAMS_R2_REGION;
+  if (!bucket || !accountId || !accessKeyId || !secretAccessKey) {
+    // eslint-disable-next-line no-console
+    console.error("missing R2 env vars: DURABLE_STREAMS_R2_BUCKET, DURABLE_STREAMS_R2_ACCOUNT_ID, DURABLE_STREAMS_R2_ACCESS_KEY_ID, DURABLE_STREAMS_R2_SECRET_ACCESS_KEY");
+    process.exit(1);
+  }
+  return new R2ObjectStore({
+    bucket,
+    accountId,
+    accessKeyId,
+    secretAccessKey,
+    endpoint,
+    region,
+  });
+}
+
+let app: App;
+if (cfg.storage === "postgres") {
+  if (cfg.postgresUrl == null) {
+    // loadConfig validates this; keep the local guard for future call-site changes.
+    // eslint-disable-next-line no-console
+    console.error("DS_POSTGRES_URL is required when DS_STORAGE=postgres");
+    process.exit(1);
+  }
+  if (cfg.postgresMode === "wal") {
+    if (storeIdx >= 0) {
       // eslint-disable-next-line no-console
-      console.error("missing R2 env vars: DURABLE_STREAMS_R2_BUCKET, DURABLE_STREAMS_R2_ACCOUNT_ID, DURABLE_STREAMS_R2_ACCESS_KEY_ID, DURABLE_STREAMS_R2_SECRET_ACCESS_KEY");
+      console.error("postgres WAL mode does not support --object-store");
       process.exit(1);
     }
-    store = new R2ObjectStore({
-      bucket,
-      accountId,
-      accessKeyId,
-      secretAccessKey,
-      endpoint,
-      region,
-    });
+    if (bootstrapEnabled) {
+      // eslint-disable-next-line no-console
+      console.error("postgres WAL mode does not support --bootstrap-from-r2");
+      process.exit(1);
+    }
+    const postgresStore = await PostgresDurableStore.connect(cfg.postgresUrl);
+    app = createPostgresApp(cfg, postgresStore, { stats });
+  } else {
+    const objectStore = createConfiguredObjectStore(requireObjectStoreChoice());
+    if (bootstrapEnabled) {
+      await bootstrapPostgresFromR2(cfg, objectStore, cfg.postgresUrl, { clearLocal: true });
+    }
+    const postgresStore = await PostgresDurableStore.connectFull(cfg.postgresUrl);
+    app = createPostgresFullApp(cfg, postgresStore, objectStore, { stats });
   }
+} else {
+  const store = createConfiguredObjectStore(requireObjectStoreChoice());
 
   if (bootstrapEnabled) {
     await bootstrapFromR2(cfg, store, { clearLocal: true });

@@ -18,21 +18,23 @@ families are complementary:
 
 - Make key-filtered reads fast by narrowing the segment scan set.
 - Store index runs as immutable objects in R2.
-- Keep local state as a cache: if local SQLite and caches are deleted, the
-  index can be rebuilt from R2 manifests and run objects.
+- Keep local state as rebuildable metadata and cache: if the active metadata
+  store and local caches are cleared, the index can be rebuilt from R2
+  manifests and run objects.
 
 ## High-Level Flow (Read Path)
 
 Reads by routing key are a two-step operation:
 
-1. Consult local SQLite (`index_runs`) to decide which index run files might
-   contain the key.
+1. Consult the active index metadata store (`index_runs`) to decide which index
+   run files might contain the key.
 2. Load run files (memory cache -> disk cache -> R2), then compute the set of
    candidate segments for the key and scan only those segments, plus any
    unindexed tail.
 
-This matches the object-storage architecture: SQLite is only a catalog; the
-source of truth remains the manifest and run objects in R2.
+This matches the object-storage architecture: the active metadata store is a
+catalog; the published source of truth remains the manifest and run objects in
+R2.
 
 Unindexed tail segments (segment index >= `indexed_through`) are still scanned
 linearly to preserve correctness while indexing catches up.
@@ -139,8 +141,8 @@ The caches are optional and bounded. They are safe to delete.
 
 ### Rebuild from R2
 
-Local index state is a cache. If local SQLite and caches are deleted, the
-system can be reconstructed from:
+Local index metadata is rebuildable. If the active metadata store and caches
+are cleared, the system can be reconstructed from:
 
 - `streams/<hash>/manifest.json` for index state and run lists
 - `streams/<hash>/index/<run-id>.idx` for run objects

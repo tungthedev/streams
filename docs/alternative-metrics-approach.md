@@ -178,7 +178,7 @@ metrics emitter because:
 
 - rollups are object-store-native
 - companion state is rebuildable
-- query-time fallback preserves correctness without requiring large local SQLite
+- query-time fallback preserves correctness without requiring large local database
   projections
 
 But the source data is still ordinary stream records, not a dedicated metric

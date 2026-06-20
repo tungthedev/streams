@@ -5,6 +5,8 @@ This runbook explains how to operate, recover, and validate Durable Streams whil
 It is written for operators and developers running either:
 
 - full mode (`src/server.ts`) with segmentation + object store
+- Postgres full mode (`DS_STORAGE=postgres DS_POSTGRES_MODE=full`) with
+  Postgres metadata + object store
 - local mode (`src/local/*`) with a single SQLite database and no object store
 
 Use this document with:
@@ -21,13 +23,14 @@ Use this document with:
 
 Correctness depends on explicit commit points in the write path:
 
-1. Append commit (durability to local SQLite):
+1. Append commit (durability to active WAL/control-plane store):
 - Appends are accepted only after the ingest batch transaction commits.
-- This is the point where offsets and WAL rows become durable on local disk.
+- This is the point where offsets and WAL rows become durable in SQLite or
+  Postgres, depending on the active mode.
 
 2. Segment build commit (local materialization):
 - Segmenter writes `*.tmp`, fsyncs, then atomic-renames to final segment path.
-- Segment metadata is committed in SQLite (`commitSealedSegment`).
+- Segment metadata is committed in the active segment metadata store.
 - If segment metadata commit fails, the local segment file is removed.
 
 3. Segment upload (remote bytes present, but not yet visible):
@@ -65,7 +68,7 @@ Why this matters:
 Read path behavior:
 
 - For sealed/uploaded history, read from segments (local cache or object store ranges).
-- For unsealed or not-yet-GC tail, read from SQLite WAL.
+- For unsealed or not-yet-GC tail, read from the active WAL store.
 - Merge in offset order and return bounded slices (`DS_READ_MAX_*`).
 
 Consequences:
@@ -115,17 +118,18 @@ The live system:
 
 Full mode:
 
-- ACKed append is durable in local SQLite immediately.
+- ACKed append is durable in the active WAL/control-plane store immediately.
 - ACKed append is durable in object storage only after manifest commit advances `uploaded_through`.
-- If the node/disk is lost before that point, latest ACKed writes may not exist in object storage.
+- If the WAL/control-plane store is lost before that point, latest ACKed writes
+  may not exist in object storage.
 - `--bootstrap-from-r2` restores published stream history and metadata from
   object storage.
-- `--bootstrap-from-r2` does not restore transient local SQLite state such as
-  the unuploaded WAL tail, producer dedupe state, or runtime live/template
-  state.
-- Deleting a node without a local snapshot is only safe after the streams you
-  care about have uploaded through the tail you need and published a manifest
-  for that state.
+- `--bootstrap-from-r2` does not restore transient WAL/control-plane state such
+  as the unuploaded WAL tail, producer dedupe state, touch journals, or runtime
+  live/template state.
+- Deleting a node or database without a snapshot is only safe after the streams
+  you care about have uploaded through the tail you need and published a
+  manifest for that state.
 
 Local mode:
 
@@ -140,7 +144,7 @@ Append crash before commit:
 - append is not durable; client should retry
 
 Append crash after commit:
-- durable in SQLite
+- durable in the active WAL/control-plane store
 
 Crash during segment build:
 - tmp files are cleaned on startup
@@ -151,7 +155,7 @@ Crash after segment upload but before manifest commit:
 - uploader retries; manifest remains source of truth
 
 Crash during/after manifest commit:
-- idempotent resume via SQLite state
+- idempotent resume via the active WAL/control-plane metadata
 
 ### 2.2 One bad stream isolation
 
@@ -344,9 +348,12 @@ If wait latency spikes:
 ### 4.7 Suspected local SQLite corruption
 
 1. Stop writer traffic.
-2. Run `PRAGMA integrity_check;`.
+2. For SQLite-backed modes, run `PRAGMA integrity_check;`. For Postgres full
+   mode, use the site's normal Postgres integrity and backup validation tools.
 3. If corruption is confirmed:
-- full mode: rebuild from object storage (`--bootstrap-from-r2`) into clean local state
+- SQLite full mode: rebuild from object storage (`--bootstrap-from-r2`) into clean local state
+- Postgres full mode: restore Postgres from backup, or rebuild published
+  full-mode metadata from object storage into a clean Postgres target
 - local mode: restore from backup snapshot
 4. Re-run invariants and conformance smoke tests.
 
@@ -354,13 +361,26 @@ If wait latency spikes:
 
 ### 5.1 Rebuild full-mode state from object storage
 
-Warning: this deletes local SQLite and local/cache directories under `DS_ROOT`.
+Warning: SQLite full-mode recovery deletes local SQLite plus local/cache
+directories under `DS_ROOT`. Postgres full-mode recovery clears the Postgres
+restore target plus local/cache directories under `DS_ROOT`.
 
 This restores the published durable state from object storage. It does not
-recover data or helper state that only existed in local SQLite at the time the
-node was lost.
+recover data or helper state that only existed in the WAL/control-plane store
+at the time the node or database was lost.
+
+SQLite full mode:
 
 ```bash
+bun run src/server.ts --object-store r2 --bootstrap-from-r2 --no-auth
+```
+
+Postgres full mode:
+
+```bash
+DS_STORAGE=postgres \
+DS_POSTGRES_MODE=full \
+DS_POSTGRES_URL=postgres://user:pass@host:5432/database \
 bun run src/server.ts --object-store r2 --bootstrap-from-r2 --no-auth
 ```
 
@@ -393,9 +413,10 @@ Recovery requires filesystem backup/restore of:
 Recommended:
 
 - treat object store + manifest generation as primary long-term durable history
-- snapshot SQLite for faster local recovery and operational continuity
-- keep SQLite snapshots if you need recovery of the latest ACKed local tail and
-  runtime-local helper state, not just published object-store state
+- snapshot SQLite or Postgres for faster recovery and operational continuity
+- keep WAL/control-plane snapshots if you need recovery of the latest ACKed
+  local tail and runtime-local helper state, not just published object-store
+  state
 
 SQLite snapshot rules:
 

@@ -4,6 +4,7 @@ import { deriveMemoryPressureHeadroomBytes, deriveMemoryPressureLimitBytes } fro
 
 const KEYS = [
   "DS_STORAGE",
+  "DS_POSTGRES_MODE",
   "DS_POSTGRES_URL",
   "DS_MEMORY_LIMIT_MB",
   "DS_SQLITE_CACHE_MB",
@@ -30,14 +31,24 @@ describe("config memory tuning", () => {
     expect(loadConfig().storage).toBe("sqlite");
 
     process.env.DS_STORAGE = "sqlite";
+    process.env.DS_POSTGRES_MODE = "bad";
     expect(loadConfig().storage).toBe("sqlite");
+    delete process.env.DS_POSTGRES_MODE;
 
     process.env.DS_STORAGE = "postgres";
     expect(() => loadConfig()).toThrow("DS_POSTGRES_URL is required when DS_STORAGE=postgres");
     process.env.DS_POSTGRES_URL = "postgres://localhost/streams";
     const postgresConfig = loadConfig();
     expect(postgresConfig.storage).toBe("postgres");
+    expect(postgresConfig.postgresMode).toBe("wal");
     expect(postgresConfig.postgresUrl).toBe("postgres://localhost/streams");
+
+    process.env.DS_POSTGRES_MODE = "full";
+    expect(loadConfig().postgresMode).toBe("full");
+
+    process.env.DS_POSTGRES_MODE = "bad";
+    expect(() => loadConfig()).toThrow("invalid DS_POSTGRES_MODE: bad");
+    delete process.env.DS_POSTGRES_MODE;
 
     delete process.env.DS_POSTGRES_URL;
     process.env.DS_STORAGE = "memory";

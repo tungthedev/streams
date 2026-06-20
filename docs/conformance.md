@@ -12,7 +12,13 @@ bun test test/conformance.test.ts
 bun run test:conformance
 bun run test:conformance:local
 DS_TEST_POSTGRES_URL=postgres://postgres:postgres@127.0.0.1:5432/streams_test \
-  bun test test/postgres_store.test.ts test/postgres_http.test.ts
+  bun test \
+    test/postgres_store.test.ts \
+    test/postgres_http.test.ts \
+    test/postgres_full_segments.test.ts \
+    test/postgres_full_search.test.ts \
+    test/postgres_full_touch.test.ts \
+    test/postgres_full_bootstrap.test.ts
 ```
 
 Default behavior:
@@ -39,12 +45,13 @@ Last verified on `2026-03-14`:
 Prisma Streams currently passes the upstream black-box suite for the full and
 local modes.
 
-Postgres mode has focused store and HTTP smoke coverage for its supported
-WAL/control-plane capability bundle. It does not claim full upstream
-conformance because the first Postgres mode intentionally excludes full-mode
-segmenting, manifest publication, search, aggregate, routing-key lexicon
-listing, `_details` storage/accounting, touch/live, object-store recovery, and
-built-in profile side effects.
+Postgres WAL mode has focused store and HTTP smoke coverage for its supported
+WAL/control-plane capability bundle. Postgres full mode has focused parity
+coverage for segmenting, manifest publication, search, aggregate, routing-key
+lexicon listing, `_details` storage/accounting, touch/live, object-store
+recovery, and built-in profile side effects. Upstream conformance should be run
+against an explicitly started Postgres full server when validating that mode
+black-box.
 
 ## Notes
 

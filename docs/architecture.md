@@ -2,9 +2,8 @@
 
 This document describes the architecture of the Prisma Streams Bun + TypeScript
 implementation using:
-- SQLite (bun:sqlite) as the full/local WAL/control-plane implementation and
-  the only current full segment/object-store/index implementation
-- Postgres as an optional WAL/control-plane store
+- SQLite (bun:sqlite) as the full/local WAL/control-plane implementation
+- Postgres as an optional WAL/control-plane store and full-mode metadata store
 - TieredStore-style segments and manifests
 - An R2-compatible object store (MockR2 for tests)
 
@@ -69,12 +68,14 @@ See [stream-profiles.md](./stream-profiles.md) for the normative model.
 - Acknowledges appends only after the transaction commits.
 
 3) Segmenter (materializer)
-- Periodically selects candidate streams from indexed SQLite metadata.
-- Streams WAL rows out of SQLite using iterators to avoid large allocations.
+- Periodically selects candidate streams from indexed segment metadata.
+- Streams WAL rows out of the active WAL store using bounded iterators or
+  cursors to avoid large allocations.
 - Builds segment files on disk (temp -> atomic rename) and records segment metadata.
 
 4) Uploader
-- Selects pending segments from SQLite and uploads with bounded concurrency.
+- Selects pending segments from the active segment metadata store and uploads
+  with bounded concurrency.
 - For each stream, it prioritizes the earliest non-uploaded segment only.
 - Later segments from the same stream do not bypass an older missing segment.
 - Uploads segments first, then publishes a new manifest generation.
@@ -209,12 +210,20 @@ narrow capability stores for segment reads, manifests, indexes, touch/live,
 storage stats, schema publication, and object-store accounting instead of
 reaching through SQLite directly.
 
-In Postgres mode, Postgres is the durable source for stream lifecycle metadata,
-schema/profile metadata, producer state, and WAL rows. The current Postgres mode
-does not publish segment, manifest, schema, or index objects to object storage,
-so it does not run the segmenter, uploader, index managers, touch runtime,
-storage accounting, or internal metrics profile stream. It supports the shared
+In Postgres WAL mode, Postgres is the durable source for stream lifecycle
+metadata, schema/profile metadata, producer state, and WAL rows. It does not
+publish segment, manifest, schema, or index objects to object storage, so it
+does not run the segmenter, uploader, index managers, touch runtime, storage
+accounting, or internal metrics profile stream. It supports the shared
 WAL/control-plane HTTP routes and rejects full-mode capabilities explicitly.
+
+In Postgres full mode, Postgres owns the WAL/control-plane rows plus durable
+full-mode metadata for segments, manifests, indexes, search companions,
+touch/live state, metrics, and object-store request accounting. Object storage
+remains the source for published segment, manifest, schema, and companion
+objects. The shared full-mode runtime starts the segmenter, uploader, index
+managers, touch processor, and schema publication path against Postgres
+capability stores.
 
 ## Stream Deletion Enforcement
 
@@ -331,8 +340,12 @@ These capabilities split by mode:
 - SQLite local mode implements WAL/control-plane plus local touch/live
   behavior, but does not segment, upload objects, publish manifests, or run
   full-mode indexes.
-- Postgres v1 implements only the WAL/control-plane capability bundle and must
-  not be treated as a full-mode segment/object-store/index implementation.
+- Postgres WAL mode implements only the WAL/control-plane capability bundle and
+  must not be treated as a full-mode segment/object-store/index implementation.
+- Postgres full mode implements WAL/control-plane plus segment reads, segment
+  and manifest metadata, index metadata, schema publication, storage stats,
+  touch/live, built-in profiles, object-store accounting, and object-store
+  recovery with object storage as the published artifact store.
 
 In full mode, bootstrap from object storage reconstructs the published durable
 state from:
@@ -386,8 +399,9 @@ Not implemented today:
 - cluster quorum durability: acknowledge writes only after a durability quorum
   in a cluster has accepted them
 
-The current full-mode server does neither. Its ACK point is local SQLite
-commit, and its object-store durability point is manifest publication.
+Current SQLite and Postgres full modes do neither. Their ACK point is the active
+WAL/control-plane transaction commit, and their object-store durability point is
+manifest publication.
 
 ## Bounded memory and backpressure
 

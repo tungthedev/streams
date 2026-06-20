@@ -34,7 +34,7 @@ The architecture in this document implements those three jobs with **three indep
 
 These families are:
 
-- **asynchronous with respect to appends**: writes still commit only to the SQLite WAL in the hot path;
+- **asynchronous with respect to appends**: writes still commit only to the active WAL store in the hot path;
 - **object-store-native**: the source of truth for uploaded index state is the stream manifest plus immutable search objects in R2;
 - **incremental**: new sealed segments get new companion index objects, and larger immutable runs are built later by compaction;
 - **correct even when indexing lags**: queries always scan the unindexed or stale tail instead of returning incomplete results;
@@ -55,7 +55,7 @@ The key design decision is that **search correctness never depends on index comp
    - Uploaded data becomes visible only after manifest publication.
    - Search must never expose data that the stream read path would not expose.
 4. Reuse the existing architecture:
-   - SQLite as local WAL + metadata catalog.
+   - active WAL/control-plane and metadata stores.
    - immutable sealed segments on local disk and R2.
    - manifest-published uploaded prefixes.
    - local cache + object store for remote reads.
@@ -77,17 +77,18 @@ The key design decision is that **search correctness never depends on index comp
 
 This design assumes the current Durable Streams server shape from the repository:
 
-- appends go to SQLite WAL rows;
+- appends go to the active WAL store;
 - a background segmenter builds immutable `segments/<n>.bin` objects;
 - an uploader publishes `manifest.json` generations containing the contiguous uploaded data prefix;
-- a reader merges sealed history from segments with tail rows from SQLite;
+- a reader merges sealed history from segments with tail rows from the active
+  WAL store;
 - routing-key indexing already exists as an object-store-native, rebuildable tier-2 index family;
 - streams already have TTL/expiry state via `ttl_seconds`, `expires_at_ms`, and `stream_flags`;
 - streams already have schema registries and versioned schema boundaries.
 
 This search design follows the same principles as the existing routing-key index:
 
-- SQLite stores only local catalog state and upload progress.
+- The active metadata store keeps only local catalog state and upload progress.
 - Uploaded search objects in R2 plus manifest metadata are the durable remote state.
 - Local caches are disposable.
 - Unindexed data is still readable/searchable through a fallback path.
@@ -1023,9 +1024,10 @@ Notes:
 - each family keeps its own `uploaded_segment_count` because sidecars may lag data upload independently;
 - `segment_object_gens_b64` is a compressed `u32le` array aligned with that family’s uploaded prefix. It lets cold nodes derive immutable object keys for per-segment companions.
 
-### 9.2 SQLite tables
+### 9.2 Metadata tables
 
-Add the following tables.
+Add the following logical metadata tables in the active full-mode metadata
+store.
 
 ### 9.2.1 `search_state`
 
@@ -1126,11 +1128,12 @@ This is recommended for historical reindex after mapping changes.
 
 ## 10.1 High-level flow
 
-1. append request commits to SQLite WAL
+1. append request commits to the active WAL store
 2. segmenter selects a stream and builds a sealed data segment
 3. during the same background scan, the segmenter also extracts search documents and builds companion search objects
 4. data segment and search companions are atomically renamed into place locally
-5. local SQLite catalog is updated for the data segment and search companions
+5. the active metadata catalog is updated for the data segment and search
+   companions
 6. data uploader uploads the data segment and publishes a new manifest generation for the data prefix
 7. search uploader uploads companion objects and publishes new manifest generations for search family prefixes
 8. compactor later merges many per-segment companions into larger immutable runs
@@ -1139,7 +1142,8 @@ The append path never waits for any search work.
 
 ## 10.2 Search extraction during segmenting
 
-The segmenter already streams WAL rows to build the `.bin` segment. Search extraction must happen in the same pass to avoid a second SQLite scan.
+The segmenter already streams WAL rows to build the `.bin` segment. Search
+extraction must happen in the same pass to avoid a second WAL scan.
 
 Pseudo-flow for one WAL row:
 
@@ -1257,12 +1261,12 @@ Rules:
 
 The full-text path is primary enough to justify earlier segment cuts. The substring path is secondary and may degrade to scan per segment.
 
-## 10.4 Local commit sequence
+## 10.4 Metadata commit sequence
 
 Once the data segment and any search companions are fully written to temp files:
 
 1. rename temp files atomically into final local paths;
-2. in one SQLite transaction:
+2. in one active metadata-store transaction:
    - insert/update `segments`
    - append to `stream_segment_meta`
    - append to `search_segment_meta`
@@ -1481,7 +1485,7 @@ The scan path must use the same `SearchDoc` extraction logic as the builder.
 
 Sources for scan:
 
-- WAL tail → SQLite iteration
+- WAL tail -> active WAL-store iteration
 - sealed local segment → local file scan
 - sealed remote segment on cold node → existing segment object load/range-scan path
 
@@ -1585,7 +1589,8 @@ If the platform later adds row-level deletes or per-document retention, search w
 
 ## 14.1 Local state is rebuildable
 
-If local SQLite search catalog rows and caches are lost, the system must be reconstructible from:
+If local search catalog rows and caches are lost, the system must be
+reconstructible from:
 
 - `manifest.json`
 - search run objects listed in the manifest
@@ -1847,7 +1852,7 @@ At minimum, add tests for:
 
 The cleanest implementation path is:
 
-- keep writes simple and durable through SQLite WAL only;
+- keep writes simple and durable through the active WAL store only;
 - build search companions asynchronously during segment sealing;
 - upload them independently of the data path but only advertise them through manifest generations;
 - use `.fts` for both full-text and exact-token keyword search;

@@ -46,7 +46,7 @@ section codecs.
 Benefits:
 
 - one companion PUT per segment instead of one PUT per family
-- one per-segment catalog row in SQLite
+- one per-segment catalog row in the active metadata store
 - one remote object to account for in manifests and `/_details`
 - one lazy container that can still decode only the requested family at query
   time
@@ -77,9 +77,9 @@ When schema or profile changes alter the desired plan, the stream enters mixed
 coverage until historical bundled companions are rebuilt for the new
 generation.
 
-## Local Catalog
+## Active Metadata Catalog
 
-SQLite stores only rebuildable catalog state:
+The active metadata store keeps only rebuildable catalog state:
 
 - `search_companion_plans`
 - `search_segment_companions`
@@ -190,7 +190,7 @@ Planning rules:
 
 1. use a current bundled section when it is present for the desired plan
 2. otherwise raw-scan the sealed segment
-3. read the unsealed WAL tail from SQLite directly only when the published
+3. read the unsealed WAL tail from the active WAL store only when the published
    prefix is otherwise caught up and the tail passes the quiet-overlay gate
 
 That means:

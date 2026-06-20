@@ -14,8 +14,8 @@ That means:
   storage
 - query-time planning chooses the cheapest available path while preserving
   correctness
-- local SQLite stores only bounded metadata and family progress, not an
-  unbounded metrics head
+- the active metadata store keeps only bounded metadata and family progress, not
+  an unbounded metrics head
 
 The comparison that motivated this direction is captured in
 [alternative-metrics-approach.md](./alternative-metrics-approach.md).
@@ -66,7 +66,7 @@ Metrics do **not** bypass the core durable stream model.
 
 The durable source of truth is still:
 
-- SQLite WAL for acknowledged but not yet published data
+- the active WAL store for acknowledged but not yet published data
 - sealed stream segments for published data
 - manifests and companion objects in object storage for published search state
 
@@ -187,7 +187,8 @@ Current properties:
   inflated lazily on first fallback scan
 - bundled companions are stored in object storage under
   `streams/<hash>/segments/...cix`
-- local SQLite stores only bundled companion plan state and object keys
+- the active metadata store keeps only bundled companion plan state and object
+  keys
 - `mblk` sections carry canonical metric interval summaries plus time-range
   metadata
 
@@ -207,7 +208,7 @@ Use it when:
 The current design improves cardinality handling in two important ways:
 
 1. query serving state is remote and immutable
-2. non-rollup aggregate queries no longer need large local SQLite projections
+2. non-rollup aggregate queries no longer need large local database projections
 
 This means high-cardinality metrics primarily show up as:
 

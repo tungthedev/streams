@@ -2,19 +2,19 @@
 
 This document describes the SQLite store used by full and local modes. SQLite
 provides the durable WAL/control-plane tables for those modes. SQLite full mode
-is currently the only implementation of segment, manifest, index,
-schema-publication, storage-stat, and object-store accounting metadata. SQLite
-local mode uses the WAL/control-plane and local touch/live tables without
-segmenting or object-store upload.
+also provides SQLite's segment, manifest, index, schema-publication,
+storage-stat, and object-store accounting metadata. SQLite local mode uses the
+WAL/control-plane and local touch/live tables without segmenting or object-store
+upload.
 The goal is to:
 - minimize custom file formats
 - keep memory bounded under load
 - simplify crash recovery (SQLite transactions)
 
 This document specifies the intended schema and the invariants it must uphold.
-Postgres mode has its own WAL/control-plane schema and does not use these
-SQLite full-mode tables for segmenting, manifest publication, search, touch, or
-object-store recovery.
+Postgres has its own schema and does not use these SQLite tables for
+WAL/control-plane, segmenting, manifest publication, search, touch, accounting,
+or object-store recovery.
 
 ---
 
@@ -364,8 +364,8 @@ Notes:
 - counters are node-local and reflect requests observed through the current
   object-store wrapper
 - request counts are exposed through `GET /v1/stream/{name}/_details`
-- this is a SQLite full-mode accounting capability; Postgres mode currently
-  reports the feature as unsupported rather than storing fake counters
+- this is the SQLite full-mode accounting table; Postgres full mode stores its
+  own request counters in the Postgres schema
 
 ---
 

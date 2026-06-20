@@ -130,7 +130,7 @@ maybeDescribe("postgres shared HTTP runtime", () => {
 });
 
 describe("postgres server startup guards", () => {
-  async function runServer(args: string[]): Promise<{ exitCode: number; stderr: string }> {
+  async function runServer(args: string[], env: Record<string, string> = {}): Promise<{ exitCode: number; stderr: string }> {
     const child = Bun.spawn({
       cmd: ["bun", "run", "src/server.ts", ...args],
       cwd: join(import.meta.dir, ".."),
@@ -138,6 +138,7 @@ describe("postgres server startup guards", () => {
         ...process.env,
         DS_STORAGE: "postgres",
         DS_POSTGRES_URL: "postgres://localhost/unused",
+        ...env,
         PORT: "0",
       },
       stdout: "pipe",
@@ -151,14 +152,24 @@ describe("postgres server startup guards", () => {
     return { exitCode, stderr };
   }
 
-  test("postgres mode rejects object-store and bootstrap flags before connecting", async () => {
+  test("postgres WAL mode rejects object-store and bootstrap flags before connecting", async () => {
     let result = await runServer(["--object-store", "local", "--no-auth"]);
     expect(result.exitCode).toBe(1);
-    expect(result.stderr).toContain("postgres storage does not support --object-store");
+    expect(result.stderr).toContain("postgres WAL mode does not support --object-store");
 
     result = await runServer(["--bootstrap-from-r2", "--no-auth"]);
     expect(result.exitCode).toBe(1);
-    expect(result.stderr).toContain("postgres storage does not support --bootstrap-from-r2");
+    expect(result.stderr).toContain("postgres WAL mode does not support --bootstrap-from-r2");
+
+    result = await runServer(["--object-store", "local", "--no-auth"], { DS_POSTGRES_MODE: "wal" });
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("postgres WAL mode does not support --object-store");
+  });
+
+  test("postgres full mode requires object-store flags before connecting", async () => {
+    const result = await runServer(["--no-auth"], { DS_POSTGRES_MODE: "full" });
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("missing or invalid --object-store (expected: r2 | local)");
   });
 });
 
